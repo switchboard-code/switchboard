@@ -390,11 +390,12 @@ The outputs preserve local, plan, and dollar units. See
 and `/copy code 2` selects the preceding block, counting newest first across
 session responses.
 
-The mouse is on by default: the wheel scrolls the transcript and a click
-expands a route or tool entry. Drag-to-select still works through the
-terminal's modifier — shift, option, or fn depending on the terminal —
-because a terminal reporting mouse events to a program needs the modifier to
-know a drag is its own. `/mouse off` hands the mouse back entirely. The
+The mouse is on by default: the wheel scrolls the transcript, a click
+expands a route or tool entry, and a drag selects whole lines and copies
+them on release — the copy goes by OSC 52 where the terminal takes it and
+by `pbcopy` on macOS, where Terminal.app takes no escape. The terminal's own
+selection still works through its modifier (shift, option, or fn).
+`/mouse off` hands the mouse back entirely. The
 setting persists as `[ui] mouse`.
 
 Nothing is lost while the mouse is off. `pgup` and `pgdn` scroll a page,

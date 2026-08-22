@@ -624,10 +624,26 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.MouseButtonWheelDown:
 			m.tr.scrollBy(-3)
 		case tea.MouseButtonLeft:
-			// A click on a tool rail or a route line toggles it, the same
-			// toggle ctrl+o applies to the most recent one: the transcript
-			// is directly manipulable where it has something to show.
-			if msg.Action == tea.MouseActionPress && m.dlg == nil {
+			if m.dlg != nil {
+				return m, nil
+			}
+			switch msg.Action {
+			case tea.MouseActionPress:
+				// A press starts a possible selection; whether it becomes one
+				// or stays a click is the motion's call.
+				m.tr.beginSelect(m.tr.lineAt(msg.Y))
+			case tea.MouseActionMotion:
+				m.tr.extendSelect(m.tr.lineAt(msg.Y))
+			case tea.MouseActionRelease:
+				if m.tr.selOn && m.tr.selMoved {
+					cmd := m.copySelection()
+					m.tr.clearSelect()
+					return m, cmd
+				}
+				m.tr.clearSelect()
+				// A click on a tool rail or a route line toggles it, the same
+				// toggle ctrl+o applies to the most recent one: the transcript
+				// is directly manipulable where it has something to show.
 				if i := m.tr.entryAt(msg.Y); i >= 0 {
 					if e := m.tr.entries[i]; e.kind == kindTool || e.kind == kindRoute {
 						e.expanded = !e.expanded
@@ -678,6 +694,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case scheduleTickMsg:
 		return m, m.fireScheduled()
+
+	case clipboardMsg:
+		m.addNotice("", fmt.Sprintf("copied %d lines from the transcript", msg.lines))
+		return m, nil
 
 	case bisectProbeMsg:
 		m.onBisectProbe(msg)

@@ -96,6 +96,15 @@ type transcript struct {
 	// transcript only paints it, on a copy, so the flat buffer never
 	// carries search state.
 	marks map[int]string
+
+	// sel is a drag selection in flat line indices, painted on a copy at view
+	// time for the same reason as the marks: flat is the render cache and
+	// carries no interaction state. selMoved distinguishes a drag from a
+	// click that never left its line.
+	selAnchor int
+	selEnd    int
+	selOn     bool
+	selMoved  bool
 }
 
 func newTranscript(width int, th *theme, md *markdown) *transcript {
@@ -514,8 +523,10 @@ func (t *transcript) view(height int) string {
 		start = 0
 	}
 	visible := t.flat[start:end]
+	painted := false
 	if len(t.marks) > 0 {
 		visible = append([]string(nil), visible...)
+		painted = true
 		for j := range visible {
 			if mark, ok := t.marks[start+j]; ok {
 				if visible[j] == "" {
@@ -525,6 +536,26 @@ func (t *transcript) view(height int) string {
 					// margin; the marker takes that cell.
 					visible[j] = mark + visible[j][1:]
 				}
+			}
+		}
+	}
+	if t.selOn {
+		lo, hi := t.selAnchor, t.selEnd
+		if lo > hi {
+			lo, hi = hi, lo
+		}
+		if hi >= start && lo < end {
+			if !painted {
+				visible = append([]string(nil), visible...)
+			}
+			const reverse = "\x1b[7m"
+			for j := max(lo-start, 0); j <= min(hi-start, len(visible)-1); j++ {
+				if visible[j] == "" {
+					continue
+				}
+				// Re-assert the highlight after every embedded reset, or it
+				// would end at the line's first styled span.
+				visible[j] = reverse + strings.ReplaceAll(visible[j], "\x1b[0m", "\x1b[0m"+reverse) + "\x1b[27m"
 			}
 		}
 	}

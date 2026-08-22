@@ -205,9 +205,9 @@ keys
   pgup/pgdn        scroll                ctrl+u / ctrl+d    half a page
   shift+↑/↓        scroll a few lines    home/end           top / bottom
 
-  the mouse is on by default: the wheel scrolls and a click expands a rail.
-  drag-to-select works through your terminal's modifier (shift, option, fn).
-  /mouse off gives the terminal the mouse entirely.`)
+  the mouse is on by default: the wheel scrolls, a click expands a rail,
+  and a drag selects lines and copies them on release.
+  /mouse off gives the terminal the mouse (a plain drag selects there).`)
 	m.addInfo(b.String())
 	return nil
 }
