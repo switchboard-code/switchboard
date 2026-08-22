@@ -979,6 +979,25 @@ func TestRoundLimit(t *testing.T) {
 	}
 }
 
+// With no cap set a turn runs until the model is done. The watcher and the
+// budget are the brakes, not a round count.
+func TestNoDefaultRoundLimit(t *testing.T) {
+	var turns []scriptTurn
+	for range 45 {
+		turns = append(turns, toolTurn(use("call_x", "read", `{"path":"loop.txt"}`)))
+	}
+	turns = append(turns, textTurn("done"))
+	h := newHarness(t, permission.ModeDefault, turns...)
+	os.WriteFile(filepath.Join(h.root, "loop.txt"), []byte("x"), 0o644)
+
+	if err := h.loop.Turn(context.Background(), "keep going"); err != nil {
+		t.Fatal(err)
+	}
+	if h.provider.calls != 46 {
+		t.Errorf("provider called %d times, want 45 tool rounds plus the closing call", h.provider.calls)
+	}
+}
+
 func TestCancellationStillPairsResultsWithCalls(t *testing.T) {
 	h := newHarness(t, permission.ModeDefault,
 		toolTurn(

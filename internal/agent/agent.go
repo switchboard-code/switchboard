@@ -26,11 +26,6 @@ import (
 )
 
 const (
-	// DefaultMaxToolRounds bounds one user turn. Loop detection and escalation
-	// are phase 2 work; until then this is the backstop that keeps a model
-	// stuck in a retry cycle from running until the budget is gone.
-	DefaultMaxToolRounds = 40
-
 	// DefaultMaxAttempts bounds retries of a single model call.
 	DefaultMaxAttempts = 3
 
@@ -118,7 +113,12 @@ type Loop struct {
 	// against.
 	Cache *Cache
 
-	System        []provider.Block
+	System []provider.Block
+
+	// MaxToolRounds, when positive, caps one turn's tool rounds as a backstop
+	// against a retry cycle burning the budget unseen. Zero means no cap: the
+	// escalation watcher and the budget ceiling are the brakes, and the turn
+	// runs until the model stops asking for tools.
 	MaxToolRounds int
 	MaxAttempts   int
 
@@ -342,9 +342,16 @@ func (l *Loop) TurnMessage(ctx context.Context, opening provider.Message) error 
 		return err
 	}
 
-	maxRounds := orDefault(l.MaxToolRounds, DefaultMaxToolRounds)
 	reliefs := 0
-	for round := range maxRounds {
+	for round := 0; ; round++ {
+		// The cap is opt-in. With none set the turn runs until the model
+		// stops asking for tools; the watcher and the budget are the brakes.
+		if l.MaxToolRounds > 0 && round >= l.MaxToolRounds {
+			msg := fmt.Sprintf("turn stopped at the %d tool-round limit", l.MaxToolRounds)
+			observer.Notice("warn", msg)
+			l.Session.AppendNote("warn", msg)
+			return ErrRoundLimit
+		}
 		// The opening round skips injection: anything pending at turn start
 		// is the caller's to fold into the prompt itself, so a request never
 		// carries two adjacent user messages. Mid-turn the previous message
@@ -442,11 +449,6 @@ func (l *Loop) TurnMessage(ctx context.Context, opening provider.Message) error 
 		// partial evidence must not rebind a turn that is ending.
 		observer.ToolBatchEnd(ctx)
 	}
-
-	msg := fmt.Sprintf("turn stopped at the %d tool-round limit", maxRounds)
-	observer.Notice("warn", msg)
-	l.Session.AppendNote("warn", msg)
-	return ErrRoundLimit
 }
 
 func successfulTodoResult(results []provider.Block) bool {
