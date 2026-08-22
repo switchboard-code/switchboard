@@ -133,16 +133,12 @@ type Config struct {
 	Notify *bool
 
 	// Mouse hands the terminal's mouse to the TUI, where the wheel scrolls
-	// the transcript and a click expands a tool rail.
-	//
-	// Off by default, and a plain bool rather than the *bool the settings
-	// above use, because absent and off are the same state here rather than
-	// two different facts. A terminal reporting mouse events to a program is
-	// a terminal that will not select text, so this trades copy and paste for
-	// the wheel — and every scroll the wheel serves already has a key (pgup,
-	// ctrl+u, home), while lifting a command out of a transcript has no
-	// substitute at all.
-	Mouse bool
+	// the transcript and a click expands a tool rail. Nil is the default,
+	// which is on: the wheel is how most people scroll, and drag-to-select
+	// still works through the terminal's modifier — shift, option, or fn by
+	// terminal — because a terminal reporting mouse events to a program
+	// needs the modifier to know a drag is its own. Read it through MouseOn.
+	Mouse *bool
 
 	// Budget is a per-session dollar ceiling, persisted so /budget survives a
 	// restart. Zero means no ceiling. It governs what the catalog prices in
@@ -291,6 +287,9 @@ func (c *Config) NotifyOn() bool {
 	return c.Notify == nil || *c.Notify
 }
 
+// MouseOn is how the mouse setting is read: absent means on.
+func (c *Config) MouseOn() bool { return c.Mouse == nil || *c.Mouse }
+
 // Default returns the tier a session starts on. The bottom of the ladder is
 // the deliberate default: an escalation the user can see beats a silent spend
 // they cannot (design principle 3).
@@ -365,12 +364,12 @@ type routingEntry struct {
 // uiEntry holds presentation settings. They live in the config rather than a
 // separate state file because the TUI writes this file anyway, and two files
 // that both mean "how sb behaves for this user" is one file too many. Notify
-// is a *bool so "absent" and "explicitly off" are different facts: the
-// default is on.
+// and Mouse are *bool so "absent" and "explicitly off" are different facts:
+// the defaults are on.
 type uiEntry struct {
 	Theme  string `toml:"theme,omitempty"`
 	Notify *bool  `toml:"notify,omitempty"`
-	Mouse  bool   `toml:"mouse,omitempty"`
+	Mouse  *bool  `toml:"mouse,omitempty"`
 }
 
 // updatesEntry holds the update settings. Booleans are *bool so "absent" and

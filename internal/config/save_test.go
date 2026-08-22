@@ -89,7 +89,7 @@ mouse = true
 	if after.NotifyOn() {
 		t.Error("notify = false did not survive the rewrite")
 	}
-	if !after.Mouse {
+	if !after.MouseOn() {
 		t.Error("mouse = true did not survive the rewrite")
 	}
 }

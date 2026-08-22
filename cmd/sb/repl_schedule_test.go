@@ -24,12 +24,21 @@ func TestREPLScheduleCommands(t *testing.T) {
 
 	r.command(context.Background(), "/every 30m run the tests")
 	r.command(context.Background(), "/at 14:30 check the deploy")
+	// The listing is sorted by next fire, so the order depends on the wall
+	// clock the test runs at; assert the set instead.
 	entries := s.List()
 	if len(entries) != 2 {
 		t.Fatalf("ledger holds %d entries, want 2", len(entries))
 	}
-	if entries[0].ID != "s1" || !entries[0].Recurring() || entries[1].ID != "s2" || entries[1].Recurring() {
-		t.Errorf("armed entries misshapen: %+v", entries)
+	byID := map[string]schedule.Entry{}
+	for _, e := range entries {
+		byID[e.ID] = e
+	}
+	if e, ok := byID["s1"]; !ok || !e.Recurring() || e.Prompt != "run the tests" {
+		t.Errorf("the recurring entry misshapen or missing: %+v", entries)
+	}
+	if e, ok := byID["s2"]; !ok || e.Recurring() || e.Prompt != "check the deploy" {
+		t.Errorf("the one-shot entry misshapen or missing: %+v", entries)
 	}
 
 	r.command(context.Background(), "/schedule")

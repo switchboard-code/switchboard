@@ -213,13 +213,17 @@ func (c *Config) render() ([]byte, error) {
 		buf.WriteString("\n")
 	}
 
-	if c.Theme != "" || !c.NotifyOn() || c.Mouse {
-		ui := uiEntry{Theme: c.Theme, Mouse: c.Mouse}
-		// Absent means on, so the file carries the setting only when it is
-		// the non-default quiet.
+	if c.Theme != "" || !c.NotifyOn() || !c.MouseOn() {
+		ui := uiEntry{Theme: c.Theme}
+		// Absent means on for both, so the file carries each setting only
+		// when it is the non-default off.
 		if !c.NotifyOn() {
 			off := false
 			ui.Notify = &off
+		}
+		if !c.MouseOn() {
+			off := false
+			ui.Mouse = &off
 		}
 		if err := encode(&buf, struct {
 			UI uiEntry `toml:"ui"`

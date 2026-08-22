@@ -390,12 +390,12 @@ The outputs preserve local, plan, and dollar units. See
 and `/copy code 2` selects the preceding block, counting newest first across
 session responses.
 
-The mouse belongs to the terminal by default, so dragging selects text in the
-transcript and in the composer the way it does anywhere else. A terminal that
-is reporting mouse events to a program will not select with them, which is the
-whole of the trade: `/mouse on` gives sb the wheel and click-to-expand and
-takes selection away, and `/mouse off` gives it back. The setting persists as
-`[ui] mouse`.
+The mouse is on by default: the wheel scrolls the transcript and a click
+expands a route or tool entry. Drag-to-select still works through the
+terminal's modifier — shift, option, or fn depending on the terminal —
+because a terminal reporting mouse events to a program needs the modifier to
+know a drag is its own. `/mouse off` hands the mouse back entirely. The
+setting persists as `[ui] mouse`.
 
 Nothing is lost while the mouse is off. `pgup` and `pgdn` scroll a page,
 `shift+↑` and `shift+↓` scroll a few lines, `ctrl+u` and `ctrl+d` scroll half a

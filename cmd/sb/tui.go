@@ -435,12 +435,12 @@ func runTUI(
 
 	m := newTUIModel(app, th, md, ta)
 
-	// The mouse is off unless it was asked for. Putting the terminal into
-	// mouse-reporting mode is what stops it selecting text, and a transcript
-	// you cannot copy a command out of costs more than a wheel whose every
-	// job pgup, ctrl+u, home, and ctrl+o already do. /mouse on trades back.
+	// The mouse is on unless it was turned off: the wheel scrolls the
+	// transcript and a click expands a rail, and drag-to-select still works
+	// through the terminal's modifier (shift, option, or fn). /mouse off
+	// hands the mouse back to the terminal entirely.
 	opts := []tea.ProgramOption{tea.WithAltScreen()}
-	if cfg.Mouse {
+	if cfg.MouseOn() {
 		opts = append(opts, tea.WithMouseCellMotion())
 	}
 	p := tea.NewProgram(m, opts...)

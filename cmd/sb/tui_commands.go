@@ -205,8 +205,9 @@ keys
   pgup/pgdn        scroll                ctrl+u / ctrl+d    half a page
   shift+↑/↓        scroll a few lines    home/end           top / bottom
 
-  the mouse belongs to the terminal, so drag to select and copy as usual.
-  /mouse on gives sb the wheel and click-to-expand instead.`)
+  the mouse is on by default: the wheel scrolls and a click expands a rail.
+  drag-to-select works through your terminal's modifier (shift, option, fn).
+  /mouse off gives the terminal the mouse entirely.`)
 	m.addInfo(b.String())
 	return nil
 }
@@ -1158,27 +1159,29 @@ func cmdNotify(m *tuiModel, args string) tea.Cmd {
 
 // cmdMouse hands the mouse to sb, or gives it back to the terminal.
 //
-// The two are exclusive, which is the whole of the setting: a terminal
-// reporting mouse events to a program will not select text with them, so the
-// wheel and click-to-expand are bought with copy and paste. Off is the
-// default. The setting persists the way /theme does, and the mode changes on
-// the running terminal at once rather than at the next launch.
+// On is the default: the wheel scrolls and a click expands a rail, and
+// selection still works through the terminal's modifier, because a terminal
+// reporting mouse events to a program needs shift, option, or fn to know a
+// drag is its own. Off returns the mouse wholly. The setting persists the
+// way /theme does, and the mode changes on the running terminal at once
+// rather than at the next launch.
 func cmdMouse(m *tuiModel, args string) tea.Cmd {
 	switch strings.TrimSpace(args) {
 	case "":
-		if m.app.config.Mouse {
+		if m.app.config.MouseOn() {
 			return noticeCmd("", "mouse is on: the wheel scrolls and a click expands a rail, "+
-				"and the terminal will not select text. /mouse off gives selection back")
+				"and drag-to-select works through your terminal's modifier (shift, option, or fn). /mouse off gives plain selection back")
 		}
 		return noticeCmd("", "mouse is off, so selection and copy are the terminal's; "+
-			"pgup, ctrl+u, home, and ctrl+o do what the wheel and a click would. /mouse on trades that away")
+			"pgup, ctrl+u, home, and ctrl+o do what the wheel and a click would. /mouse on hands it the wheel")
 	case "on", "off":
-		m.app.config.Mouse = args == "on"
+		on := args == "on"
+		m.app.config.Mouse = &on
 		mode := tea.Cmd(tea.DisableMouse)
 		told := "mouse is off; the terminal selects text again"
-		if m.app.config.Mouse {
+		if on {
 			mode = tea.EnableMouseCellMotion
-			told = "mouse is on; the terminal will not select text while it is"
+			told = "mouse is on; drag-to-select works through your terminal's modifier"
 		}
 		if err := m.app.config.Save(); err != nil {
 			return tea.Batch(mode, noticeCmd("error", told+", but saving it failed: "+err.Error()))
