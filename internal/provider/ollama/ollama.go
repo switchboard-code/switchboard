@@ -235,7 +235,7 @@ func (c *Client) Probe(ctx context.Context, target provider.RouteTarget) (provid
 		res.Tools = provider.ToolsNone
 		res.Detail = "model does not advertise tool support"
 	}
-	res.ContextWindow = show.contextWindow()
+	res.ContextWindow, res.WindowEnforced = show.contextWindow()
 	return res, nil
 }
 
@@ -246,11 +246,14 @@ func (c *Client) Probe(ctx context.Context, target provider.RouteTarget) (provid
 var numCtx = regexp.MustCompile(`(?m)^\s*num_ctx\s+(\d+)\s*$`)
 
 // contextWindow reports what this server will accept for the model, or zero
-// when it said nothing this can be read from.
-func (s showResponse) contextWindow() int {
+// when it said nothing this can be read from. The second return is whether
+// the number is the allocation the server enforces (a Modelfile num_ctx)
+// rather than the architecture's ceiling, which is metadata that does not
+// outrank the number the user declared.
+func (s showResponse) contextWindow() (int, bool) {
 	if m := numCtx.FindStringSubmatch(s.Parameters); m != nil {
 		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
-			return n
+			return n, true
 		}
 	}
 	// Keyed by architecture, so the name is matched by suffix rather than
@@ -261,10 +264,10 @@ func (s showResponse) contextWindow() int {
 		}
 		var n int
 		if json.Unmarshal(raw, &n) == nil && n > 0 {
-			return n
+			return n, false
 		}
 	}
-	return 0
+	return 0, false
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body []byte) (*http.Response, error) {

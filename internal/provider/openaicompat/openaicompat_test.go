@@ -529,6 +529,9 @@ func TestProbeReadsTheWindowTheServerAllocated(t *testing.T) {
 	if res.ContextWindow != 103168 {
 		t.Errorf("ContextWindow = %d, want the 103168 this server allocated", res.ContextWindow)
 	}
+	if res.WindowEnforced {
+		t.Error("a metadata reading was marked enforced; the user's declaration must outrank it")
+	}
 }
 
 // vLLM states one number and it is the limit it enforces per request.
@@ -541,6 +544,9 @@ func TestProbeReadsVLLMMaxModelLen(t *testing.T) {
 	}
 	if res.ContextWindow != 32768 {
 		t.Errorf("ContextWindow = %d, want 32768", res.ContextWindow)
+	}
+	if !res.WindowEnforced {
+		t.Error("vLLM's per-request limit was not marked enforced")
 	}
 }
 

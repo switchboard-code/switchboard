@@ -287,6 +287,11 @@ func (c *Client) Probe(ctx context.Context, target provider.RouteTarget) (provid
 		if m.ID == target.ModelID {
 			res.ModelPresent = true
 			res.ContextWindow = m.contextWindow()
+			// vLLM's number is the limit the server enforces per request.
+			// The other names are metadata that can contradict itself — one
+			// unsloth-studio reports an allocation and an architecture
+			// ceiling side by side — so only vLLM's counts as enforced.
+			res.WindowEnforced = m.MaxModelLen > 0 && m.MaxModelLen == res.ContextWindow
 			break
 		}
 	}
@@ -295,7 +300,12 @@ func (c *Client) Probe(ctx context.Context, target provider.RouteTarget) (provid
 		return res, nil
 	}
 	if res.ContextWindow == 0 {
-		res.ContextWindow = c.slotContextWindow(ctx)
+		if allocated := c.slotContextWindow(ctx); allocated > 0 {
+			// /props reports what the server allocated, which is an
+			// enforced fact rather than a metadata reading.
+			res.ContextWindow = allocated
+			res.WindowEnforced = true
+		}
 	}
 
 	if c.profile.Tools {

@@ -66,7 +66,14 @@ type providers struct {
 	// windows is the same store for the attested context window, for the
 	// same reason: auto-compaction cannot arm against a number that
 	// evaporates when an effort change rebinds the target.
-	windows map[string]int
+	windows map[string]probedWindow
+}
+
+// probedWindow is an attested context window and whether the server enforces
+// it, because only an enforced window outranks the user's declared one.
+type probedWindow struct {
+	tokens   int
+	enforced bool
 }
 
 func newProviders(host string, cfg *config.Config) *providers {
@@ -78,7 +85,7 @@ func newProviders(host string, cfg *config.Config) *providers {
 		host:    host,
 		probes:  map[provider.RouteTargetID]provider.ProbeResult{},
 		efforts: map[string][]string{},
-		windows: map[string]int{},
+		windows: map[string]probedWindow{},
 	}
 }
 
@@ -172,18 +179,20 @@ func (p *providers) probedCapabilities(target provider.RouteTarget) (provider.Pr
 }
 
 // probedContextWindow reports the window this target's server attested, or
-// zero when it said nothing. A live answer outranks a catalog default for the
-// same reason a probed capability does: the catalog describes a surface, and
-// the server knows which model is loaded on it and how much of it was
-// allocated. The read is parameter-independent: /think rebinds the target
-// under a new identity, and the window does not move with the effort.
-func (p *providers) probedContextWindow(target provider.RouteTarget) int {
+// zero when it said nothing, and whether the server enforces that number.
+// A live answer outranks a catalog default for the same reason a probed
+// capability does: the catalog describes a surface, and the server knows
+// which model is loaded on it. The read is parameter-independent: /think
+// rebinds the target under a new identity, and the window does not move with
+// the effort.
+func (p *providers) probedContextWindow(target provider.RouteTarget) (int, bool) {
 	if p == nil {
-		return 0
+		return 0, false
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.windows[bareTargetKey(target)]
+	w := p.windows[bareTargetKey(target)]
+	return w.tokens, w.enforced
 }
 
 // probedEffortLevels reports the reasoning efforts this target's server
@@ -391,7 +400,7 @@ func (p *providers) probeTier(ctx context.Context, tier config.Tier) (config.Tie
 	p.mu.Lock()
 	p.probes[tier.Target.ID()] = probe
 	if probe.ContextWindow > 0 {
-		p.windows[bareTargetKey(tier.Target)] = probe.ContextWindow
+		p.windows[bareTargetKey(tier.Target)] = probedWindow{tokens: probe.ContextWindow, enforced: probe.WindowEnforced}
 	} else {
 		// Same posture as the effort list below: the freshest probe answer is
 		// the truth, and a silent one clears what an earlier probe said.

@@ -346,6 +346,14 @@ type ProbeResult struct {
 	// model that is loaded on it.
 	ContextWindow int
 
+	// WindowEnforced marks the difference between a window the server will
+	// hold a request to — an allocation or a per-request limit — and one
+	// inferred from metadata fields that can contradict each other on the
+	// same response. Only an enforced window outranks the number the user
+	// declared for the surface: a heuristic that disagrees with the person
+	// who configured the server is the heuristic's loss.
+	WindowEnforced bool
+
 	// EffortLevels are the reasoning efforts the server states this model
 	// accepts, in the server's own order, or nil where discovery says
 	// nothing about them. The same live-answer rule as ContextWindow: the

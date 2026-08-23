@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/switchboard-code/switchboard/internal/agent"
 	"github.com/switchboard-code/switchboard/internal/config"
 	"github.com/switchboard-code/switchboard/internal/provider"
 	"github.com/switchboard-code/switchboard/internal/session"
@@ -75,15 +76,41 @@ func TestAnUnknownWindowIsSaidRatherThanShownAsEmpty(t *testing.T) {
 // included.
 func TestProbedWindowSurvivesAnEffortChange(t *testing.T) {
 	base := provider.RouteTarget{Provider: "openaicompat", Surface: "generic", ModelID: "local"}
-	p := &providers{windows: map[string]int{bareTargetKey(base): 128000}}
+	p := &providers{windows: map[string]probedWindow{bareTargetKey(base): {tokens: 128000}}}
 
 	moved := base
 	moved.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "high"}
 	if moved.ID() == base.ID() {
 		t.Fatal("an effort change did not change the target identity; the test proves nothing")
 	}
-	if got := p.probedContextWindow(moved); got != 128000 {
+	if got, _ := p.probedContextWindow(moved); got != 128000 {
 		t.Fatalf("window under the rebound identity = %d, want the 128000 the server stated", got)
+	}
+}
+
+// The user is the better witness when the server's own fields contradict
+// each other: a declared window outranks a metadata-inferred probe, and only
+// an enforced window outranks the declaration.
+func TestDeclaredWindowOutranksAnInferredProbe(t *testing.T) {
+	m := testModel(t)
+	target := provider.RouteTarget{Provider: "openaicompat", Surface: "generic", ModelID: "local"}
+	m.app.loop.Bind(agent.Binding{Target: target})
+
+	m.app.providers = &providers{windows: map[string]probedWindow{
+		bareTargetKey(target): {tokens: 103168, enforced: false},
+	}}
+	m.app.config.Providers = map[string]config.ProviderSettings{
+		"openaicompat/generic": {ContextWindow: 262144},
+	}
+	m.refreshCtxWindow()
+	if m.ctxWindow != 262144 {
+		t.Fatalf("an inferred probe beat the declared window: %d", m.ctxWindow)
+	}
+
+	m.app.providers.windows[bareTargetKey(target)] = probedWindow{tokens: 103168, enforced: true}
+	m.refreshCtxWindow()
+	if m.ctxWindow != 103168 {
+		t.Fatalf("an enforced probe lost to the declaration: %d", m.ctxWindow)
 	}
 }
 

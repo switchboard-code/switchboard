@@ -160,6 +160,9 @@ func (c *ResponsesClient) Probe(ctx context.Context, target provider.RouteTarget
 		if m.Slug == target.ModelID {
 			res.ModelPresent = true
 			res.ContextWindow = m.ContextWindow
+			// The endpoint's per-model window is its own statement of what
+			// the model holds, not a metadata inference.
+			res.WindowEnforced = m.ContextWindow > 0
 			res.EffortLevels = m.effortLevels()
 		}
 	}

@@ -373,8 +373,12 @@ base_url = "http://localhost:1234/v1"
 context_window = 32768
 ```
 
-A probed window wins over this one, because the server knows which model is
-loaded and how much of it was allocated.
+A window the server enforces — an allocation, vLLM's per-request limit, or an
+endpoint's own per-model statement — wins over this one, because the server
+will hold the request to it. A window inferred from metadata fields wins only
+while you have said nothing: the same response can carry an allocation and an
+architecture ceiling that contradict each other, and your declared number is
+the better witness then.
 
 The local server's address resolves in this order: the `-host` flag, then
 `[providers.ollama] base_url`, then `OLLAMA_HOST`, then
