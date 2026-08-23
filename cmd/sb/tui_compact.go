@@ -163,9 +163,15 @@ func compactCmd(m *tuiModel, instructions string, auto bool) tea.Cmd {
 		}
 		handedOff = true
 		return sessionSwapMsg{sess: sess, tier: app.tier, client: app.loop.Binding().Provider, fresh: false, keepFold: true, release: release,
-			operation: generation, sourceID: sourceID, preserveRuntimeTarget: true}
+			operation: generation, sourceID: sourceID, preserveRuntimeTarget: true,
+			continuePrompt: compactContinuePrompt}
 	}
 }
+
+// compactContinuePrompt opens the first turn of a compacted session. The
+// summary is already established context; the instruction is to act on it,
+// not to retell it.
+const compactContinuePrompt = "Continue the work from the summary of the conversation so far. Pick up where it left off and keep going; do not recap the summary, act on it."
 
 // compactContinuity carries structured task state into the compacted log.
 // The generated summary already lives in the seed message, so copying it into

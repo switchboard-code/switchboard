@@ -149,6 +149,12 @@ type sessionSwapMsg struct {
 	// keeping a race arm. A clear, a resume, a fork, a retry replace the
 	// conversation — or revert the files — and the verdict dies with it.
 	keepFold bool
+
+	// continuePrompt, when set, opens a turn on the new session the moment
+	// the swap lands. Compaction sets it: a compacted session should pick
+	// the work back up, not wait for the user to say "continue" to a model
+	// that already has the summary.
+	continuePrompt string
 }
 type overrideProbeMsg struct {
 	generation uint64
@@ -2051,6 +2057,13 @@ func (m *tuiModel) onSessionSwap(msg sessionSwapMsg) tea.Cmd {
 		}
 	}
 
+	// A compacted session does not wait to be told what it already knows:
+	// with nothing queued, the continuation opens the new session's first
+	// turn. Queued prompts are themselves the continuation when they exist.
+	if msg.continuePrompt != "" && len(m.queue) == 0 {
+		return m.startTurn(msg.continuePrompt, "")
+	}
+
 	// Prompts queued behind the turn that triggered an auto-compaction run
 	// now, in the fresh context they were waiting for.
 	if len(m.queue) > 0 && !m.busy {
@@ -2285,28 +2298,33 @@ func (m *tuiModel) refreshCost(state session.State) {
 // refreshCtxWindow settles how much room this target has, from the most
 // direct source that has an answer.
 //
-// The server first: it knows which model is loaded and how much of its window
-// was actually allocated, which the catalog cannot. Then the user, who is the
-// only one who can speak for an endpoint nobody has characterized. The catalog
-// last, and its local surfaces deliberately record zero rather than guess.
-// Zero at the end is unknown, and unknown is reported as unknown: the number
-// gates auto-compaction, so inventing one would compact against a window that
-// does not exist.
+// The user first when the probe's number is a metadata inference rather than
+// an enforced limit: a server whose fields contradict each other is not a
+// better witness than the person who configured it. An enforced window — an
+// allocation, a per-request limit, the endpoint's own statement — outranks
+// the declaration, because the server will hold the request to it. The
+// catalog last, and its local surfaces deliberately record zero rather than
+// guess. Zero at the end is unknown, and unknown is reported as unknown: the
+// number gates auto-compaction, so inventing one would compact against a
+// window that does not exist.
 func (m *tuiModel) refreshCtxWindow() {
 	target := m.app.loop.Binding().Target
-	if probed := m.app.providers.probedContextWindow(target); probed > 0 {
-		m.ctxWindow = probed
-		return
-	}
-	if declared := m.app.config.ProviderForTarget(target.Provider, target.Surface).ContextWindow; declared > 0 {
+	probed, enforced := m.app.providers.probedContextWindow(target)
+	declared := m.app.config.ProviderForTarget(target.Provider, target.Surface).ContextWindow
+	switch {
+	case declared > 0 && !enforced:
 		m.ctxWindow = declared
-		return
+	case probed > 0:
+		m.ctxWindow = probed
+	case declared > 0:
+		m.ctxWindow = declared
+	default:
+		if info, _, ok := m.app.catalog.Lookup(target); ok {
+			m.ctxWindow = info.ContextWindow
+			return
+		}
+		m.ctxWindow = 0
 	}
-	if info, _, ok := m.app.catalog.Lookup(target); ok {
-		m.ctxWindow = info.ContextWindow
-		return
-	}
-	m.ctxWindow = 0
 }
 
 // --- view ------------------------------------------------------------------

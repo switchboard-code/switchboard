@@ -184,6 +184,10 @@ context window. `/compact preview` reports the messages and estimated tokens
 that would be replaced, the content that remains fixed, and the model that
 will summarize. `[slots] summarizer` assigns a dedicated tier to this work.
 
+The session does not wait to be told to go on: the new context's first turn
+starts by itself, acting on the summary rather than retelling it. Prompts
+queued while the summary ran go first — they are the continuation.
+
 ### What crosses a context boundary
 
 `todo` carries three fields beside the task list: `objective`, `next_action`,

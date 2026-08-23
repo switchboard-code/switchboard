@@ -59,6 +59,13 @@ func (r *repl) compact(ctx context.Context, instructions string) {
 	previous.Close()
 	r.callTokens = 0
 	r.out.Notice("", "compacted into session "+sess.ID()+"; the summary is its opening message")
+
+	// A compacted session does not wait to be told what it already knows:
+	// the continuation runs as the new session's first turn.
+	r.out.line(r.out.style(bold, "› ") + compactContinuePrompt)
+	if err := r.turnPrepared(ctx, compactContinuePrompt, nil, false); err != nil {
+		r.out.Notice("error", "the continuation could not start: "+err.Error())
+	}
 }
 
 // autoCompactIfFull runs at turn end, which is where occupancy is known from
@@ -84,22 +91,26 @@ func (r *repl) shouldCompactNow() bool {
 	return r.callTokens >= r.ctxWindow*compactThreshold(r.config)/100
 }
 
-// refreshCtxWindow settles how much room this target has, from the same three
-// sources and in the same order the TUI uses: the server, then the user, then
-// the catalog.
+// refreshCtxWindow settles how much room this target has, from the same
+// sources and in the same order the TUI uses: the user's declaration beats a
+// metadata-inferred probe, an enforced probe beats the declaration, and the
+// catalog is last.
 func (r *repl) refreshCtxWindow() {
 	target := r.loop.Binding().Target
-	if probed := r.providers.probedContextWindow(target); probed > 0 {
-		r.ctxWindow = probed
-		return
-	}
-	if declared := r.config.ProviderForTarget(target.Provider, target.Surface).ContextWindow; declared > 0 {
+	probed, enforced := r.providers.probedContextWindow(target)
+	declared := r.config.ProviderForTarget(target.Provider, target.Surface).ContextWindow
+	switch {
+	case declared > 0 && !enforced:
 		r.ctxWindow = declared
-		return
+	case probed > 0:
+		r.ctxWindow = probed
+	case declared > 0:
+		r.ctxWindow = declared
+	default:
+		if info, _, ok := r.catalog.Lookup(target); ok {
+			r.ctxWindow = info.ContextWindow
+			return
+		}
+		r.ctxWindow = 0
 	}
-	if info, _, ok := r.catalog.Lookup(target); ok {
-		r.ctxWindow = info.ContextWindow
-		return
-	}
-	r.ctxWindow = 0
 }

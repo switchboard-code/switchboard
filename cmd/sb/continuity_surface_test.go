@@ -451,9 +451,15 @@ func TestCompactSwapAuthorsLineageAndDeliversContinuityOnce(t *testing.T) {
 		!strings.Contains(seedOpening.AuthoredText(), "Line one.\n\nLine two.\tNext action.") {
 		t.Fatalf("compact seed did not carry one hidden capsule beside the unmodified summary: %#v", seedOpening)
 	}
-	if cmd := m.onSessionSwap(swap); cmd != nil {
-		t.Fatal("compact swap unexpectedly launched a queued turn")
+	// A compacted session continues on its own now: the swap hands back the
+	// continuation's launcher. It is not run here — the harness has no live
+	// provider — and planning is closed so the typed first turn below plans
+	// cleanly.
+	cmd := m.onSessionSwap(swap)
+	if cmd == nil {
+		t.Fatal("a compacted session did not continue on its own")
 	}
+	m.finishPlanning()
 	t.Cleanup(func() { _ = m.app.loop.Session.Close() })
 	if todos := m.app.loop.Tools.Todos(); len(todos) != 1 || todos[0].Text != "finish after compaction" {
 		t.Fatalf("compaction did not hydrate todos: %+v", todos)
@@ -490,6 +496,33 @@ func TestCompactSwapAuthorsLineageAndDeliversContinuityOnce(t *testing.T) {
 	}
 }
 
+// Queued prompts are the continuation when they exist: they were typed after
+// the work the summary describes, so they run first and the synthetic
+// "continue" never fires. Only an empty queue gets it.
+func TestCompactContinueYieldsToQueuedPrompts(t *testing.T) {
+	m := testModel(t)
+	appendTurn(t, m, "do the work", "done")
+	swap := compactWithSummary(t, m, "A summary of the work so far.")
+	m.queue = []string{"typed while the summary ran"}
+
+	cmd := m.onSessionSwap(swap)
+	if cmd == nil {
+		t.Fatal("the queued prompt did not start after the swap")
+	}
+	defer func() { _ = m.app.loop.Session.Close() }()
+	if len(m.queue) != 0 {
+		t.Fatalf("the queue survived its own drain: %v", m.queue)
+	}
+	flat := strings.Join(m.tr.flat, "\n")
+	if !strings.Contains(flat, "typed while the summary ran") {
+		t.Errorf("the queued prompt never rendered:\n%s", flat)
+	}
+	if strings.Contains(flat, compactContinuePrompt) {
+		t.Errorf("the synthetic continuation fired over a queued prompt:\n%s", flat)
+	}
+	m.finishPlanning()
+}
+
 func TestCompactRespectsContinuityTombstone(t *testing.T) {
 	m := testModel(t)
 	appendTurn(t, m, "clear carried state", "done")
@@ -505,9 +538,12 @@ func TestCompactRespectsContinuityTombstone(t *testing.T) {
 		swap.sess.Close()
 		t.Fatalf("tombstoned source produced a new capsule: %+v", got)
 	}
-	if cmd := m.onSessionSwap(swap); cmd != nil {
-		t.Fatal("tombstone swap returned a continuation")
+	// Same continuation contract as any compact swap: the launcher comes
+	// back, is not run (no live provider), and planning is closed.
+	if cmd := m.onSessionSwap(swap); cmd == nil {
+		t.Fatal("a compacted session did not continue on its own")
 	}
+	m.finishPlanning()
 	t.Cleanup(func() { _ = m.app.loop.Session.Close() })
 	if todos := m.app.loop.Tools.Todos(); len(todos) != 0 {
 		t.Fatalf("tombstone did not clear live todos: %+v", todos)
