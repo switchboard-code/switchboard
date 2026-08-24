@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -13,6 +14,8 @@ import (
 
 	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 )
+
+var windowsNativeMCPTestReOpenFile = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReOpenFile")
 
 func TestWindowsNativeMCPStateAndLockUseOwnerOnlyDACLs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), nativeMCPStateFileName)
@@ -100,17 +103,47 @@ func assertWindowsNativeMCPDirectoryOwnerOnly(t *testing.T, path string) {
 
 func setWindowsNativeMCPFileEveryoneDACL(t *testing.T, f *os.File) {
 	t.Helper()
+	// The lock can already exist because opening the deliberately unsafe state
+	// file acquires it before rejecting that state. OpenReadWriteOrCreate then
+	// returns its intentionally least-privileged existing-file handle, which
+	// has no WRITE_DAC. Reopen the exact selected file for the fixture mutation
+	// instead of weakening the production lock handle's access mask.
+	result, _, callErr := windowsNativeMCPTestReOpenFile.Call(
+		f.Fd(),
+		uintptr(windows.WRITE_DAC),
+		uintptr(uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)),
+		uintptr(uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)),
+	)
+	runtime.KeepAlive(f)
+	handle := windows.Handle(result)
+	if handle == windows.InvalidHandle {
+		if callErr == nil || callErr == windows.ERROR_SUCCESS {
+			callErr = windows.ERROR_INVALID_HANDLE
+		}
+		t.Fatal(callErr)
+	}
+	mutation := os.NewFile(uintptr(handle), f.Name()+" (test DACL mutation)")
+	if mutation == nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal("converting native MCP test DACL handle")
+	}
 	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;WD)")
 	if err != nil {
+		_ = mutation.Close()
 		t.Fatal(err)
 	}
 	dacl, _, err := descriptor.DACL()
 	if err != nil {
+		_ = mutation.Close()
 		t.Fatal(err)
 	}
-	if err := windows.SetSecurityInfo(windows.Handle(f.Fd()), windows.SE_FILE_OBJECT,
+	if err := windows.SetSecurityInfo(windows.Handle(mutation.Fd()), windows.SE_FILE_OBJECT,
 		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
 		nil, nil, dacl, nil); err != nil {
+		_ = mutation.Close()
+		t.Fatal(err)
+	}
+	if err := mutation.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
