@@ -30,7 +30,7 @@ func TestMessageRoundTrip(t *testing.T) {
 		},
 		{
 			"incomplete assistant message",
-			Message{Role: RoleAssistant, Incomplete: true, Content: []Block{Text{Text: "partial"}}},
+			Message{Role: RoleAssistant, Incomplete: true, DraftID: "session:draft:7", Content: []Block{Text{Text: "partial"}}},
 		},
 		{
 			"continuity delivery metadata",
@@ -38,6 +38,17 @@ func TestMessageRoundTrip(t *testing.T) {
 				Role: RoleUser, Content: []Block{Text{Text: "continue"}},
 				ContinuityRef: "0123456789abcdef0123456789abcdef",
 			},
+		},
+		{
+			"user steer provenance",
+			Message{
+				Role: RoleUser, Content: []Block{Text{Text: "[steer] stop the release"}},
+				Authored: "stop the release", AuthoredKnown: true, Injected: true, UserSteer: true,
+			},
+		},
+		{
+			"synthetic opening provenance",
+			Message{Role: RoleUser, Content: []Block{Text{Text: "continue"}}, Synthetic: true},
 		},
 		{
 			"binary blocks",
@@ -62,6 +73,49 @@ func TestMessageRoundTrip(t *testing.T) {
 				t.Errorf("round trip changed the message\n got: %#v\nwant: %#v", got, tc.msg)
 			}
 		})
+	}
+}
+
+func TestReplayRequestExcludesOnlyIncompleteAssistantMessages(t *testing.T) {
+	partial := Message{
+		Role:       RoleAssistant,
+		Incomplete: true,
+		Content:    []Block{Text{Text: "partial must stay durable"}},
+	}
+	flaggedUser := UserText("a non-assistant marker is not replay policy")
+	flaggedUser.Incomplete = true
+	plan := &CachePlan{RoutingKey: "stable-prefix"}
+	req := Request{
+		Messages: []Message{
+			UserText("before"),
+			partial,
+			flaggedUser,
+			UserText("after"),
+		},
+		CachePlan: plan,
+	}
+
+	got := ReplayRequest(req)
+	if len(got.Messages) != 3 {
+		t.Fatalf("projected messages = %+v, want only the incomplete assistant removed", got.Messages)
+	}
+	if got.Messages[0].Text() != "before" || got.Messages[1].Text() != flaggedUser.Text() || got.Messages[2].Text() != "after" {
+		t.Fatalf("projected messages changed order or removed the wrong role: %+v", got.Messages)
+	}
+	if !got.Messages[1].Incomplete {
+		t.Fatal("an incomplete marker on a non-assistant role was silently given assistant replay semantics")
+	}
+	if got.CachePlan != plan {
+		t.Fatal("projection changed unrelated request metadata")
+	}
+
+	// The source request is the durable shape. Projecting it must never erase
+	// the diagnostic record that a later resume or transcript reader needs.
+	if len(req.Messages) != 4 || req.Messages[1].Text() != partial.Text() || !req.Messages[1].Incomplete {
+		t.Fatalf("ReplayRequest mutated its input: %+v", req.Messages)
+	}
+	if twice := ReplayRequest(got); !reflect.DeepEqual(twice, got) {
+		t.Fatalf("projection is not idempotent:\n once: %+v\ntwice: %+v", got, twice)
 	}
 }
 
@@ -98,6 +152,27 @@ func TestAuthoredTextExcludesOnlyStampedContinuityBlock(t *testing.T) {
 	message.ContinuityRef = ""
 	if got := message.AuthoredText(); got != message.Text() {
 		t.Fatalf("unstamped authored text = %q, wire = %q", got, message.Text())
+	}
+}
+
+func TestAuthoredProjectionDoesNotGuessFromProviderExpandedContent(t *testing.T) {
+	expanded := Message{
+		Role:    RoleUser,
+		Content: []Block{Text{Text: "inspect @notes.txt\n\nContents of notes.txt:\nsecret evidence"}},
+	}.WithAuthoredText("inspect @notes.txt")
+	if got, known := expanded.AuthoredProjection(); !known || got != "inspect @notes.txt" {
+		t.Fatalf("authored projection = %q known=%v", got, known)
+	}
+	if got := expanded.Text(); !strings.Contains(got, "secret evidence") {
+		t.Fatalf("wire text lost expansion: %q", got)
+	}
+
+	legacy := Message{Role: RoleUser, Content: []Block{Text{Text: "possibly expanded legacy content"}}}
+	if got, known := legacy.AuthoredProjection(); known || got != "" {
+		t.Fatalf("legacy projection was guessed: %q known=%v", got, known)
+	}
+	if got := legacy.AuthoredText(); got != legacy.Text() {
+		t.Fatalf("legacy compatibility projection = %q, wire = %q", got, legacy.Text())
 	}
 }
 

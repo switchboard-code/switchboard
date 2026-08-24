@@ -17,7 +17,7 @@ func loadHooks(workspace string, ts *trust.Store) (*hooks.Set, []mcpNote) {
 	var sets []*hooks.Set
 
 	if home, err := os.UserHomeDir(); err == nil {
-		s, err := hooks.Load(filepath.Join(home, ".switchboard", hooks.FileName), workspace)
+		s, err := hooks.LoadRooted(home, filepath.Join(".switchboard", hooks.FileName), workspace)
 		if err != nil {
 			notes = append(notes, mcpNote{"error", err.Error()})
 		} else {
@@ -28,7 +28,7 @@ func loadHooks(workspace string, ts *trust.Store) (*hooks.Set, []mcpNote) {
 	repoPath := filepath.Join(workspace, ".switchboard", hooks.FileName)
 	if _, err := os.Stat(repoPath); err == nil {
 		if ts != nil && ts.Trusted(workspace) {
-			s, err := hooks.Load(repoPath, workspace)
+			s, err := hooks.LoadRooted(workspace, filepath.Join(".switchboard", hooks.FileName), workspace)
 			if err != nil {
 				notes = append(notes, mcpNote{"error", err.Error()})
 			} else {

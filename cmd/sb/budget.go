@@ -149,16 +149,16 @@ func (b *budgetState) finishLocked(scope string, bound, spent catalog.Money, fai
 }
 
 // preflightBound prices the §15 worst case for one call from an already
-// conservative input-token ceiling: the whole request cold and the target's
-// maximum output. TokensAreExact prevents the cost estimator from widening an
-// upper bound a second time. Eligibility mirrors candidatesFor, because a
+// conservative input-token ceiling: the whole request cold and the exact
+// output allowance the adapter sends. TokensAreExact prevents the cost
+// estimator from widening an upper bound a second time. Eligibility mirrors candidatesFor, because a
 // target that places markers pays the write rate on a miss.
 func preflightBound(info catalog.ModelInfo, contextTokens int) catalog.Money {
 	return preflightBoundWithOutput(info, contextTokens, info.MaxOutput)
 }
 
 func preflightBoundForTarget(info catalog.ModelInfo, target provider.RouteTarget, contextTokens int) catalog.Money {
-	return preflightBoundWithOutput(info, contextTokens, max(info.MaxOutput, reservedOutputTokens(target, info)))
+	return preflightBoundWithOutput(info, contextTokens, reservedOutputTokens(target, info))
 }
 
 func preflightBoundWithOutput(info catalog.ModelInfo, contextTokens, outputTokens int) catalog.Money {
@@ -186,6 +186,7 @@ type budgetGuard struct {
 	persisted func() catalog.Money
 	begin     func(catalog.Money) (string, error)
 	settle    func(string, string, catalog.Money) error
+	allowance func(provider.RouteTarget, int) int
 	external  bool
 
 	mu           sync.Mutex
@@ -215,6 +216,11 @@ func (g *budgetGuard) withLedger(
 	return g
 }
 
+func (g *budgetGuard) withOutputAllowance(resolve func(provider.RouteTarget, int) int) *budgetGuard {
+	g.allowance = resolve
+	return g
+}
+
 func (g *budgetGuard) scopeID() string {
 	if g.scope == nil {
 		return ""
@@ -223,11 +229,16 @@ func (g *budgetGuard) scopeID() string {
 }
 
 func (g *budgetGuard) before(promptTokens, attempt int) error {
-	info, _, ok := g.catalog.Lookup(g.target())
+	target := g.target()
+	info, _, ok := g.catalog.Lookup(target)
 	if !ok {
 		return nil
 	}
-	bound := preflightBoundForTarget(info, g.target(), promptTokens)
+	output := reservedOutputTokens(target, info)
+	if g.allowance != nil {
+		output = g.allowance(target, info.MaxOutput)
+	}
+	bound := preflightBoundWithOutput(info, promptTokens, output)
 	if bound <= 0 {
 		if info.Metering != catalog.Local && info.Metering != catalog.Plan && !info.Free() {
 			return fmt.Errorf("%w: refusing priced provider attempt %d because the catalog produced no positive conservative cost bound", errBudgetUnavailable, attempt)
@@ -339,7 +350,7 @@ func wireBudget(loop *agent.Loop, guard *budgetGuard) {
 // primaryGate wires the gate to the primary loop: its own moving target,
 // its own session's priced record — the same number /cost shows.
 func primaryGate(bs *budgetState, loop *agent.Loop, cat *catalog.Catalog) *budgetGuard {
-	return budgetGate(bs, cat,
+	guard := budgetGate(bs, cat,
 		func() provider.RouteTarget { return loop.Binding().Target },
 		func() catalog.Money { return catalog.Money(loop.Session.State().AccountedCostMicroUSD()) },
 		func() string { return loop.Session.ID() }).withLedger(
@@ -348,12 +359,18 @@ func primaryGate(bs *budgetState, loop *agent.Loop, cat *catalog.Catalog) *budge
 		func(id, outcome string, charge catalog.Money) error {
 			return loop.Session.SettleBudgetAttempt(id, outcome, int64(charge))
 		}, false)
+	return guard.withOutputAllowance(func(target provider.RouteTarget, catalogMax int) int {
+		if loop.OutputAllowance != nil {
+			return loop.OutputAllowance(target, catalogMax)
+		}
+		return effectiveOutputTokenAllowance(loop.Binding().Provider, target, catalogMax)
+	})
 }
 
 // beginMeteredCall gives one-shot model features (/compact, /learn, advisor)
 // the same durable admission protocol as agent.Loop. The returned closure must
 // be called exactly once with either EventDone usage or the call error.
-func beginMeteredCall(bs *budgetState, cat *catalog.Catalog, sess *session.Session, target provider.RouteTarget, req provider.Request, purpose string) (func(provider.Usage, error) error, error) {
+func beginMeteredCall(bs *budgetState, cat *catalog.Catalog, sess *session.Session, target provider.RouteTarget, req provider.Request, purpose string, bound ...provider.Provider) (func(provider.Usage, error) error, error) {
 	if bs == nil || cat == nil || sess == nil {
 		return nil, fmt.Errorf("model call has no durable budget ledger")
 	}
@@ -372,6 +389,11 @@ func beginMeteredCall(bs *budgetState, cat *catalog.Catalog, sess *session.Sessi
 		func(id, outcome string, charge catalog.Money) error {
 			return sess.SettleBudgetAttempt(id, outcome, int64(charge))
 		}, false)
+	if len(bound) > 0 && bound[0] != nil {
+		guard.withOutputAllowance(func(target provider.RouteTarget, catalogMax int) int {
+			return effectiveOutputTokenAllowance(bound[0], target, catalogMax)
+		})
+	}
 	tokens := prefix.RequestTokens(req)
 	contextTokens := prefix.RequestTokenCeiling(req)
 	if err := guard.before(contextTokens, 1); err != nil {

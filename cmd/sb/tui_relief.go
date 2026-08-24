@@ -56,7 +56,7 @@ func (a *tuiApp) relief(ctx context.Context, reason agent.ReliefReason, cause er
 	var refusals []string
 	for _, candidate := range candidates {
 		rank := candidate.rank
-		probed, client, _, err := a.providers.probeTierFallbackFeasible(ctx, candidate.tier, func(tier config.Tier) error {
+		probed, client, fallbackNote, err := a.providers.probeTierFallbackFeasible(ctx, candidate.tier, func(tier config.Tier) error {
 			return checkMoveFeasible(a.loop, a.catalog, a.providers, a.budget, a.config.Destinations, tier, rank)
 		})
 		if err != nil {
@@ -65,6 +65,12 @@ func (a *tuiApp) relief(ctx context.Context, reason agent.ReliefReason, cause er
 		}
 		if ctx.Err() != nil {
 			return agent.Binding{}, "", ctx.Err()
+		}
+		if a.reliefAfterProbe != nil {
+			a.reliefAfterProbe()
+		}
+		if !a.providers.preparedClientCurrent(client) {
+			return agent.Binding{}, "", &providerReconfiguredError{}
 		}
 		if probed.Target.ID() == current.Target.ID() {
 			// The same target cannot answer the refusal it just made.
@@ -76,7 +82,12 @@ func (a *tuiApp) relief(ctx context.Context, reason agent.ReliefReason, cause er
 		// and priced before the rebind discards the tracker.
 		abandoned := abandonedCacheNote(current.Cache, a.catalog, time.Now())
 
-		if err := persistRuntimeBinding(a.loop.Session, probed, false); err != nil {
+		if fallbackNote != "" {
+			err = a.loop.Session.AppendRuntimeBindingNote(probed.ID, probed.Target.ID(), false, "warn", fallbackNote)
+		} else {
+			err = persistRuntimeBinding(a.loop.Session, probed, false)
+		}
+		if err != nil {
 			return agent.Binding{}, "", fmt.Errorf("the substitution was not saved, so it was not made: %w", err)
 		}
 		a.bindRuntime(probed, client)
@@ -87,8 +98,13 @@ func (a *tuiApp) relief(ctx context.Context, reason agent.ReliefReason, cause er
 		// because they have to agree with /why about how far the session
 		// moved. Both reasons send this; what differs is the sentence, which
 		// says plainly which of the two happened.
-		a.p.Send(tierNowMsg{line: note, rank: rank, tier: probed, abandoned: abandoned})
-		return a.loop.Binding(), "", nil
+		if a.p != nil {
+			a.p.Send(tierNowMsg{line: note, rank: rank, tier: probed, abandoned: abandoned})
+		}
+		// The loop renders this exact fallback sentence before it starts the
+		// next provider call. The generic relief sentence above remains the UI's
+		// routing-state update and must not replace the substitution evidence.
+		return a.loop.Binding(), fallbackNote, nil
 	}
 
 	return agent.Binding{}, "", fmt.Errorf("no rung could take this over: %s", joinRefusals(refusals))

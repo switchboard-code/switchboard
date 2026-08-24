@@ -227,7 +227,7 @@ func baselineEnvironmentName(name string) bool {
 	}
 	if runtime.GOOS == "windows" {
 		switch candidate {
-		case "COMSPEC", "PATHEXT", "SYSTEMROOT", "TEMP":
+		case "APPDATA", "COMSPEC", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "PATHEXT", "SYSTEMROOT", "TEMP", "USERPROFILE":
 			return true
 		}
 	}
@@ -327,7 +327,18 @@ func (t *stdioTransport) Recv() ([]byte, error) {
 		chunk, err := t.stdout.ReadSlice('\n')
 		buf.Write(chunk)
 		if err == nil {
-			line := bytes.TrimSpace(buf.Bytes())
+			raw := buf.Bytes()
+			messageBytes := len(raw)
+			if messageBytes > 0 && raw[messageBytes-1] == '\n' {
+				messageBytes--
+				if messageBytes > 0 && raw[messageBytes-1] == '\r' {
+					messageBytes--
+				}
+			}
+			if messageBytes > limit {
+				return nil, fmt.Errorf("mcp message exceeds %d bytes", limit)
+			}
+			line := bytes.TrimSpace(raw[:messageBytes])
 			if len(line) == 0 {
 				buf.Reset()
 				continue

@@ -452,6 +452,21 @@ func TestFinishRaceSwapsOntoTheWinnerAndRecords(t *testing.T) {
 	if got := m.app.loop.Session.Path(); got != winnerPath {
 		t.Errorf("session is %s, want the winning branch %s", got, winnerPath)
 	}
+	if armB.sess.PublicationPending() || armA.sess.PublicationPending() {
+		t.Fatal("finalized race left the winner or accounting alternative unpublished")
+	}
+	infos, err := m.app.store.List(m.app.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenWinner, seenLoser := false, false
+	for _, info := range infos {
+		seenWinner = seenWinner || info.Path == winnerPath
+		seenLoser = seenLoser || info.Path == loserPath
+	}
+	if !seenWinner || !seenLoser {
+		t.Fatalf("published race inventory missing winner=%v loser=%v: %#v", seenWinner, seenLoser, infos)
+	}
 	if m.app.tier.ID != "t2" {
 		t.Errorf("active tier is %s, want the winning rung t2", m.app.tier.ID)
 	}
@@ -477,6 +492,53 @@ func TestFinishRaceSwapsOntoTheWinnerAndRecords(t *testing.T) {
 	}
 	if len(m.raceLog) == 0 || !strings.Contains(m.raceLog[0], "kept t2") {
 		t.Errorf("/why has no race line: %v", m.raceLog)
+	}
+}
+
+func TestFinishRacePublicationCollisionKeepsOriginAndHidesBothBranches(t *testing.T) {
+	m := raceModel(t)
+	origin := m.app.loop.Session
+
+	armA, err := assembleRaceArm(m.app, m.app.config.Tiers[0], &racedProvider{}, agent.NopObserver{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	armB, err := assembleRaceArm(m.app, m.app.config.Tiers[1], &racedProvider{}, agent.NopObserver{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	armA.status, armB.status = "completed", "completed"
+	winnerPath, loserPath := armB.sess.Path(), armA.sess.Path()
+	winnerID, loserID := armB.sess.ID(), armA.sess.ID()
+	// A marker this creator does not own makes the winner's publication commit
+	// fail. The losing answer must still be staged at this point so adoption can
+	// close both branches and leave them invisible for bounded maintenance.
+	if err := os.WriteFile(winnerPath+".published", []byte("foreign publication marker\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := &raceRun{typed: "the raced prompt", arms: [2]*raceArm{armA, armB}}
+	m.race = run
+	m.busy = true
+
+	m.finishRace(run, "b", "b")
+
+	if m.app.loop.Session != origin {
+		t.Fatalf("publication failure adopted %s, want origin %s", m.app.loop.Session.ID(), origin.ID())
+	}
+	for _, branch := range []struct{ id, path string }{
+		{id: winnerID, path: winnerPath},
+		{id: loserID, path: loserPath},
+	} {
+		assertRetainedUnpublishedStage(t, m.app.store, m.app.workspace, branch.id, branch.path)
+	}
+	infos, err := m.app.store.List(m.app.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, info := range infos {
+		if info.Path == winnerPath || info.Path == loserPath {
+			t.Fatalf("failed race branch became discoverable: %+v", info)
+		}
 	}
 }
 
@@ -571,7 +633,7 @@ func TestRacePreflightRefusesKnownPaidArmWithoutConservativePrice(t *testing.T) 
 func TestRaceRetryReserveUsesTheOriginAsItsAuthoritativeLedger(t *testing.T) {
 	cat, target := pricedTarget(t)
 	info, _, _ := cat.Lookup(target)
-	bound := preflightBound(info, 10_000)
+	bound := preflightBoundForTarget(info, target, 10_000)
 	store, err := session.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -714,6 +776,12 @@ func TestFinalizedRaceWinnerCanRaceAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := first.sess.FinalizeRaceBranch(); err != nil {
+		t.Fatal(err)
+	}
+	// A winner becomes a valid source only after the real adoption seam's
+	// publication commit. This test bypasses finishRace/onSessionSwap, so mirror
+	// that final step explicitly before starting another race from it.
+	if err := first.sess.Publish(); err != nil {
 		t.Fatal(err)
 	}
 	origin := m.app.loop.Session

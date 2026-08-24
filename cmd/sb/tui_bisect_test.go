@@ -56,7 +56,8 @@ func TestBisectRefusesAPartialTurn(t *testing.T) {
 	dir := t.TempDir()
 	big := filepath.Join(dir, "big.bin")
 	os.WriteFile(big, []byte(strings.Repeat("x", 4<<20+1)), 0o644)
-	m.app.undo.Begin("bulk change")
+	token := "ghp_" + strings.Repeat("e", 36)
+	m.app.undo.Begin("bulk change " + token)
 	m.app.undo.Record(big)
 
 	cmd := cmdBisect(m, "go test ./...")
@@ -66,6 +67,9 @@ func TestBisectRefusesAPartialTurn(t *testing.T) {
 	msg := cmd().(noticeMsg)
 	if !strings.Contains(msg.text, "snapshot cap") {
 		t.Errorf("a partial turn must be refused by name: %q", msg.text)
+	}
+	if strings.Contains(msg.text, token) || !strings.Contains(msg.text, "[redacted") {
+		t.Errorf("a partial-turn refusal rendered its credential-shaped label: %q", msg.text)
 	}
 }
 
@@ -133,10 +137,10 @@ func TestRedWatchVerdictNamesBisectOnce(t *testing.T) {
 		os.WriteFile(path, []byte("v1"), 0o644)
 	}
 
-	report := watchReportMsg{command: "go test ./...", turnEnd: true, rep: watch.Report{
+	report := bindWatchReport(t, m, watchReportMsg{command: "go test ./...", turnEnd: true, rep: watch.Report{
 		New:        []route.Failure{{Line: "--- FAIL: TestX", Signature: "sig"}},
 		Signatures: []string{"sig"},
-	}}
+	}})
 	m.onWatchReport(report)
 	joined := strings.Join(m.tr.flat, "\n")
 	if !strings.Contains(joined, "/bisect can name the turn") {
@@ -175,6 +179,18 @@ func TestBisectVerdictFoldsIntoTheNextPrompt(t *testing.T) {
 	}
 	if strings.Contains(folded, "sk-ant-api03-abcdefghijklmnopqrstuvwxyz") {
 		t.Errorf("a key-shaped string in verifier output rode the fold unredacted:\n%s", folded)
+	}
+}
+
+func TestBisectVerdictRedactsBeforeTheFailureCap(t *testing.T) {
+	token := "sk-ant-api03-" + "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnop"
+	text := bisectInjectText("go test", "break things", bisect.Result{
+		Outcome: bisect.Found,
+		Culprit: 1,
+		Fail:    bisect.Verdict{FirstFail: strings.Repeat("x", 179) + " " + token},
+	})
+	if strings.Contains(text, "sk-ant-api03-") || !strings.Contains(text, "[redacted") {
+		t.Fatalf("a boundary-straddling key fragment survived the bisect cap:\n%s", text)
 	}
 }
 

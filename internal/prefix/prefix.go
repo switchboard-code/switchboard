@@ -416,6 +416,7 @@ func (l *Layout) HistoryBlocks() int {
 // bias (docs/estimator.md): a floor, never an overcount. The budget check
 // prices its preflight bound from this, which is why it is exported.
 func RequestTokens(req provider.Request) int {
+	req = provider.ReplayRequest(req)
 	total := 0
 	for _, b := range req.System {
 		total += blockTokens(b)
@@ -439,6 +440,7 @@ func RequestTokens(req provider.Request) int {
 // every payload byte and adds explicit request framing. Byte-fallback
 // tokenizers cannot exceed that text allowance; media has a separate bound.
 func RequestTokenCeiling(req provider.Request) int {
+	req = provider.ReplayRequest(req)
 	total := 16 // request envelope
 	for _, block := range req.System {
 		total = saturatingIntAdd(total, 8)

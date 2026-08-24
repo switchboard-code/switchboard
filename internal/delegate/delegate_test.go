@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -112,6 +113,43 @@ func (s *oneTurnStream) Next() (provider.Event, error) {
 }
 
 func (s *oneTurnStream) Close() error { return nil }
+
+type fallbackNoticeObserver struct {
+	agent.NopObserver
+	want string
+	seen atomic.Bool
+}
+
+func (o *fallbackNoticeObserver) Notice(level, text string) {
+	if level == "warn" && strings.Contains(text, o.want) {
+		o.seen.Store(true)
+	}
+}
+
+type fallbackOrderedProvider struct {
+	observer *fallbackNoticeObserver
+	calls    atomic.Int32
+	ordered  atomic.Bool
+}
+
+func (*fallbackOrderedProvider) Name() string { return "fallback-ordered" }
+
+func (p *fallbackOrderedProvider) Stream(context.Context, provider.RouteTarget, provider.Request) (provider.EventStream, error) {
+	p.calls.Add(1)
+	p.ordered.Store(p.observer != nil && p.observer.seen.Load())
+	return &oneTurnStream{events: []provider.Event{
+		{Type: provider.EventTextDelta, Index: 0, Text: "done"},
+		{Type: provider.EventDone, StopReason: provider.StopEndTurn},
+	}}, nil
+}
+
+func (*fallbackOrderedProvider) CountTokens(context.Context, provider.RouteTarget, provider.Request) (provider.TokenEstimate, error) {
+	return provider.TokenEstimate{}, nil
+}
+
+func (*fallbackOrderedProvider) Probe(context.Context, provider.RouteTarget) (provider.ProbeResult, error) {
+	return provider.ProbeResult{Reachable: true, ModelPresent: true}, nil
+}
 
 func ladder() []config.Tier {
 	return []config.Tier{
@@ -225,6 +263,106 @@ func TestRunReturnsTheFinalAnswerWithATrailer(t *testing.T) {
 	}
 	if !strings.Contains(res.Content, "[delegate on t2:") {
 		t.Errorf("content = %q, want the trailer naming the rung it ran on", res.Content)
+	}
+}
+
+func TestRunnerFallbackNoteIsDurableAndObservedBeforeContent(t *testing.T) {
+	cfg := testConfig(t, "unused")
+	const note = "t2 is served by its fallback scripted/local/backup: primary unavailable"
+	observer := &fallbackNoticeObserver{want: note}
+	client := &fallbackOrderedProvider{observer: observer}
+	fallbackTier := cfg.Tiers[1]
+	fallbackTier.Target.ModelID = "backup"
+	cfg.Probe = func(context.Context, string) (config.Tier, provider.Provider, string, error) {
+		return fallbackTier, client, note, nil
+	}
+	cfg.Forward = func() agent.Observer { return observer }
+	newSession := cfg.NewSession
+	var child *session.Session
+	cfg.NewSession = func(target provider.RouteTargetID) (*session.Session, error) {
+		var err error
+		child, err = newSession(target)
+		return child, err
+	}
+
+	tool, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := plan(t, tool, `{"task":"inspect","tier":"t2"}`)
+	res, err := p.Run(context.Background())
+	if err != nil || res.IsError {
+		t.Fatalf("fallback delegate failed: result=%+v err=%v", res, err)
+	}
+	if client.calls.Load() != 1 || !client.ordered.Load() {
+		t.Fatalf("provider order = calls:%d notice-before-call:%v", client.calls.Load(), client.ordered.Load())
+	}
+	if child == nil {
+		t.Fatal("delegate created no child session")
+	}
+	timeline, err := session.ReadTimeline(child.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, item := range timeline {
+		if item.Note != nil && item.Note.Text == note {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("delegate fallback timeline count = %d, want one", count)
+	}
+}
+
+func TestRunnerFallbackAppendFailureStopsDelegateAndWorkflowContent(t *testing.T) {
+	cfg := testConfig(t, "unused")
+	const note = "t2 is served by its fallback scripted/local/backup: primary unavailable"
+	observer := &fallbackNoticeObserver{want: note}
+	client := &fallbackOrderedProvider{observer: observer}
+	fallbackTier := cfg.Tiers[1]
+	fallbackTier.Target.ModelID = "backup"
+	cfg.Probe = func(context.Context, string) (config.Tier, provider.Provider, string, error) {
+		return fallbackTier, client, note, nil
+	}
+	cfg.Forward = func() agent.Observer { return observer }
+	newSession := cfg.NewSession
+	var child *session.Session
+	cfg.NewSession = func(target provider.RouteTargetID) (*session.Session, error) {
+		var err error
+		child, err = newSession(target)
+		if err == nil {
+			err = child.Close()
+		}
+		return child, err
+	}
+
+	tool, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := plan(t, tool, `{"task":"must not leave","tier":"t2"}`)
+	res, err := p.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || !strings.Contains(res.Content, "could not record the fallback note") {
+		t.Fatalf("fallback append refusal = %+v", res)
+	}
+	if client.calls.Load() != 0 || observer.seen.Load() {
+		t.Fatalf("failed append leaked content or notice: calls=%d notice=%v", client.calls.Load(), observer.seen.Load())
+	}
+	if child == nil {
+		t.Fatal("delegate created no child session")
+	}
+	timeline, err := session.ReadTimeline(child.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range timeline {
+		if item.Note != nil && item.Note.Text == note {
+			t.Fatal("failed delegate append left a fallback note")
+		}
 	}
 }
 

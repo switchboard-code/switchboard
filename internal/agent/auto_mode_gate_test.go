@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,6 +18,20 @@ import (
 	"github.com/switchboard-code/switchboard/internal/session"
 	"github.com/switchboard-code/switchboard/internal/tools"
 )
+
+func TestMain(m *testing.M) {
+	if os.Getenv("SWITCHBOARD_AGENT_BUILD_HELPER") == "1" {
+		marker := os.Getenv("SWITCHBOARD_BUILD_MARKER")
+		if marker == "" {
+			os.Exit(2)
+		}
+		if err := os.WriteFile(marker, []byte("ran"), 0o600); err != nil {
+			os.Exit(2)
+		}
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
 
 type buildAllowReviewer struct {
 	calls   atomic.Int32
@@ -50,10 +66,12 @@ func autoBuildLoop(t *testing.T, controller *execution.Controller, reviewer perm
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	trap := "#!/bin/sh\nprintf ran > \"$SWITCHBOARD_BUILD_MARKER\"\n"
-	if err := os.WriteFile(filepath.Join(bin, "go"), []byte(trap), 0o755); err != nil {
-		t.Fatal(err)
+	helperName := "go"
+	if runtime.GOOS == "windows" {
+		helperName += ".exe"
 	}
+	copyTestExecutable(t, filepath.Join(bin, helperName))
+	t.Setenv("SWITCHBOARD_AGENT_BUILD_HELPER", "1")
 	t.Setenv("SWITCHBOARD_BUILD_MARKER", marker)
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
@@ -74,6 +92,30 @@ func autoBuildLoop(t *testing.T, controller *execution.Controller, reviewer perm
 	perms := permission.NewEngineWithExecution(permission.ModeAuto, controller)
 	perms.SetReviewer(reviewer)
 	return &Loop{Tools: registry, Perms: perms, Asker: asker, Session: sess}, marker
+}
+
+func copyTestExecutable(t *testing.T, destination string) {
+	t.Helper()
+	sourcePath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	dest, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(dest, source); err != nil {
+		_ = dest.Close()
+		t.Fatal(err)
+	}
+	if err := dest.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func runAutoBuild(loop *Loop) (provider.ToolResult, error) {

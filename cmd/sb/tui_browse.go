@@ -25,6 +25,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/switchboard-code/switchboard/internal/catalog"
 	"github.com/switchboard-code/switchboard/internal/config"
 	"github.com/switchboard-code/switchboard/internal/credential"
 	"github.com/switchboard-code/switchboard/internal/provider"
@@ -92,31 +93,64 @@ func addressKey(providerName, surface string) string {
 // models. onChoice is what the caller does with a pick, which is the only
 // thing /models and first-run setup disagree about.
 func browseSurfaceCmd(reg *providers, cfg *config.Config, choice modelChoice, onChoice func(modelChoice) tea.Cmd) tea.Cmd {
-	providerName, surface := choice.provider, choice.surface
-	again := func() tea.Cmd { return browseSurfaceCmd(reg, cfg, choice, onChoice) }
+	return browseSurfaceCmdBound(asyncResultBinding{}, reg, nil, cfg, choice, onChoice)
+}
 
-	current := cfg.ProviderForTarget(providerName, surface).BaseURL
+func browseSurfaceCmdWithCatalog(reg *providers, cat *catalog.Catalog, cfg *config.Config, choice modelChoice, onChoice func(modelChoice) tea.Cmd) tea.Cmd {
+	return browseSurfaceCmdBound(asyncResultBinding{}, reg, cat, cfg, choice, onChoice)
+}
+
+func browseSurfaceCmdForTUI(m *tuiModel, reg *providers, cfg *config.Config, choice modelChoice, onChoice func(modelChoice) tea.Cmd) tea.Cmd {
+	return browseSurfaceCmdForTUIBound(m, m.bindAsyncResult(), reg, cfg, choice, onChoice)
+}
+
+func browseSurfaceCmdForTUIBound(m *tuiModel, binding asyncResultBinding, reg *providers, cfg *config.Config, choice modelChoice, onChoice func(modelChoice) tea.Cmd) tea.Cmd {
+	readCfg := cfg.Snapshot()
+	readReg := reg.discoverySnapshot(readCfg)
+	again := func() tea.Cmd {
+		return browseSurfaceCmdForTUIBound(m, binding, reg, cfg, choice, onChoice)
+	}
+	return browseSurfaceCmdWithReaders(binding, readReg, m.app.catalog, readCfg, reg, cfg, choice, onChoice, again)
+}
+
+func browseSurfaceCmdBound(binding asyncResultBinding, reg *providers, cat *catalog.Catalog, cfg *config.Config, choice modelChoice, onChoice func(modelChoice) tea.Cmd) tea.Cmd {
+	readCfg := cfg.Snapshot()
+	readReg := reg.discoverySnapshot(readCfg)
+	again := func() tea.Cmd { return browseSurfaceCmdBound(binding, reg, cat, cfg, choice, onChoice) }
+	return browseSurfaceCmdWithReaders(binding, readReg, cat, readCfg, reg, cfg, choice, onChoice, again)
+}
+
+func browseSurfaceCmdWithReaders(binding asyncResultBinding,
+	readReg *providers, cat *catalog.Catalog, readCfg *config.Config,
+	liveReg *providers, liveCfg *config.Config,
+	choice modelChoice, onChoice func(modelChoice) tea.Cmd, again func() tea.Cmd,
+) tea.Cmd {
+	providerName, surface := choice.provider, choice.surface
+
+	current := readCfg.ProviderForTarget(providerName, surface).BaseURL
 	if surfaceNeedsAddress(providerName, surface) && current == "" {
-		return askAddressCmd(reg, cfg, providerName, surface, again)
+		readReg.releaseSnapshot()
+		return askAddressCmd(binding, liveReg, liveCfg, providerName, surface, again)
 	}
 
 	return func() tea.Msg {
+		defer readReg.releaseSnapshot()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		names, efforts, listErr := listSurfaceModels(ctx, reg, providerName, surface)
+		names, efforts, listErr := listSurfaceModels(ctx, readReg, providerName, surface)
 		bind := func(model string) modelChoice {
-			levels := choice.effortLevels
+			bound := modelChoice{
+				ref:      providerName + "/" + model,
+				provider: providerName,
+				surface:  surface,
+				desc:     choice.desc,
+			}
+			bound = withModelChoiceCatalogEvidence(cat, bound)
 			if stated := efforts[model]; len(stated) > 0 {
-				levels = stated
+				bound.effortLevels = append([]string(nil), stated...)
 			}
-			return modelChoice{
-				ref:          providerName + "/" + model,
-				provider:     providerName,
-				surface:      surface,
-				desc:         choice.desc,
-				effortLevels: levels,
-			}
+			return bound
 		}
 
 		var items []pickerItem
@@ -144,9 +178,9 @@ func browseSurfaceCmd(reg *providers, cfg *config.Config, choice modelChoice, on
 			desc:  listNote(len(names), listErr),
 		})
 		if surfaceTakesAddress(providerName) {
-			addr := cfg.ProviderForTarget(providerName, surface).BaseURL
+			addr := readCfg.ProviderForTarget(providerName, surface).BaseURL
 			if providerName == ollama.Name {
-				addr = reg.localServer().BaseURL()
+				addr = readReg.localServer().BaseURL()
 			}
 			items = append(items, pickerItem{
 				id:    setAddressID,
@@ -155,29 +189,32 @@ func browseSurfaceCmd(reg *providers, cfg *config.Config, choice modelChoice, on
 			})
 		}
 
-		return pickerMsg{
+		return binding.bindPicker(pickerMsg{
 			title: "models on " + providerName + "/" + surface,
 			items: items,
 			action: func(id string) tea.Cmd {
 				switch id {
 				case storeSecretID:
-					return askSurfaceSecretCmd(providerName, surface, again)
+					// Assemble the next discovery snapshot now, on the event-loop
+					// goroutine. The secret-prompt command itself runs asynchronously.
+					next := again()
+					return askSurfaceSecretCmd(binding, providerName, surface, func() tea.Cmd { return next })
 				case setAddressID:
-					return askAddressCmd(reg, cfg, providerName, surface, again)
+					return askAddressCmd(binding, liveReg, liveCfg, providerName, surface, again)
 				case typeModelID:
 					return func() tea.Msg {
-						return textPromptMsg{
+						return binding.bindText(textPromptMsg{
 							title: "model id on " + providerName + "/" + surface,
 							help:  "the id the server itself uses, copied exactly",
 							submit: func(model string) tea.Cmd {
 								return onChoice(bind(model))
 							},
-						}
+						})
 					}
 				}
 				return onChoice(bind(id))
 			},
-		}
+		})
 	}
 }
 
@@ -185,7 +222,7 @@ func browseSurfaceCmd(reg *providers, cfg *config.Config, choice modelChoice, on
 // write goes to the config the next launch reads, and the cached adapters are
 // dropped so the address takes effect on the next request rather than the
 // next process.
-func askAddressCmd(reg *providers, cfg *config.Config, providerName, surface string, then func() tea.Cmd) tea.Cmd {
+func askAddressCmd(binding asyncResultBinding, reg *providers, cfg *config.Config, providerName, surface string, then func() tea.Cmd) tea.Cmd {
 	key := addressKey(providerName, surface)
 	current := cfg.ProviderForTarget(providerName, surface).BaseURL
 	help := "the base url, including any /v1 the server serves under"
@@ -194,13 +231,12 @@ func askAddressCmd(reg *providers, cfg *config.Config, providerName, surface str
 		help = "the Ollama server's address, without /v1"
 	}
 	return func() tea.Msg {
-		return textPromptMsg{
+		return binding.bindText(textPromptMsg{
 			title:   "server address for " + providerName + "/" + surface,
 			help:    help,
 			initial: current,
 			submit: func(value string) tea.Cmd {
-				cfg.SetProviderBaseURL(key, value)
-				if err := cfg.Save(); err != nil {
+				if err := cfg.SetProviderBaseURLAndSave(key, value); err != nil {
 					return noticeCmd("error", "saving the address failed: "+err.Error())
 				}
 				if providerName == ollama.Name {
@@ -210,14 +246,14 @@ func askAddressCmd(reg *providers, cfg *config.Config, providerName, surface str
 				}
 				return then()
 			},
-		}
+		})
 	}
 }
 
 // askSurfaceSecretCmd takes the credential a surface just refused a request
 // for, and reopens the surface once it is stored. The prompt is the same
 // masked one /login uses and lands in the same store.
-func askSurfaceSecretCmd(providerName, surface string, then func() tea.Cmd) tea.Cmd {
+func askSurfaceSecretCmd(binding asyncResultBinding, providerName, surface string, then func() tea.Cmd) tea.Cmd {
 	ref := credential.Ref{Provider: providerName, Account: surface}
 	store := credential.NewOSStore()
 	writer, ok := any(store).(credential.Writer)
@@ -226,7 +262,7 @@ func askSurfaceSecretCmd(providerName, surface string, then func() tea.Cmd) tea.
 			credential.EnvNames(ref)[0]+" in the environment instead")
 	}
 	return func() tea.Msg {
-		return secretPromptMsg{ref: ref, writer: writer, storeName: store.Name(), then: then()}
+		return binding.bindSecret(secretPromptMsg{ref: ref, writer: writer, storeName: store.Name(), then: then()})
 	}
 }
 
@@ -251,14 +287,15 @@ func refusedForAuth(err error) bool {
 // where it states them at all, from the same answer, so a surface that reports
 // levels is not asked twice.
 func listSurfaceModels(ctx context.Context, reg *providers, providerName, surface string) ([]string, map[string][]string, error) {
-	client, err := reg.get(ctx, surfaceTarget(providerName, surface))
+	client, call, err := reg.acquire(ctx, surfaceTarget(providerName, surface))
 	if err != nil {
 		return nil, nil, err
 	}
+	defer call.release()
 	if el, ok := client.(effortLister); ok {
-		efforts, err := el.ModelEfforts(ctx)
+		efforts, err := el.ModelEfforts(call.ctx)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, call.translate(err)
 		}
 		names := make([]string, 0, len(efforts))
 		for name := range efforts {
@@ -271,9 +308,9 @@ func listSurfaceModels(ctx context.Context, reg *providers, providerName, surfac
 	if !ok {
 		return nil, nil, fmt.Errorf("the %s adapter cannot list models", providerName)
 	}
-	names, err := lister.Models(ctx)
+	names, err := lister.Models(call.ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, call.translate(err)
 	}
 	sort.Strings(names)
 	return names, nil, nil

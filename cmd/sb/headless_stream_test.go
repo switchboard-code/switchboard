@@ -126,3 +126,50 @@ func TestTheLastStreamedLineIsTheResult(t *testing.T) {
 		}
 	}
 }
+
+func TestHeadlessStreamWatcherPreservesLiveEventsAndOneFinalResult(t *testing.T) {
+	r, _, _ := newOverrideREPL(t, "small")
+	var machine bytes.Buffer
+	selected := selectPlainObserver("stream-json", &machine, r.out,
+		r.loop.Session.ID(), r.tier.ID, string(r.tier.Target.ID()), "plan")
+	r.watcher = newWatcher(selected, r.sticky, len(r.config.Tiers)-1, nil)
+	r.loop.SetObserver(r.watcher)
+
+	turnErr := r.onceAuthored(context.Background(), "answer once", "answer once")
+	if turnErr != nil {
+		t.Fatal(turnErr)
+	}
+	report := buildHeadlessReport(r.loop.Session.State(), r.catalog, r.tier, turnErr)
+	if err := writeStreamResult(&machine, report); err != nil {
+		t.Fatal(err)
+	}
+
+	events := decodeLines(t, machine.String())
+	if len(events) < 4 {
+		t.Fatalf("headless stream lost live events: %v", events)
+	}
+	seen := map[string]int{}
+	for _, event := range events {
+		kind, _ := event["type"].(string)
+		seen[kind]++
+	}
+	if seen["init"] != 1 || seen["text"] == 0 || seen["usage"] != 1 {
+		t.Fatalf("typed live events = %v, want init, text, and one usage", seen)
+	}
+	if seen["result"] != 1 || events[len(events)-1]["type"] != "result" {
+		t.Fatalf("final stream contract = %v, want exactly one terminal result", events)
+	}
+}
+
+func TestPlainObserverLeavesTextAndJSONModesUnchanged(t *testing.T) {
+	inner := &countingObserver{}
+	for _, output := range []string{"text", "json"} {
+		var machine bytes.Buffer
+		if got := selectPlainObserver(output, &machine, inner, "s", "t1", "target", "plan"); got != inner {
+			t.Fatalf("%s mode replaced its transcript observer", output)
+		}
+		if machine.Len() != 0 {
+			t.Fatalf("%s mode wrote stream output: %q", output, machine.String())
+		}
+	}
+}

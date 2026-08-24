@@ -58,17 +58,22 @@ type leakPattern struct {
 // format; the length floors are what keep prose that mentions a prefix
 // ("set sk-ant-... in the env") from matching without the token attached.
 var leakPatterns = []leakPattern{
-	{"an Anthropic API key", regexp.MustCompile(`\bsk-ant-[A-Za-z0-9_-]{20,}`)},
-	{"an OpenAI API key", regexp.MustCompile(`\bsk-(?:proj-)?[A-Za-z0-9_-]{40,}`)},
-	{"a GitHub token", regexp.MustCompile(`\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}`)},
-	{"a GitHub fine-grained token", regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{22,}`)},
-	{"a GitLab token", regexp.MustCompile(`\bglpat-[A-Za-z0-9_-]{20,}`)},
-	{"a Slack token", regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{10,}`)},
-	{"an AWS access key ID", regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)},
-	{"a Google API key", regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{35}\b`)},
-	{"a Stripe live key", regexp.MustCompile(`\b[sr]k_live_[A-Za-z0-9]{20,}`)},
-	{"an npm token", regexp.MustCompile(`\bnpm_[A-Za-z0-9]{36}\b`)},
-	{"a Hugging Face token", regexp.MustCompile(`\bhf_[A-Za-z0-9]{30,}`)},
+	// Do not require a word boundary before a distinctive issuer prefix. Tool
+	// output is an arbitrary byte stream: a credential can directly follow a
+	// bounded capture's padding or another identifier byte. The issuer prefix
+	// plus its published length floor supplies the precision; a lexical
+	// boundary would make the outbound guarantee depend on the preceding byte.
+	{"an Anthropic API key", regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}`)},
+	{"an OpenAI API key", regexp.MustCompile(`sk-(?:proj-)?[A-Za-z0-9_-]{40,}`)},
+	{"a GitHub token", regexp.MustCompile(`(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}`)},
+	{"a GitHub fine-grained token", regexp.MustCompile(`github_pat_[A-Za-z0-9_]{22,}`)},
+	{"a GitLab token", regexp.MustCompile(`glpat-[A-Za-z0-9_-]{20,}`)},
+	{"a Slack token", regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]{10,}`)},
+	{"an AWS access key ID", regexp.MustCompile(`AKIA[0-9A-Z]{16}`)},
+	{"a Google API key", regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`)},
+	{"a Stripe live key", regexp.MustCompile(`[sr]k_live_[A-Za-z0-9]{20,}`)},
+	{"an npm token", regexp.MustCompile(`npm_[A-Za-z0-9]{36}`)},
+	{"a Hugging Face token", regexp.MustCompile(`hf_[A-Za-z0-9]{30,}`)},
 	// The whole block, not the header: a redaction that replaced only the
 	// BEGIN line would send the key body it was asked to hold back. The
 	// non-greedy body stops at the first END line, and a block whose END
@@ -93,6 +98,45 @@ func ScanPrompt(text string) []Leak {
 		}
 	}
 	return out
+}
+
+// SafePrefixForTruncation returns a byte-bounded prefix without cutting a
+// recognized credential into an unrecognizable fragment. Complete credentials
+// wholly before the boundary stay intact so the caller's ordinary outbound
+// ScanPrompt can still offer its redact/send/drop decision. If a credential
+// crosses the boundary, the prefix moves back to the start of that match and a
+// visible redaction marker replaces the omitted tail. cut is the number of
+// original source bytes retained before any marker.
+func SafePrefixForTruncation(text string, limit int) (prefix string, cut int) {
+	if limit <= 0 {
+		return "", 0
+	}
+	if len(text) <= limit {
+		return text, len(text)
+	}
+
+	cut = limit
+	boundaryKind := ""
+	for {
+		start, kind := -1, ""
+		for _, pattern := range leakPatterns {
+			for _, span := range pattern.re.FindAllStringIndex(text, -1) {
+				if span[0] < cut && span[1] > cut && (start < 0 || span[0] < start) {
+					start, kind = span[0], pattern.kind
+				}
+			}
+		}
+		if start < 0 {
+			break
+		}
+		cut, boundaryKind = start, kind
+	}
+
+	prefix = text[:cut]
+	if boundaryKind != "" {
+		prefix += "[redacted: " + boundaryKind + "]"
+	}
+	return prefix, cut
 }
 
 // Redact replaces each finding with a placeholder naming what stood there,

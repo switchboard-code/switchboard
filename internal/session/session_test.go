@@ -237,7 +237,7 @@ func TestTornFinalWriteRecovers(t *testing.T) {
 	}
 }
 
-func TestAlteredPayloadIsDetected(t *testing.T) {
+func TestCompleteCorruptMiddleFrameIsRefusedAndPreserved(t *testing.T) {
 	store, workspace := newStore(t)
 
 	sess, err := store.Create(workspace, "t", "test-revision")
@@ -245,20 +245,24 @@ func TestAlteredPayloadIsDetected(t *testing.T) {
 		t.Fatal(err)
 	}
 	id, path := sess.ID(), sess.Path()
-	for _, text := range []string{"keep", "tamper"} {
+	for _, text := range []string{"keep before", "tamper middle", "keep after"} {
 		if err := sess.AppendMessage(provider.UserText(text)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	sess.Close()
+	if err := sess.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Flip a byte inside the final record's payload, leaving the framing intact.
-	// Only the checksum can catch this.
-	tampered := strings.Replace(string(data), "tamper", "TAMPER", 1)
+	// Flip bytes inside a complete middle record's payload, preserving its
+	// framing and the complete valid record after it. Only the checksum catches
+	// the change; treating every checksum failure as a torn final write would
+	// silently discard both records.
+	tampered := strings.Replace(string(data), "tamper middle", "TAMPER MIDDLE", 1)
 	if tampered == string(data) {
 		t.Fatal("test fixture did not contain the expected payload")
 	}
@@ -266,14 +270,127 @@ func TestAlteredPayloadIsDetected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := store.Open(id)
+	if _, err := store.Open(id); !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("Open error = %v, want ErrCorruptRecord", err)
+	}
+	if fork, err := store.Fork(id, 1); !errors.Is(err, ErrCorruptRecord) {
+		if fork != nil {
+			_ = fork.Close()
+		}
+		t.Fatalf("Fork error = %v, want ErrCorruptRecord", err)
+	}
+
+	readers := map[string]func() error{
+		"state": func() error { _, err := ReadState(path); return err },
+		"races": func() error { _, err := ReadRaces(path); return err },
+		"permissions": func() error {
+			_, err := ReadPermissions(path)
+			return err
+		},
+		"timeline":   func() error { _, err := ReadTimeline(path); return err },
+		"usage":      func() error { _, err := ReadUsages(path); return err },
+		"file edits": func() error { _, err := ReadFileEdits(path); return err },
+		"accounting": func() error { _, err := ReadAccountingLedger(path); return err },
+		"turn costs": func() error { _, err := ReadTurnCosts(path); return err },
+	}
+	for name, read := range readers {
+		if err := read(); !errors.Is(err, ErrCorruptRecord) {
+			t.Errorf("%s error = %v, want ErrCorruptRecord", name, err)
+		}
+	}
+	infos, err := store.List(workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.Close()
+	if len(infos) != 1 || infos[0].ID != id || !infos[0].Health.CorruptRecord {
+		t.Fatalf("preserved corrupt session disappeared from inventory: %+v", infos)
+	}
+	if infos[0].Health.RecoveredCorruptTail || infos[0].Health.Messages != 1 {
+		t.Fatalf("corrupt-session health overclaimed recovery or crossed the bad frame: %+v", infos[0].Health)
+	}
+	all, err := store.ListAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all[workspace]) != 1 || !all[workspace][0].Health.CorruptRecord {
+		t.Fatalf("ListAll hid the preserved corrupt session: %+v", all[workspace])
+	}
+	if latest, err := store.Latest(workspace); !errors.Is(err, ErrCorruptRecord) {
+		if latest != nil {
+			_ = latest.Close()
+		}
+		t.Fatalf("Latest error = %v, want the preserved corruption refusal", err)
+	}
 
-	if n := len(reopened.State().Messages); n != 1 {
-		t.Errorf("got %d messages, want only the 1 record whose checksum verified", n)
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != tampered {
+		t.Fatal("corruption refusal modified or truncated the original log")
+	}
+}
+
+func TestLatestSkipsANewerIntegrityBlockedSession(t *testing.T) {
+	store, workspace := newStore(t)
+	healthy, err := store.Create(workspace, "test/local/healthy", "rev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := healthy.AppendMessage(provider.UserText("resume the healthy session")); err != nil {
+		t.Fatal(err)
+	}
+	healthyID, healthyPath := healthy.ID(), healthy.Path()
+	if err := healthy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	blocked, err := store.Create(workspace, "test/local/blocked", "rev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"blocked prefix", "damage middle", "blocked suffix"} {
+		if err := blocked.AppendMessage(provider.UserText(text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blockedID, blockedPath := blocked.ID(), blocked.Path()
+	if err := blocked.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(blockedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := strings.Replace(string(raw), "damage middle", "DAMAGE MIDDLE", 1)
+	if tampered == string(raw) {
+		t.Fatal("blocked fixture did not contain its middle payload")
+	}
+	if err := os.WriteFile(blockedPath, []byte(tampered), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := os.Chtimes(healthyPath, now.Add(-time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(blockedPath, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	infos, err := store.List(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 2 || infos[0].ID != blockedID || !infos[0].Health.CorruptRecord {
+		t.Fatalf("inventory did not expose the newer blocked session first: %+v", infos)
+	}
+	latest, err := store.Latest(workspace)
+	if err != nil {
+		t.Fatalf("healthy continuation was hidden behind newer corruption: %v", err)
+	}
+	defer latest.Close()
+	if latest.ID() != healthyID {
+		t.Fatalf("Latest resumed %s, want healthy session %s", latest.ID(), healthyID)
 	}
 }
 
@@ -563,12 +680,12 @@ func TestSessionsAreNotWorldReadable(t *testing.T) {
 	}
 	defer sess.Close()
 
-	fi, err := os.Stat(sess.Path())
+	ownerOnly, err := privateSessionFileIsOwnerOnly(sess.f)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-		t.Errorf("session mode = %o; logs hold prompts and code and must stay owner-only", perm)
+	if !ownerOnly {
+		t.Error("session log holds prompts and code but is not owner-only")
 	}
 }
 

@@ -244,7 +244,7 @@ func runProcess(ctx context.Context, cmd *exec.Cmd) (waitErr, contextErr error, 
 func commandEnv(network NetworkAccess, extra []string) []string {
 	keep := func(kv string) bool {
 		key, _, ok := strings.Cut(kv, "=")
-		if !ok || childenv.Sensitive(key) {
+		if !ok || childenv.Sensitive(key) || childLoaderInjection(key) {
 			return false
 		}
 		// macOS Seatbelt permits host loopback so test fixtures work. An
@@ -273,7 +273,42 @@ func commandEnv(network NetworkAccess, extra []string) []string {
 	return kept
 }
 
+// childLoaderInjection identifies ambient process controls that can make a
+// fixed executable load attacker-selected code before main. Explicit user `!`
+// shells do not use commandEnv; agent commands and first-party helpers do.
+func childLoaderInjection(key string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(key))
+	if strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_") {
+		return true
+	}
+	switch upper {
+	case "GCONV_PATH", "LOCPATH", "NLSPATH", "BASH_ENV", "ENV", "ZDOTDIR",
+		"GIO_MODULE_DIR", "GIO_EXTRA_MODULES", "GI_TYPELIB_PATH",
+		"GTK_PATH", "GTK_MODULES", "GTK_IM_MODULE_FILE", "GDK_PIXBUF_MODULE_FILE", "GDK_PIXBUF_MODULEDIR",
+		"QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "QML_IMPORT_PATH", "QML2_IMPORT_PATH",
+		"GST_PLUGIN_PATH", "GST_PLUGIN_PATH_1_0", "GST_PLUGIN_SYSTEM_PATH", "GST_PLUGIN_SYSTEM_PATH_1_0",
+		"LUA_PATH", "LUA_CPATH", "TCLLIBPATH", "TCL_LIBRARY", "TK_LIBRARY",
+		"PHPRC", "PHP_INI_SCAN_DIR", "VLC_PLUGIN_PATH",
+		"OPENSSL_CONF", "OPENSSL_CONF_INCLUDE", "OPENSSL_MODULES", "OPENSSL_ENGINES",
+		"NODE_OPTIONS", "NODE_PATH",
+		"PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE",
+		"PERL5LIB", "PERL5OPT", "RUBYLIB", "RUBYOPT",
+		"GEM_HOME", "GEM_PATH",
+		"JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS", "CLASSPATH",
+		"DOTNET_STARTUP_HOOKS":
+		return true
+	default:
+		return false
+	}
+}
+
 func childEnv() []string { return commandEnv(NetworkFull, nil) }
+
+// ScrubbedChildEnv returns the environment for fixed first-party subprocesses:
+// ordinary process context without credential-shaped variables or ambient
+// loader controls. Explicit user shells and editors deliberately do not use
+// this posture.
+func ScrubbedChildEnv() []string { return childEnv() }
 
 func appendLine(s, line string) string {
 	if s == "" {

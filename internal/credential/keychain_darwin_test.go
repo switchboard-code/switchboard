@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeSecurity stands in for the system command and records exactly what it was
@@ -59,6 +60,25 @@ esac
 	return &OSStore{bin: path}, argvLog
 }
 
+func TestKeychainGetCancellationStopsPipeHoldingDescendant(t *testing.T) {
+	helper, pidPath := pipeHoldingCredentialHelper(t, notFoundStatus)
+	store := &OSStore{bin: helper}
+	ctx, cancel := context.WithTimeout(context.Background(), credentialHelperCancelTimeout)
+	defer cancel()
+
+	started := time.Now()
+	_, err := store.Get(ctx, Ref{Provider: "anthropic"})
+	assertCredentialHelperCanceled(t, pidPath, started, err)
+}
+
+func TestKeychainWithholdsOversizedCredentialOutput(t *testing.T) {
+	store := &OSStore{bin: overflowingCredentialHelper(t)}
+	_, err := store.Get(context.Background(), Ref{Provider: "anthropic"})
+	if err == nil || !strings.Contains(err.Error(), "output withheld") || strings.Contains(err.Error(), strings.Repeat("s", 100)) {
+		t.Fatalf("oversized keychain output was not withheld: %v", err)
+	}
+}
+
 // The command line of every process is readable by every user on the machine.
 // Passing a credential as an argument would publish it there for as long as the
 // call runs, which is why the value goes over standard input instead.
@@ -90,6 +110,22 @@ func TestKeychainKeepsTheSecretOutOfArgv(t *testing.T) {
 	// catch.
 	if !strings.Contains(string(argv), "-i") {
 		t.Errorf("no store call was made through the interactive parser:\n%s", argv)
+	}
+}
+
+func TestKeychainPinsSystemSecurityAndScrubsChildEnvironment(t *testing.T) {
+	shadow := t.TempDir()
+	t.Setenv("PATH", shadow)
+	t.Setenv("SB_KEYCHAIN_TOKEN", value)
+
+	cmd := NewOSStore().command(context.Background(), "help")
+	if cmd.Path != securityToolPath {
+		t.Fatalf("security path = %q, want pinned %q", cmd.Path, securityToolPath)
+	}
+	for _, entry := range cmd.Env {
+		if strings.Contains(entry, value) || strings.HasPrefix(entry, "SB_KEYCHAIN_TOKEN=") {
+			t.Fatalf("credential-bearing environment reached security: %q", entry)
+		}
 	}
 }
 

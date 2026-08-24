@@ -321,6 +321,12 @@ func Render(c Capsule) (string, error) {
 	if c.Cleared {
 		return "", nil
 	}
+	// Rendering has a smaller budget than storage. Spend it semantically:
+	// identity and the execution frontier are mandatory; active and pending
+	// work outrank old completed work; verification evidence and relevant files
+	// outrank narrative. Appending whole lines avoids chopping a task or path
+	// into a misleading fragment.
+	const footerReserve = 320
 	var b strings.Builder
 	fmt.Fprintf(&b, "[continuity %s]\nLast recorded working state; verify it against the workspace before writing.\n", c.ID)
 	writeField := func(label, value string) {
@@ -332,47 +338,112 @@ func Render(c Capsule) (string, error) {
 	writeField("Phase", c.Phase)
 	writeField("Next", c.NextAction)
 	writeField("Stop when", c.StopCondition)
-	if len(c.Tasks) > 0 {
-		b.WriteString("Tasks:\n")
-		for _, task := range c.Tasks {
-			mark := "[ ]"
-			switch task.Status {
-			case TaskActive:
-				mark = "[>]"
-			case TaskDone:
-				mark = "[x]"
+
+	omitted := map[string]int{}
+	appendSection := func(name string, lines []string) {
+		if len(lines) == 0 {
+			return
+		}
+		header := name + ":\n"
+		wroteHeader := false
+		for i, line := range lines {
+			need := len(line) + 1
+			if !wroteHeader {
+				need += len(header)
 			}
-			fmt.Fprintf(&b, "%s %s\n", mark, task.Text)
-		}
-	}
-	writeList(&b, "Facts", c.Facts)
-	if len(c.Decisions) > 0 {
-		b.WriteString("Decisions:\n")
-		for _, decision := range c.Decisions {
-			line := decision.Text
-			if decision.Reason != "" {
-				line += " — " + decision.Reason
+			if b.Len()+need > MaxRenderBytes-footerReserve {
+				omitted[name] += len(lines) - i
+				return
 			}
-			fmt.Fprintf(&b, "- %s\n", line)
+			if !wroteHeader {
+				b.WriteString(header)
+				wroteHeader = true
+			}
+			b.WriteString(line)
+			b.WriteByte('\n')
 		}
 	}
-	writeList(&b, "Rejected paths", c.Rejected)
-	writeField("Context", c.Narrative)
-	if len(c.Files) > 0 {
-		b.WriteString("Recorded files:\n")
-		for _, file := range c.Files {
-			fmt.Fprintf(&b, "- %s (%s)\n", file.Path, file.State)
+
+	var active, pending, done []string
+	for _, task := range c.Tasks {
+		switch task.Status {
+		case TaskActive:
+			active = append(active, "[>] "+task.Text)
+		case TaskPending:
+			pending = append(pending, "[ ] "+task.Text)
+		case TaskDone:
+			done = append(done, "[x] "+task.Text)
 		}
 	}
+	appendSection("Active task", active)
+	appendSection("Pending tasks", pending)
+
+	facts := make([]string, len(c.Facts))
+	for i, fact := range c.Facts {
+		facts[i] = "- " + fact
+	}
+	appendSection("Facts", facts)
+
+	decisions := make([]string, len(c.Decisions))
+	for i, decision := range c.Decisions {
+		line := decision.Text
+		if decision.Reason != "" {
+			line += " — " + decision.Reason
+		}
+		decisions[i] = "- " + line
+	}
+	appendSection("Decisions", decisions)
+
+	files := make([]string, len(c.Files))
+	for i, file := range c.Files {
+		files[i] = fmt.Sprintf("- %s (%s)", file.Path, file.State)
+	}
+	appendSection("Recorded files", files)
+
+	rejected := make([]string, len(c.Rejected))
+	for i, path := range c.Rejected {
+		rejected[i] = "- " + path
+	}
+	appendSection("Rejected paths", rejected)
+
+	// A bounded tail of completed tasks prevents immediate repetition without
+	// letting a long chronology hide work that is still live.
+	const completedTail = 3
+	if len(done) > completedTail {
+		omitted["Completed tasks"] += len(done) - completedTail
+		done = done[len(done)-completedTail:]
+	}
+	appendSection("Recently completed", done)
+
+	if c.Narrative != "" {
+		line := "Context: " + c.Narrative + "\n"
+		if b.Len()+len(line) <= MaxRenderBytes-footerReserve {
+			b.WriteString(line)
+		} else {
+			omitted["Context"]++
+		}
+	}
+
+	var footer []string
 	if len(c.Omitted) > 0 {
-		fmt.Fprintf(&b, "Omitted by bounds: %s\n", strings.Join(c.Omitted, ", "))
+		footer = append(footer, "Omitted while storing: "+strings.Join(c.Omitted, ", "))
 	}
-	out := strings.TrimSpace(b.String())
-	if len(out) > MaxRenderBytes {
-		out = strings.TrimSpace(truncateUTF8(out, MaxRenderBytes-len("\n… [continuity rendering truncated]"))) +
-			"\n… [continuity rendering truncated]"
+	for _, name := range []string{"Active task", "Pending tasks", "Facts", "Decisions", "Recorded files", "Rejected paths", "Completed tasks", "Recently completed", "Context"} {
+		if count := omitted[name]; count > 0 {
+			footer = append(footer, fmt.Sprintf("%s omitted while rendering: %d", name, count))
+		}
 	}
-	return out, nil
+	if len(footer) > 0 {
+		text := strings.Join(footer, "\n")
+		available := MaxRenderBytes - b.Len()
+		if available > 0 {
+			text = truncateUTF8(text, available)
+			b.WriteString(text)
+			b.WriteByte('\n')
+		}
+	}
+
+	return strings.TrimSpace(b.String()), nil
 }
 
 func canonicalizeContent(c *Capsule) error {
@@ -691,16 +762,6 @@ func reconcileTodoNextAction(c *Capsule) {
 			c.NextAction = task.Text
 			return
 		}
-	}
-}
-
-func writeList(b *strings.Builder, label string, values []string) {
-	if len(values) == 0 {
-		return
-	}
-	b.WriteString(label + ":\n")
-	for _, value := range values {
-		fmt.Fprintf(b, "- %s\n", value)
 	}
 }
 

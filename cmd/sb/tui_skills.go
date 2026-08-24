@@ -136,8 +136,9 @@ func skillPickerCmd(m *tuiModel) tea.Cmd {
 	if len(items) == 0 {
 		return noticeCmd("", "no skill can be invoked right now; /skills says why for each")
 	}
+	binding := m.bindAsyncResult()
 	return func() tea.Msg {
-		return pickerMsg{
+		return binding.bindPicker(pickerMsg{
 			title: "invoke a skill",
 			items: items,
 			action: func(selector string) tea.Cmd {
@@ -151,17 +152,17 @@ func skillPickerCmd(m *tuiModel) tea.Cmd {
 				// The pack says it takes arguments, so ask for them rather
 				// than invoking it with none and letting it discover that.
 				return func() tea.Msg {
-					return textPromptMsg{
+					return binding.bindText(textPromptMsg{
 						title:      "arguments for " + sk.Name,
 						help:       sk.ArgumentHint + " · enter alone runs it with none",
 						allowEmpty: true,
 						submit: func(value string) tea.Cmd {
 							return cmdSkill(m, strings.TrimSpace(selector+" "+value))
 						},
-					}
+					})
 				}
 			},
-		}
+		})
 	}
 }
 
@@ -181,12 +182,18 @@ func splitSkillCommand(args string) (selector, rest string) {
 // Claude @ references are rejected before this point; another ecosystem's
 // literal @ text must not accidentally inherit Switchboard's input shortcut.
 func (m *tuiModel) startSkillPrompt(display, prompt string) tea.Cmd {
-	m.addUser(display)
 	prompt = m.watchContext(m.adviceContext(m.shellContext(prompt)))
-	if leaks := credential.ScanPrompt(prompt); len(leaks) > 0 {
-		return m.openSecretGate(leaks, prompt, func(p string) tea.Cmd {
-			return m.launchTurn(p, nil)
-		})
+	leaks := credential.ScanPrompt(prompt)
+	launch := func(p string) tea.Cmd {
+		shown := display
+		if len(leaks) > 0 && p != prompt {
+			shown = credential.Redact(shown, leaks)
+		}
+		m.addUser(shown)
+		return m.launchTurnAuthored(p, shown, nil)
 	}
-	return m.launchTurn(prompt, nil)
+	if len(leaks) > 0 {
+		return m.openSecretGate(leaks, prompt, launch)
+	}
+	return launch(prompt)
 }

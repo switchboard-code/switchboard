@@ -277,6 +277,152 @@ func TestATypedAnswerIsRedactedBeforeItLeaves(t *testing.T) {
 	}
 }
 
+func TestElicitationRedactsServerMetadataBeforeDisplayCaps(t *testing.T) {
+	token := "ghp_" + strings.Repeat("A", 36)
+	message := strings.Repeat("m", maxElicitMessage-5) + token + " after"
+	params, err := json.Marshal(map[string]any{
+		"message": message,
+		"requestedSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"environment": map[string]any{
+					"type":        "string",
+					"title":       "deploy with " + token,
+					"description": "the server said " + token,
+					"enum":        []string{"staging"},
+					"enumNames":   []string{"Staging " + token},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := &scriptedQuestioner{answers: []tools.Answer{{Picked: []string{"staging"}}}}
+	reply := elicitReply(t, q, string(params))
+
+	asked := q.questions()
+	if len(asked) != 1 {
+		t.Fatalf("asked %d questions, want one", len(asked))
+	}
+	rendered, err := json.Marshal(asked[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rendered), token) || strings.Contains(string(rendered), token[:12]) {
+		t.Fatalf("question exposed server credential metadata: %s", rendered)
+	}
+	if !strings.Contains(string(rendered), "[redacted: a GitHub token]") {
+		t.Fatalf("question did not explain its redaction: %s", rendered)
+	}
+	replyBytes, err := json.Marshal(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(replyBytes), token) || strings.Contains(string(replyBytes), token[:12]) {
+		t.Fatalf("MCP reply exposed server credential metadata: %s", replyBytes)
+	}
+}
+
+func TestCredentialShapedElicitationSemanticsAreRefused(t *testing.T) {
+	token := "ghp_" + strings.Repeat("B", 36)
+	tests := []struct {
+		name       string
+		properties map[string]any
+	}{
+		{
+			name: "property name",
+			properties: map[string]any{
+				token: map[string]any{"type": "string"},
+			},
+		},
+		{
+			name: "enum value",
+			properties: map[string]any{
+				"choice": map[string]any{"type": "string", "enum": []string{token}},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			params, err := json.Marshal(map[string]any{
+				"message": "choose",
+				"requestedSchema": map[string]any{
+					"type":       "object",
+					"properties": test.properties,
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			q := &scriptedQuestioner{answers: []tools.Answer{{Text: "answer"}}}
+			reply := elicitReply(t, q, string(params))
+			if len(q.questions()) != 0 {
+				t.Fatal("credential-shaped protocol semantics reached the questioner")
+			}
+			if _, ok := reply["error"].(map[string]any); !ok {
+				t.Fatalf("credential-shaped protocol semantics were accepted: %v", reply)
+			}
+			raw, err := json.Marshal(reply)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(raw), token) || strings.Contains(string(raw), token[:12]) {
+				t.Fatalf("refusal echoed the credential to the MCP server: %s", raw)
+			}
+		})
+	}
+}
+
+func TestElicitationOptionLabelsStayUniqueAndMapToOriginalValues(t *testing.T) {
+	shared := strings.Repeat("v", maxElicitMessage+32)
+	values := []string{shared + "first", shared + "second"}
+	field := elicitField{Type: "string", Enum: values}
+	question, choices, err := elicitQuestion("server", "pick", "choice", field)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(question.Options) != 2 {
+		t.Fatalf("options = %v, want two", question.Options)
+	}
+	first, second := question.Options[0].Label, question.Options[1].Label
+	if first == second {
+		t.Fatalf("truncated option labels collided: %q", first)
+	}
+	if len(first) > maxElicitMessage || len(second) > maxElicitMessage {
+		t.Fatalf("option labels exceeded the display cap: %d, %d", len(first), len(second))
+	}
+	value, ok := elicitValue(field, choices, tools.Answer{Picked: []string{second}})
+	if !ok || value != values[1] {
+		t.Fatalf("second safe label mapped to %#v, %t; want the second original value", value, ok)
+	}
+}
+
+func TestElicitationControlTextDoesNotChangeOptionSemantics(t *testing.T) {
+	control := "safe\x1b]0;forged\a\u202e\nnext"
+	field := elicitField{
+		Type:        "string",
+		Title:       "title \x1b[2J\u202e",
+		Description: "detail \x1b]8;;https://example.invalid\a",
+		Enum:        []string{control},
+		EnumNames:   []string{"name \x1b[31m\u202e"},
+	}
+	question, choices, err := elicitQuestion("server\x1b]0;bad\a", "message\n\x1b[2J", "choice", field)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(question.Options) != 1 {
+		t.Fatalf("options = %v, want one", question.Options)
+	}
+	// The core preserves semantic text; both terminal questioners escape every
+	// rendered component. The selected display label must still resolve to the
+	// exact server value rather than to its escaped or normalized spelling.
+	value, ok := elicitValue(field, choices, tools.Answer{Picked: []string{question.Options[0].Label}})
+	if !ok || value != control {
+		t.Fatalf("control-bearing option mapped to %#v, %t; want the original semantic value", value, ok)
+	}
+}
+
 // A boolean is two options rather than a typed word, and comes back as JSON's
 // own true rather than the string the user clicked.
 func TestBooleanElicitationAnswersWithABoolean(t *testing.T) {

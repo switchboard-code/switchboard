@@ -20,7 +20,6 @@ import (
 
 	"github.com/switchboard-code/switchboard/internal/bisect"
 	"github.com/switchboard-code/switchboard/internal/checkpoint"
-	"github.com/switchboard-code/switchboard/internal/credential"
 	"github.com/switchboard-code/switchboard/internal/execution"
 	route "github.com/switchboard-code/switchboard/internal/router"
 	"github.com/switchboard-code/switchboard/internal/watch"
@@ -31,6 +30,12 @@ type bisectRun struct {
 	labels    []string
 	cancel    context.CancelFunc
 	cancelled bool
+	// done closes only after Runner.Run has returned, including its mandatory
+	// deferred workspace restore. Abnormal terminal teardown waits for it before
+	// allowing the process to exit; cancellation without that join can strand the
+	// checkout at the last probed historical state.
+	done      chan struct{}
+	resultErr error
 	rail      *entry
 }
 
@@ -64,7 +69,8 @@ func cmdBisect(m *tuiModel, args string) tea.Cmd {
 	}
 	for i, t := range turns {
 		if t.Partial {
-			return noticeCmd("error", fmt.Sprintf("turn %d (%q) passed the snapshot cap; a bisect over it would restore half a turn", i+1, t.Label))
+			return noticeCmd("error", fmt.Sprintf("turn %d (%q) passed the snapshot cap; a bisect over it would restore half a turn",
+				i+1, redactCredentialText(t.Label)))
 		}
 	}
 
@@ -74,9 +80,17 @@ func cmdBisect(m *tuiModel, args string) tea.Cmd {
 		states[i] = m.app.undo.StateBefore(i)
 		labels[i] = turns[i].Label
 	}
+	workspace := m.app.workspace
+	if m.app.store == nil {
+		return noticeCmd("error", "bisect cleanup storage is unavailable")
+	}
+	journalDir, err := m.app.store.WorkspaceDir(workspace)
+	if err != nil {
+		return noticeCmd("error", redactCredentialText("opening bisect cleanup storage failed: "+err.Error()))
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	run := &bisectRun{command: command, labels: labels, cancel: cancel}
+	run := &bisectRun{command: command, labels: labels, cancel: cancel, done: make(chan struct{})}
 	run.rail = m.tr.add(&entry{kind: kindInfo, text: bisectRailLine(command, len(labels), -1, 0)})
 	m.tr.scrollToBottom()
 	m.bisect = run
@@ -86,20 +100,52 @@ func cmdBisect(m *tuiModel, args string) tea.Cmd {
 	// the last turn must not tick along under a bisect that streams none.
 	m.samples, m.tokChars, m.tokAt = nil, 0, time.Time{}
 
-	workspace := m.app.workspace
-	send := m.app.p.Send
+	send := func(msg tea.Msg) {
+		if m.app.p != nil {
+			m.app.p.Send(msg)
+		}
+	}
 	runner := &bisect.Runner{
-		States: states,
-		Verify: func(ctx context.Context) bisect.Verdict { return runVerifier(ctx, command, workspace) },
+		Workspace:  workspace,
+		JournalDir: journalDir,
+		States:     states,
+		Verify:     func(ctx context.Context) bisect.Verdict { return runVerifier(ctx, command, workspace) },
 		OnProbe: func(state, probes int) {
 			send(bisectProbeMsg{state: state, probes: probes})
 		},
 	}
 	go func() {
+		defer close(run.done)
 		res, err := runner.Run(ctx)
+		run.resultErr = err
 		send(bisectDoneMsg{res: res, err: err})
 	}()
 	return m.spin.Tick
+}
+
+// finishBisectForExit is the process-exit half of the bisect contract. A
+// Bubble Tea program may stop without accepting the final message, but the
+// checkout must not be allowed to exit in a reconstructed historical state.
+func (m *tuiModel) finishBisectForExit(run *bisectRun) {
+	if run == nil {
+		return
+	}
+	run.cancelled = true
+	if run.cancel != nil {
+		run.cancel()
+	}
+	if run.done != nil {
+		<-run.done
+	}
+	if m.bisect == run {
+		m.bisect = nil
+		m.busy = false
+	}
+	var restoreFail *bisect.RestoreError
+	if errors.As(run.resultErr, &restoreFail) {
+		m.shutdownErr = errors.Join(m.shutdownErr,
+			fmt.Errorf("restoring workspace while the TUI stopped: %w", restoreFail))
+	}
 }
 
 // runVerifier is one probe: the declared command, unconfined through the
@@ -117,6 +163,12 @@ func runVerifier(ctx context.Context, command, workspace string) bisect.Verdict 
 	}
 	if res.ExitCode == 0 && !res.TimedOut {
 		return bisect.Verdict{Passed: true}
+	}
+	if res.Truncated {
+		// The capture retained only fragments around an omitted middle. A
+		// failure token or credential can cross that boundary, so do not parse
+		// or render either fragment as a verifier diagnostic.
+		return bisect.Verdict{FirstFail: "verifier output exceeded its bounded capture and was withheld"}
 	}
 	fail := ""
 	if failures := route.ExtractFailures(res.Output); len(failures) > 0 {
@@ -146,14 +198,13 @@ func runVerifier(ctx context.Context, command, workspace string) bisect.Verdict 
 func bisectInjectText(command, label string, res bisect.Result) string {
 	text := fmt.Sprintf(
 		"[bisect] The user bisected this session's checkpoints against `%s`. Turn %d (%q) is where it turned red — green just before it, red ever since. First failure:\n%s",
-		command, res.Culprit+1, label, truncate(res.Fail.FirstFail, 200))
-	if leaks := credential.ScanPrompt(text); len(leaks) > 0 {
-		text = credential.Redact(text, leaks)
-	}
-	return text
+		redactCredentialText(command), res.Culprit+1, redactCredentialText(label),
+		redactCredentialTextBeforeTruncate(res.Fail.FirstFail, 200))
+	return redactCredentialText(text)
 }
 
 func bisectRailLine(command string, span, state, probes int) string {
+	command = redactCredentialText(command)
 	where := "the current state"
 	if state >= 0 && state < span {
 		where = fmt.Sprintf("before turn %d of %d", state+1, span)
@@ -195,26 +246,27 @@ func (m *tuiModel) onBisectDone(msg bisectDoneMsg) tea.Cmd {
 		// run — cancellation included — the tree may sit at a past state,
 		// and saying "restored" here would be the lie the contract exists
 		// to prevent.
-		summary = "bisect: " + restoreFail.Error() + " — /diff shows what stands"
+		summary = redactCredentialText("bisect: " + restoreFail.Error() + " — /diff shows what stands")
 		m.addNotice("error", summary)
 	case run.cancelled || errors.Is(msg.err, context.Canceled):
 		summary = "bisect cancelled; the workspace is restored"
 		m.addNotice("", summary)
 	case msg.err != nil:
-		summary = "bisect: " + msg.err.Error()
+		summary = redactCredentialText("bisect: " + msg.err.Error())
 		m.addNotice("error", summary)
 	case msg.res.Outcome == bisect.AlreadyGreen:
-		summary = fmt.Sprintf("bisect: %s passes as things stand; there is nothing to find", run.command)
+		summary = fmt.Sprintf("bisect: %s passes as things stand; there is nothing to find", redactCredentialText(run.command))
 		m.addNotice("", summary)
 	case msg.res.Outcome == bisect.RedBeforeRecord:
-		summary = fmt.Sprintf("bisect: red before the oldest recorded turn — the break predates what this session's checkpoints hold (%s)", msg.res.Fail.FirstFail)
+		summary = fmt.Sprintf("bisect: red before the oldest recorded turn — the break predates what this session's checkpoints hold (%s)",
+			redactCredentialText(msg.res.Fail.FirstFail))
 		m.addNotice("warn", summary)
 	default:
 		label := run.labels[msg.res.Culprit]
 		summary = fmt.Sprintf("bisect: turn %d of %d (%q) turned %s red — green just before it, red ever since",
-			msg.res.Culprit+1, len(run.labels), label, run.command)
+			msg.res.Culprit+1, len(run.labels), redactCredentialText(label), redactCredentialText(run.command))
 		m.addInfo(summary + "\n" +
-			"  first failure: " + msg.res.Fail.FirstFail + "\n" +
+			"  first failure: " + redactCredentialText(msg.res.Fail.FirstFail) + "\n" +
 			fmt.Sprintf("  %d probes; reconstruction covers what write and edit captured — shell-made and hand-made changes rode along at today's state", msg.res.Probes))
 		// The verdict folds behind the next typed prompt, the watch
 		// posture: the user who now types "fix it" should not have to

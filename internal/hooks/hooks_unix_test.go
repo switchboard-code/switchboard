@@ -95,3 +95,19 @@ func TestPostToolFailureIsNotedNotFatal(t *testing.T) {
 		t.Errorf("note = %q, want the exit reported", note)
 	}
 }
+
+func TestHookOutputCrossingCaptureBoundaryIsWithheld(t *testing.T) {
+	token := "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	noisyFailure := `i=0; while [ "$i" -lt 5000 ]; do printf x; i=$((i+1)); done; printf '` + token + `'; exit 3`
+	pre := setWith(t.TempDir(), Hook{Event: PreTool, Run: noisyFailure})
+	msg, blocked := pre.PreTool(context.Background(), reqFor("exec"))
+	if !blocked || !strings.Contains(msg, "output withheld") || strings.Contains(msg, "ghp_") {
+		t.Fatalf("truncated pre-hook output = blocked=%v %q", blocked, msg)
+	}
+
+	post := setWith(t.TempDir(), Hook{Event: PostTool, Run: noisyFailure})
+	note := post.PostTool(context.Background(), reqFor("exec"), "", false)
+	if !strings.Contains(note, "output withheld") || strings.Contains(note, "ghp_") {
+		t.Fatalf("truncated post-hook output = %q", note)
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -24,32 +25,38 @@ import (
 	"github.com/switchboard-code/switchboard/internal/permission"
 	"github.com/switchboard-code/switchboard/internal/provider"
 	"github.com/switchboard-code/switchboard/internal/session"
+	"github.com/switchboard-code/switchboard/internal/terminaltext"
 	"github.com/switchboard-code/switchboard/internal/tools"
 )
 
 type raceProbeMsg struct {
-	operation uint64
-	sourceID  string
-	prompt    string // as typed; expansion happens when the race starts
-	a, b      config.Tier
-	ca, cb    provider.Provider
-	na, nb    string // fallback substitution notes, rendered before content is sent
-	err       error
+	operation       uint64
+	sourceID        string
+	prompt          string // as typed; expansion happens when the race starts
+	requestedA      config.Tier
+	requestedB      config.Tier
+	providerRetries int
+	a, b            config.Tier
+	ca, cb          provider.Provider
+	na, nb          string // fallback substitution notes, rendered before content is sent
+	err             error
 }
 
 // raceSetupMsg completes the ledger barrier and branch assembly off the UI
 // goroutine. operation/sourceID reject a result that outlives its launching
 // session, exactly like an asynchronous session swap.
 type raceSetupMsg struct {
-	operation uint64
-	sourceID  string
-	probe     raceProbeMsg
-	prompt    string
-	opening   provider.Message
-	before    session.State
-	arms      [2]*raceArm
-	release   func()
-	err       error
+	operation       uint64
+	sourceID        string
+	probe           raceProbeMsg
+	prompt          string
+	opening         provider.Message
+	providerRetries int
+	staleProviders  bool
+	before          session.State
+	arms            [2]*raceArm
+	release         func()
+	err             error
 }
 
 type raceToolMsg struct {
@@ -75,10 +82,19 @@ type raceRun struct {
 	typed  string // what the user wrote, for the record and the transcript
 	arms   [2]*raceArm
 	before session.State // authoritative origin ledger before either arm ran
+	// publishDurably is a deterministic fault seam for publication ordering
+	// tests. Runtime races leave it nil and use Session.PublishDurably.
+	publishDurably durableSessionPublisher
 
 	cancel    context.CancelFunc
 	cancelled bool
 	done      [2]bool
+	// workers joins the two branch goroutines during abnormal TUI teardown.
+	// Their errors are written before each completion message is sent, so a
+	// stopped Bubble Tea program can still finalize an abandoned, fully-settled
+	// race after those messages are dropped.
+	workers sync.WaitGroup
+	exitErr [2]error
 
 	// releaseAdvisor ends the ledger barrier acquired before the arm forks.
 	// It stays held through verdict accounting and any winner bind.
@@ -165,8 +181,15 @@ func cmdRace(m *tuiModel, args string) tea.Cmd {
 	if err != nil {
 		return noticeCmd("warn", err.Error())
 	}
+	return m.ownOperationCmd(generation, m.probeRaceTiers(ctx, generation, sourceID, prompt, a, b, 0))
+}
+
+func (m *tuiModel) probeRaceTiers(ctx context.Context, generation uint64, sourceID, prompt string,
+	a, b config.Tier, retries int,
+) tea.Cmd {
 	return func() tea.Msg {
-		result := raceProbeMsg{operation: generation, sourceID: sourceID, prompt: prompt}
+		result := raceProbeMsg{operation: generation, sourceID: sourceID, prompt: prompt,
+			requestedA: a, requestedB: b, providerRetries: retries}
 		probedA, ca, na, err := m.app.providers.probeTierFallback(ctx, a)
 		if err != nil {
 			result.err = fmt.Errorf("%s cannot race: %w", a.ID, err)
@@ -190,8 +213,8 @@ func cmdRace(m *tuiModel, args string) tea.Cmd {
 // attested image input, then a catalog entry carrying it from its own
 // verification. No evidence means no attach.
 func (m *tuiModel) targetTakesImages(target provider.RouteTarget) bool {
-	if attested, _ := m.app.providers.probedVision(target); attested {
-		return true
+	if attested, known := m.app.providers.probedVision(target); known {
+		return attested
 	}
 	info, _, ok := m.app.catalog.Lookup(target)
 	return ok && info.Vision
@@ -215,6 +238,21 @@ func (m *tuiModel) onRaceProbe(msg raceProbeMsg) tea.Cmd {
 	if msg.err != nil {
 		return abort("error", msg.err.Error())
 	}
+	if m.app.providers != nil && (!m.app.providers.preparedClientCurrent(msg.ca) ||
+		!m.app.providers.preparedClientCurrent(msg.cb)) {
+		if msg.providerRetries >= maxProviderReplans {
+			return abort("error", "provider settings kept changing while preparing the race; neither arm was sent")
+		}
+		a, b := msg.requestedA, msg.requestedB
+		if a.ID == "" {
+			a = msg.a
+		}
+		if b.ID == "" {
+			b = msg.b
+		}
+		return m.ownOperationCmd(msg.operation,
+			m.probeRaceTiers(m.turnCtx, msg.operation, msg.sourceID, msg.prompt, a, b, msg.providerRetries+1))
+	}
 	// Fallback may have substituted either lane's target, so the degenerate
 	// check runs against what will actually serve, not what was named.
 	if msg.a.Target.ID() == msg.b.Target.ID() {
@@ -230,7 +268,6 @@ func (m *tuiModel) onRaceProbe(msg raceProbeMsg) tea.Cmd {
 		}
 	}
 
-	m.addUser(msg.prompt)
 	expanded, images := m.expandMentions(msg.prompt)
 	prompt := m.adviceContext(m.shellContext(expanded))
 	if len(images) > 0 {
@@ -242,19 +279,27 @@ func (m *tuiModel) onRaceProbe(msg raceProbeMsg) tea.Cmd {
 	}
 	// The same outbound gate as a plain turn, doubled in consequence: a key
 	// in a race prompt would land in two branch logs and two providers.
-	if leaks := credential.ScanPrompt(prompt); len(leaks) > 0 {
+	leaks := credential.ScanPrompt(prompt)
+	start := func(p string) tea.Cmd {
+		display := msg.prompt
+		if len(leaks) > 0 && p != prompt {
+			display = credential.Redact(display, leaks)
+		}
+		return m.startRaceArms(msg, p, images, display)
+	}
+	if len(leaks) > 0 {
 		return m.openSecretGate(leaks, prompt, func(p string) tea.Cmd {
-			return m.startRaceArms(msg, p, images)
+			return start(p)
 		}, func() tea.Cmd { return abort("", "") })
 	}
-	return m.startRaceArms(msg, prompt, images)
+	return start(prompt)
 }
 
 // startRaceArms is onRaceProbe past the gates that can still stop it. The
 // advisor barrier may wait for an inflight provider call, so every setup step
 // runs as a cancellable command rather than blocking Bubble Tea's Update.
-func (m *tuiModel) startRaceArms(msg raceProbeMsg, prompt string, images []provider.Image) tea.Cmd {
-	unstamped := turnOpening(prompt, images)
+func (m *tuiModel) startRaceArms(msg raceProbeMsg, prompt string, images []provider.Image, display string) tea.Cmd {
+	unstamped := turnOpeningAuthored(prompt, display, images)
 	if !m.operationMatches(msg.operation, msg.sourceID) {
 		return nil
 	}
@@ -262,66 +307,149 @@ func (m *tuiModel) startRaceArms(msg raceProbeMsg, prompt string, images []provi
 		m.finishOperation(msg.operation, false)
 		return m.nextQueuedTurn()
 	}
+	// The prompt becomes transcript history only after every outbound gate has
+	// resolved. A dropped credential-bearing race must leave no raw user card.
+	m.addUser(display)
 	ctx, generation, sourceID := m.turnCtx, msg.operation, msg.sourceID
 	m.operationName = "race setup"
 	app := m.app
-	return func() tea.Msg {
-		result := raceSetupMsg{operation: generation, sourceID: sourceID, probe: msg, prompt: prompt}
-		releaseAdvisor, err := pauseAdvisorLedger(ctx, app)
-		if err != nil {
-			result.err = fmt.Errorf("race could not stabilize the session ledger: %w", err)
-			return result
-		}
-		result.release = releaseAdvisor
+	return m.ownOperationCmd(generation, func() tea.Msg {
 		opening, err := stampTurnOpening(app.loop.Session, unstamped)
 		if err != nil {
-			result.err = err
-			return result
+			return raceSetupMsg{operation: generation, sourceID: sourceID, probe: msg, prompt: prompt, err: err}
 		}
-		result.opening = opening
-		result.before = app.loop.Session.State()
-		if reason, blocked := racePreflight(app.budget, app.catalog, result.before,
-			app.loop.System, app.loop.Tools.Definitions(), opening, msg.a, msg.b); blocked {
-			result.err = errors.New("no race: " + reason)
-			return result
-		}
+		return m.prepareRaceSetup(ctx, generation, sourceID, msg, prompt, opening, msg.providerRetries)
+	})
+}
 
-		send := func(v tea.Msg) {
-			if app.p != nil {
-				app.p.Send(v)
-			}
-		}
-		armA, err := assembleRaceArm(app, msg.a, msg.ca, &raceObserver{arm: 0, send: send})
-		if err != nil {
-			result.err = fmt.Errorf("race setup failed: %w", err)
-			return result
-		}
-		result.arms[0] = armA
-		armB, err := assembleRaceArm(app, msg.b, msg.cb, &raceObserver{arm: 1, send: send})
-		if err != nil {
-			result.err = fmt.Errorf("race setup failed: %w", err)
-			return result
-		}
-		result.arms[1] = armB
-		if err := ctx.Err(); err != nil {
-			result.err = err
-			return result
-		}
-		for i, note := range []string{msg.na, msg.nb} {
-			if note != "" {
-				_ = result.arms[i].sess.AppendNote("warn", note)
-			}
-		}
-		raceGates(app.budget, app.catalog, app.loop.Session, result.before, armA, armB)
+func (m *tuiModel) prepareRaceSetup(ctx context.Context, generation uint64, sourceID string,
+	probe raceProbeMsg, prompt string, opening provider.Message, retries int,
+) raceSetupMsg {
+	app := m.app
+	result := raceSetupMsg{operation: generation, sourceID: sourceID, probe: probe, prompt: prompt,
+		opening: opening, providerRetries: retries}
+	if app.providers != nil && (!app.providers.preparedClientCurrent(probe.ca) ||
+		!app.providers.preparedClientCurrent(probe.cb)) {
+		result.staleProviders = true
 		return result
 	}
+	releaseAdvisor, err := pauseAdvisorLedger(ctx, app)
+	if err != nil {
+		result.err = fmt.Errorf("race could not stabilize the session ledger: %w", err)
+		return result
+	}
+	result.release = releaseAdvisor
+	result.before = app.loop.Session.State()
+	if reason, blocked := racePreflight(app.budget, app.catalog, result.before,
+		app.loop.System, app.loop.Tools.Definitions(), opening, probe.a, probe.b,
+		app.providers.outputTokenAllowance); blocked {
+		result.err = errors.New("no race: " + reason)
+		return result
+	}
+
+	send := func(v tea.Msg) {
+		if app.p != nil {
+			app.p.Send(v)
+		}
+	}
+	armA, err := assembleRaceArm(app, probe.a, probe.ca, &raceObserver{arm: 0, send: send})
+	if err != nil {
+		result.err = fmt.Errorf("race setup failed: %w", err)
+		return result
+	}
+	result.arms[0] = armA
+	armB, err := assembleRaceArm(app, probe.b, probe.cb, &raceObserver{arm: 1, send: send})
+	if err != nil {
+		result.err = fmt.Errorf("race setup failed: %w", err)
+		return result
+	}
+	result.arms[1] = armB
+	if err := ctx.Err(); err != nil {
+		result.err = err
+		return result
+	}
+	if err := recordRaceFallbackBindings(result.arms, [2]string{probe.na, probe.nb}); err != nil {
+		result.err = err
+		return result
+	}
+	raceGates(app.budget, app.catalog, app.loop.Session, result.before, armA, armB)
+	return result
+}
+
+// recordRaceFallbackBindings is the last write-ahead boundary before either
+// branch may call its provider. A failure on one arm aborts the whole race;
+// the caller closes both staged logs, leaving any earlier arm record invisible
+// for bounded maintenance.
+func recordRaceFallbackBindings(arms [2]*raceArm, notes [2]string) error {
+	for i, note := range notes {
+		if note == "" {
+			continue
+		}
+		arm := arms[i]
+		if arm == nil || arm.sess == nil {
+			return fmt.Errorf("race setup cannot record arm %d's fallback substitution without a session", i+1)
+		}
+		if err := arm.sess.AppendRuntimeBindingNote(arm.tier.ID, arm.tier.Target.ID(), false, "warn", note); err != nil {
+			return fmt.Errorf("race setup failed to record %s's fallback substitution: %w", arm.tier.ID, err)
+		}
+	}
+	return nil
+}
+
+func (m *tuiModel) retryRaceSetup(msg raceSetupMsg) tea.Cmd {
+	ctx := m.turnCtx
+	app := m.app
+	return m.ownOperationCmd(msg.operation, func() tea.Msg {
+		msg.arms = [2]*raceArm{}
+		msg.release = nil
+		msg.err = nil
+		msg.staleProviders = false
+		msg.providerRetries++
+		probe := msg.probe
+		a, b := probe.requestedA, probe.requestedB
+		if a.ID == "" {
+			a = probe.a
+		}
+		if b.ID == "" {
+			b = probe.b
+		}
+		probedA, ca, na, err := app.providers.probeTierFallback(ctx, a)
+		if err != nil {
+			msg.probe.ca, msg.probe.cb = nil, nil
+			msg.err = fmt.Errorf("%s cannot race after provider settings changed: %w", a.ID, err)
+			return msg
+		}
+		probedB, cb, nb, err := app.providers.probeTierFallback(ctx, b)
+		if err != nil {
+			msg.probe.ca, msg.probe.cb = nil, nil
+			msg.err = fmt.Errorf("%s cannot race after provider settings changed: %w", b.ID, err)
+			return msg
+		}
+		probe.a, probe.b, probe.ca, probe.cb, probe.na, probe.nb = probedA, probedB, ca, cb, na, nb
+		probe.providerRetries = msg.providerRetries
+		if probedA.Target.ID() == probedB.Target.ID() {
+			msg.err = fmt.Errorf("both rungs now resolve to %s after provider settings changed", probedA.Target.Display())
+			return msg
+		}
+		for _, tier := range []config.Tier{probedA, probedB} {
+			if err := destinationAllowed(app.config, tier.Target); err != nil {
+				msg.err = fmt.Errorf("the refreshed race cannot run: %w", err)
+				return msg
+			}
+			if messagesNeedVision([]provider.Message{msg.opening}) && !m.targetTakesImages(tier.Target) {
+				msg.err = fmt.Errorf("%s no longer has evidence it takes images", tier.Target.Display())
+				return msg
+			}
+		}
+		return m.prepareRaceSetup(ctx, msg.operation, msg.sourceID, probe, msg.prompt, msg.opening, msg.providerRetries)
+	})
 }
 
 func (m *tuiModel) onRaceSetup(msg raceSetupMsg) tea.Cmd {
 	closeArms := func() {
 		for _, arm := range msg.arms {
 			if arm != nil && arm.sess != nil {
-				_ = arm.sess.Close()
+				_ = arm.sess.CloseDiscardingStaged()
 			}
 		}
 	}
@@ -339,6 +467,20 @@ func (m *tuiModel) onRaceSetup(msg raceSetupMsg) tea.Cmd {
 		}
 		m.finishOperation(msg.operation, false)
 		return m.nextQueuedTurn()
+	}
+	staleProviders := msg.staleProviders || (m.app.providers != nil &&
+		(!m.app.providers.preparedClientCurrent(msg.probe.ca) || !m.app.providers.preparedClientCurrent(msg.probe.cb)))
+	if staleProviders {
+		closeArms()
+		if msg.release != nil {
+			msg.release()
+		}
+		if msg.providerRetries >= maxProviderReplans {
+			m.finishOperation(msg.operation, false)
+			m.addNotice("error", "provider settings kept changing while assembling the race; neither arm was sent")
+			return m.nextQueuedTurn()
+		}
+		return m.retryRaceSetup(msg)
 	}
 	if msg.err != nil || msg.arms[0] == nil || msg.arms[1] == nil {
 		closeArms()
@@ -401,12 +543,17 @@ func raceTierLabel(t config.Tier) string {
 func (m *tuiModel) launchRace(run *raceRun, opening provider.Message) {
 	ctx, cancel := context.WithCancel(context.Background())
 	run.cancel = cancel
+	run.workers.Add(len(run.arms))
 	for i, arm := range run.arms {
 		go func(i int, arm *raceArm) {
+			defer run.workers.Done()
 			arm.started = time.Now()
 			err := arm.loop.TurnMessage(ctx, opening)
 			arm.wall = time.Since(arm.started)
-			run.send(raceArmDoneMsg{arm: i, err: err})
+			run.exitErr[i] = err
+			if run.send != nil {
+				run.send(raceArmDoneMsg{arm: i, err: err})
+			}
 		}(i, arm)
 	}
 }
@@ -468,24 +615,57 @@ func (m *tuiModel) onRaceArmDone(msg raceArmDoneMsg) tea.Cmd {
 	if run == nil {
 		return nil
 	}
-	arm := run.arms[msg.arm]
-	switch {
-	case msg.err == nil:
-		arm.status = "completed"
-	case errors.Is(msg.err, context.Canceled):
-		arm.status = "cancelled"
-	case errors.Is(msg.err, agent.ErrRoundLimit):
-		arm.status = "round_limit"
-	default:
-		arm.status = "error"
-		arm.failure = msg.err.Error()
-	}
-	run.done[msg.arm] = true
+	applyRaceArmOutcome(run, msg.arm, msg.err)
 	m.refreshRail(msg.arm)
 	if !run.done[0] || !run.done[1] {
 		return nil
 	}
 	return m.onRaceFinished(run)
+}
+
+func applyRaceArmOutcome(run *raceRun, armIndex int, err error) {
+	if run == nil || armIndex < 0 || armIndex >= len(run.arms) || run.done[armIndex] {
+		return
+	}
+	arm := run.arms[armIndex]
+	switch {
+	case err == nil:
+		arm.status = "completed"
+	case errors.Is(err, context.Canceled):
+		arm.status = "cancelled"
+	case errors.Is(err, agent.ErrRoundLimit):
+		arm.status = "round_limit"
+	default:
+		arm.status = "error"
+		arm.failure = err.Error()
+	}
+	run.done[armIndex] = true
+}
+
+// finishRaceForExit settles an in-flight race after Bubble Tea has stopped
+// accepting its completion messages. Both arms are cancelled and joined before
+// their sessions are finalized, so no goroutine can append behind teardown and
+// the advisor ledger barrier cannot be stranded in an embedding or test host.
+func (m *tuiModel) finishRaceForExit(run *raceRun) {
+	if run == nil {
+		return
+	}
+	run.cancelled = true
+	if run.cancel != nil {
+		run.cancel()
+	}
+	run.workers.Wait()
+	// A verdict dialog drained during teardown may already have synchronously
+	// finalized this run. In that case there is nothing left to settle.
+	if m.race != run {
+		return
+	}
+	for i := range run.arms {
+		applyRaceArmOutcome(run, i, run.exitErr[i])
+	}
+	clear(m.queue)
+	m.queue = nil
+	_ = m.finishRace(run, "", "abandoned")
 }
 
 // onRaceFinished has both arms answered, one way or another. Completed
@@ -518,7 +698,7 @@ func (m *tuiModel) onRaceFinished(run *raceRun) tea.Cmd {
 		}
 		return m.finishRace(run, "", outcome)
 	}
-	m.dlg = newRaceDialog(m, run)
+	m.openDialog(newRaceDialog(m, run))
 	return nil
 }
 
@@ -569,19 +749,49 @@ func (m *tuiModel) finishRace(run *raceRun, pick, outcome string) tea.Cmd {
 	m.raceLog = append(m.raceLog, line)
 
 	if kept == nil {
-		// Nothing continues: the record lands on the session that does, and
-		// both branch logs close labelled, still resumable.
+		// Nothing continues: finalize both alternatives while hidden, then make
+		// the verdict durable on the session that continues. Only after that
+		// commit may the branch accounting records become resumable history.
 		for _, arm := range run.arms {
 			if err := arm.sess.FinalizeRaceBranchAlternative(); err != nil {
 				return m.abortRaceAccounting(run, record, "a race branch could not be finalized: "+err.Error())
 			}
 			_ = arm.sess.AppendNote("info", "race: this branch was not kept ("+outcome+")")
-			_ = arm.sess.Close()
 		}
-		// Touch the actual continuation last so --continue cannot select an
-		// abandoned arm merely because finalizing it changed its mtime.
 		if err := m.app.loop.Session.AppendRace(record); err != nil {
-			m.addNotice("warn", "the race record was not saved: "+err.Error())
+			return m.abortRaceAccounting(run, record, "the race verdict could not be saved: "+err.Error())
+		}
+		var durabilityUncertain error
+	publicationLoop:
+		for i, arm := range run.arms {
+			outcome, rawErr := publishDurablyWith(arm.sess, run.publishDurably)
+			disposition, err := publicationResult(outcome, rawErr, "race alternative "+arm.sess.ID())
+			switch disposition {
+			case publicationUnpublished:
+				m.addNotice("warn", "a finalized race alternative stayed hidden because publication failed: "+err.Error())
+				_ = arm.sess.CloseDiscardingStaged()
+			case publicationVisibleUncertain:
+				// The alternative is already discoverable, so it cannot be discarded.
+				// Close it and the continuing source immediately: no later append or
+				// sibling publication may follow a durability-uncertain commit.
+				durabilityUncertain = errors.Join(durabilityUncertain, err)
+				durabilityUncertain = errors.Join(durabilityUncertain, arm.sess.Close())
+				durabilityUncertain = errors.Join(durabilityUncertain, m.app.loop.Session.Close())
+				// A sibling whose publication was never attempted is still a hidden,
+				// rollbackable stage. Discard it without making it discoverable.
+				for _, pending := range run.arms[i+1:] {
+					durabilityUncertain = errors.Join(durabilityUncertain, pending.sess.CloseDiscardingStaged())
+				}
+				break publicationLoop
+			case publicationDurable:
+				_ = arm.sess.Close()
+			}
+		}
+		if durabilityUncertain != nil {
+			m.shutdownErr = errors.Join(m.shutdownErr, durabilityUncertain)
+			m.addNotice("error", durabilityUncertain.Error())
+			m.quitting = true
+			return tea.Quit
 		}
 		m.addNotice("", "race over, nothing kept; the session continues where it was")
 		if len(m.queue) > 0 {
@@ -609,20 +819,30 @@ func (m *tuiModel) finishRace(run *raceRun, pick, outcome string) tea.Cmd {
 	// The record rides the branch that continues, appended before the swap
 	// so it is durable whatever happens next.
 	if err := kept.sess.AppendRace(record); err != nil {
-		m.addNotice("warn", "the race record was not saved: "+err.Error())
+		return m.abortRaceAccounting(run, record, "the race verdict could not be saved: "+err.Error())
 	}
 	origID := m.app.loop.Session.ID()
 	loser := other
 	loserID := loser.sess.ID()
-	loser.sess.Close()
 
-	note := fmt.Sprintf("continuing on the %s branch; /resume %s returns to the pre-race session, /resume %s to the other answer",
-		kept.tier.ID, origID, loserID)
+	note := fmt.Sprintf("continuing on the %s branch; /resume %s returns to the pre-race session",
+		kept.tier.ID, origID)
 	// The swap applies here, on the UI goroutine, not through a command: a
 	// command leaves a gap where the session is idle but still the old one,
 	// and a prompt submitted into that gap would open a turn on a log about
 	// to be closed.
-	return m.onSessionSwap(sessionSwapMsg{sess: kept.sess, tier: kept.tier, client: kept.client, note: note, keepFold: true})
+	next := m.onSessionSwap(sessionSwapMsg{
+		sess: kept.sess, tier: kept.tier, client: kept.client, note: note, keepFold: true,
+		publishAfter: loser.sess, publishAfterNote: fmt.Sprintf(", /resume %s to the other answer", loserID),
+	})
+	if m.app.loop.Session == kept.sess {
+		// An ordinary swap drops /why evidence from the log being left. This
+		// verdict is different: it was durably appended to the branch just
+		// adopted, so keep that one new-log fact without carrying older races
+		// from the pre-race process view.
+		m.raceLog = []string{line}
+	}
+	return next
 }
 
 // abortRaceAccounting fails closed on the pre-race session. The origin is the
@@ -635,7 +855,7 @@ func (m *tuiModel) abortRaceAccounting(run *raceRun, record session.Race, why st
 	}
 	for _, arm := range run.arms {
 		_ = arm.sess.AppendNote("warn", "race: accounting transfer failed; pre-race session continued")
-		_ = arm.sess.Close()
+		_ = arm.sess.CloseDiscardingStaged()
 	}
 	if err := m.app.loop.Session.AppendRace(record); err != nil {
 		why += "; the race record also could not be saved: " + err.Error()
@@ -679,6 +899,11 @@ func newRaceDialog(m *tuiModel, run *raceRun) *raceDialog {
 		d.add("tie", "tie — both suffice, keep the cheaper ("+cheaper.tier.ID+")")
 	}
 	d.add("drop", "neither; stay where the session was")
+	// Race completion is asynchronous. The keystroke that happens to follow
+	// the result must never adopt an arm, so Enter starts on the only outcome
+	// that leaves the source session untouched. Arrow navigation is the
+	// deliberate act that opts into keeping an answer.
+	d.sel = len(d.ids) - 1
 	return d
 }
 
@@ -719,12 +944,12 @@ func raceCostLabel(m *tuiModel, arm *raceArm) string {
 func (d *raceDialog) update(key tea.KeyMsg, _ *theme) (bool, tea.Cmd) {
 	switch key.String() {
 	case "esc":
-		return true, d.resolve("drop")
-	case "up", "k":
+		return true, d.cancel()
+	case "up":
 		if d.sel > 0 {
 			d.sel--
 		}
-	case "down", "j":
+	case "down":
 		if d.sel < len(d.ids)-1 {
 			d.sel++
 		}
@@ -733,6 +958,8 @@ func (d *raceDialog) update(key tea.KeyMsg, _ *theme) (bool, tea.Cmd) {
 	}
 	return false, nil
 }
+
+func (d *raceDialog) cancel() tea.Cmd { return d.resolve("drop") }
 
 func (d *raceDialog) resolve(id string) tea.Cmd {
 	run := d.run
@@ -761,16 +988,57 @@ func (d *raceDialog) resolve(id string) tea.Cmd {
 }
 
 func (d *raceDialog) view(width int, th *theme) string {
+	return d.viewWithin(width, dialogUnlimitedHeight, th)
+}
+
+func (d *raceDialog) viewWithin(width, height int, th *theme) string {
+	width = max(width, 1)
+	if height <= 10 {
+		lines := []string{
+			fitCells(th.bold.Render(" keep which answer?"), width),
+			fitCells(th.warn.Render(" ROUTING EVIDENCE"), width),
+		}
+		focus := 0
+		safeLine := -1
+		for i, id := range d.ids {
+			label := ""
+			switch id {
+			case "a":
+				label = raceCostLabel(d.m, d.run.arms[0]) + " · keep " + d.run.labels[0]
+			case "b":
+				label = raceCostLabel(d.m, d.run.arms[1]) + " · keep " + d.run.labels[1]
+			case "tie":
+				label = "tie · keep cheaper"
+			default:
+				label = "neither · stay here"
+				safeLine = len(lines)
+			}
+			prefix := "  "
+			style := th.dim
+			if i == d.sel {
+				prefix = th.accent.Render("▌ ")
+				style = th.bold
+				focus = len(lines)
+			}
+			lines = append(lines, fitCells(prefix+style.Render(terminaltext.Escape(label)), width))
+		}
+		hintLine := len(lines)
+		lines = append(lines, th.faint.Render(fitCells("↑↓ · enter · esc neither", width)))
+		return strings.Join(dialogWindow(lines, height, focus, 0, 1, safeLine, hintLine), "\n")
+	}
 	var b strings.Builder
-	b.WriteString(th.bold.Render(" which answer does the session keep?") + "\n")
-	b.WriteString(th.dim.Render(" the pick is recorded as routing evidence; a tie says the cheaper rung sufficed") + "\n\n")
+	b.WriteString(wrapCells(th.bold.Render(" which answer does the session keep?"), width) + "\n")
+	b.WriteString(wrapCells(th.dim.Render(" the pick is recorded as routing evidence; a tie says the cheaper rung sufficed"), width) + "\n\n")
 	for i, label := range d.lbl {
+		label = terminaltext.Escape(label)
 		if i == d.sel {
-			b.WriteString(th.accent.Render(" ▌ ") + th.bold.Render(label) + "\n")
+			b.WriteString(wrapCellsBounded(th.accent.Render(" ▌ ")+th.bold.Render(label), width, 2) + "\n")
 		} else {
-			b.WriteString(th.dim.Render("   "+label) + "\n")
+			b.WriteString(wrapCellsBounded(th.dim.Render("   "+label), width, 2) + "\n")
 		}
 	}
-	b.WriteString(th.faint.Render(" ↑↓ choose · enter keep · esc neither"))
-	return b.String()
+	b.WriteString(wrapCells(th.faint.Render(" ↑↓ choose · enter keep · esc neither"), width))
+	lines := strings.Split(b.String(), "\n")
+	focus := dialogLine(lines, "▌", true)
+	return strings.Join(dialogWindow(lines, height, focus, 0, len(lines)-1), "\n")
 }

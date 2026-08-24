@@ -780,6 +780,278 @@ func TestToolDescriptionEnumeratesTheSet(t *testing.T) {
 	}
 }
 
+func TestToolRedactsCompleteNativeDescriptionsAndBodiesWithoutMutatingInventory(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	ws := t.TempDir()
+	secret := "ghp_" + strings.Repeat("a", 36)
+	boundaryDescription := strings.Repeat("d", 390) + " " + secret + " after"
+
+	writeSkill(t, filepath.Join(ws, ".switchboard", "skills"), "switchboard.md",
+		"---\ndescription: switchboard "+secret+"\n---\nswitchboard body "+secret)
+	writePackedSkill(t, filepath.Join(ws, ".agents", "skills"), "codex",
+		"---\ndescription: "+boundaryDescription+"\n---\ncodex body "+secret)
+	writePackedSkill(t, filepath.Join(ws, ".claude", "skills"), "claude",
+		"---\ndescription: claude "+secret+"\n---\nclaude body "+secret)
+	// Claude derives a missing description from the first body paragraph. That
+	// derived value is just as provider-bound as explicit frontmatter.
+	writePackedSkill(t, filepath.Join(ws, ".claude", "skills"), "derived",
+		"derived "+secret+" paragraph\n\nsecond paragraph")
+
+	list, notes := Load(ws)
+	if len(notes) != 0 || len(list) != 4 {
+		t.Fatalf("loaded credential fixtures = %+v, notes %v", list, notes)
+	}
+	type sourceValue struct {
+		description string
+		body        string
+	}
+	sources := make(map[string]sourceValue, len(list))
+	for _, sk := range list {
+		if !strings.Contains(sk.Description, secret) || !strings.Contains(sk.Body, secret) {
+			t.Fatalf("fixture %s did not retain source credential: %+v", sk.Key(), sk)
+		}
+		sources[sk.Key()] = sourceValue{description: sk.Description, body: sk.Body}
+	}
+
+	tool := NewTool(list)
+	description := tool.Description()
+	if strings.Contains(description, secret) || strings.Count(description, "[redacted: a GitHub token]") != len(list) {
+		t.Fatalf("frozen skill inventory did not visibly redact every description:\n%s", description)
+	}
+	for _, sk := range list {
+		input, err := json.Marshal(skillInput{Name: sk.Key()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan, err := tool.Plan(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := plan.Run(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(result.Content, secret) || !strings.Contains(result.Content, "[redacted: a GitHub token]") {
+			t.Errorf("skill %s body egress was not visibly redacted:\n%s", sk.Key(), result.Content)
+		}
+	}
+	for _, sk := range list {
+		want := sources[sk.Key()]
+		if sk.Description != want.description || sk.Body != want.body {
+			t.Errorf("source skill %s was mutated: got description=%q body=%q", sk.Key(), sk.Description, sk.Body)
+		}
+	}
+}
+
+func TestToolRedactsEveryProviderVisibleIdentityAndDiagnosticWithoutMutatingInventory(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("i", 36)
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "skill-"+secret)
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := "reference-" + secret + ".md"
+	writeSkill(t, dir, file, "ordinary supporting content")
+
+	source := Skill{
+		Name:        "identity " + secret,
+		Selector:    "codex:repo:" + strings.Repeat("p", 390) + "%20" + secret,
+		Description: "description " + secret,
+		Body:        "body " + secret,
+		Dir:         dir,
+	}
+	list := []Skill{source}
+	tool := NewTool(list)
+
+	visibleSelector := redactSkillSelector(source.Selector)
+	description := tool.Description()
+	if strings.Contains(description, secret) || !strings.Contains(description, visibleSelector) ||
+		!strings.Contains(description, "[redacted: a GitHub token]") {
+		t.Fatalf("provider definition exposed or lost the redacted identity:\n%s", description)
+	}
+
+	plan, err := tool.Plan(mustSkillInput(t, skillInput{Name: visibleSelector}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(plan.Request.Detail, secret) {
+		t.Fatalf("permission detail exposed source identity: %q", plan.Request.Detail)
+	}
+	result, err := plan.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result.Content, secret) || strings.Count(result.Content, "[redacted: a GitHub token]") < 3 {
+		t.Fatalf("body result exposed identity, directory, or body metadata:\n%s", result.Content)
+	}
+
+	filePlan, err := tool.Plan(mustSkillInput(t, skillInput{Name: visibleSelector, File: file}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(filePlan.Request.Detail, secret) || !strings.Contains(filePlan.Request.Detail, "[redacted: a GitHub token]") {
+		t.Fatalf("supporting-file permission detail was not redacted: %q", filePlan.Request.Detail)
+	}
+	if _, err := filePlan.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	missingPlan, err := tool.Plan(mustSkillInput(t, skillInput{Name: visibleSelector, File: "missing-" + secret}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing, err := missingPlan.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(missing.Content, secret) || !strings.Contains(missing.Content, "[redacted: a GitHub token]") {
+		t.Fatalf("supporting-file error exposed input metadata: %q", missing.Content)
+	}
+
+	_, err = tool.Plan(mustSkillInput(t, skillInput{Name: "unknown-" + secret}))
+	if err == nil || strings.Contains(err.Error(), secret) || !strings.Contains(err.Error(), "[redacted: a GitHub token]") {
+		t.Fatalf("unknown-selector error was not redacted: %v", err)
+	}
+
+	if list[0].Name != source.Name || list[0].Selector != source.Selector ||
+		list[0].Description != source.Description || list[0].Body != source.Body || list[0].Dir != source.Dir {
+		t.Fatalf("tool construction mutated the source inventory: got %+v want %+v", list[0], source)
+	}
+}
+
+func TestToolTreatsSelectorsThatCollideAfterRedactionAsAmbiguous(t *testing.T) {
+	one := "ghp_" + strings.Repeat("a", 36)
+	two := "ghp_" + strings.Repeat("b", 36)
+	tool := NewTool([]Skill{
+		{Name: "one", Selector: "codex:repo:" + one, Description: "first", Body: "first"},
+		{Name: "two", Selector: "codex:repo:" + two, Description: "second", Body: "second"},
+	})
+	selector := "codex:repo:%5Bredacted%3A%20a%20GitHub%20token%5D"
+	_, err := tool.Plan(mustSkillInput(t, skillInput{Name: selector}))
+	if err == nil || !strings.Contains(err.Error(), "ambiguous across 2 definitions") ||
+		strings.Contains(err.Error(), one) || strings.Contains(err.Error(), two) {
+		t.Fatalf("redacted selector collision did not fail safely: %v", err)
+	}
+}
+
+func TestToolReescapesRedactedSelectorComponents(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("z", 36)
+	sourceSelector := "codex:repo:folder%0Aname%2Fpart%3Arole%20" + secret
+	visibleSelector := redactSkillSelector(sourceSelector)
+	if strings.Contains(visibleSelector, secret) || strings.ContainsAny(visibleSelector, "\r\n") ||
+		strings.Count(visibleSelector, ":") != 2 || strings.Contains(visibleSelector, "/") {
+		t.Fatalf("redacted selector lost its escaped component grammar: %q", visibleSelector)
+	}
+	for _, want := range []string{"%0A", "%2F", "%3A", "%5Bredacted%3A%20a%20GitHub%20token%5D"} {
+		if !strings.Contains(visibleSelector, want) {
+			t.Errorf("redacted selector %q is missing %q", visibleSelector, want)
+		}
+	}
+
+	tool := NewTool([]Skill{{
+		Name: "encoded", Selector: sourceSelector, Description: "encoded selector", Body: "body",
+	}})
+	if description := tool.Description(); strings.Contains(description, secret) ||
+		strings.Contains(description, "\r") || strings.Count(description, "\n") != 1 ||
+		!strings.Contains(description, "- "+visibleSelector+" (encoded): encoded selector") {
+		t.Fatalf("tool description did not preserve the safe model-visible key:\n%s", description)
+	}
+	plan, err := tool.Plan(mustSkillInput(t, skillInput{Name: visibleSelector}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plan.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustSkillInput(t *testing.T, input skillInput) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestToolRedactsBodyAtDefinitionReadLimit(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	ws := t.TempDir()
+	secret := "ghp_" + strings.Repeat("b", 36)
+	header := "---\ndescription: boundary body\n---\n"
+	content := header + strings.Repeat("x", int(maxDefinitionBytes)-len(header)-len(secret)-1) + " " + secret
+	if len(content) != int(maxDefinitionBytes) {
+		t.Fatalf("fixture length = %d, want %d", len(content), maxDefinitionBytes)
+	}
+	writePackedSkill(t, filepath.Join(ws, ".agents", "skills"), "boundary", content)
+
+	list, notes := Load(ws)
+	if len(notes) != 0 || len(list) != 1 {
+		t.Fatalf("boundary definition loaded %+v, notes %v", list, notes)
+	}
+	sourceBody := list[0].Body
+	if !strings.HasSuffix(sourceBody, secret) {
+		t.Fatal("boundary fixture did not retain its source token")
+	}
+	plan, err := NewTool(list).Plan(json.RawMessage(`{"name":"codex:repo:.agents/skills/boundary"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := plan.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result.Content, secret) || !strings.Contains(result.Content, "[redacted: a GitHub token]") {
+		t.Fatalf("definition-boundary credential reached the tool result: suffix %q", result.Content[len(result.Content)-128:])
+	}
+	if list[0].Body != sourceBody {
+		t.Fatal("tool construction mutated the source body")
+	}
+}
+
+func TestToolRedactsCompleteSupportingFilesAtAndAcrossReadBoundary(t *testing.T) {
+	dir := t.TempDir()
+	secret := "ghp_" + strings.Repeat("c", 36)
+	writeSkill(t, dir, "small.md", strings.Repeat("s", 390)+" "+secret+" tail")
+	exact := strings.Repeat("x", int(maxSupportingBytes)-len(secret)-1) + " " + secret
+	writeSkill(t, dir, "exact.md", exact)
+	// This token starts within the read allowance and ends beyond it. The
+	// resource must be refused whole, never returned as a prefix.
+	crossing := strings.Repeat("y", int(maxSupportingBytes)-11) + " " + secret
+	writeSkill(t, dir, "crossing.md", crossing)
+
+	tool := NewTool([]Skill{{Name: "support", Description: "supporting files", Body: "body", Dir: dir}})
+	serve := func(name string) tools.Result {
+		t.Helper()
+		input, err := json.Marshal(skillInput{Name: "support", File: name})
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan, err := tool.Plan(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := plan.Run(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	for _, name := range []string{"small.md", "exact.md"} {
+		result := serve(name)
+		if result.IsError || strings.Contains(result.Content, secret) || !strings.Contains(result.Content, "[redacted: a GitHub token]") {
+			t.Errorf("supporting file %s was not visibly redacted: error=%v, suffix=%q", name, result.IsError, result.Content[len(result.Content)-128:])
+		}
+	}
+	if result := serve("crossing.md"); !result.IsError || strings.Contains(result.Content, "ghp_") || !strings.Contains(result.Content, "exceeds the") {
+		t.Fatalf("over-limit crossing resource was partially served: %+v", result)
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, "exact.md")); err != nil || string(got) != exact {
+		t.Fatalf("serving mutated source bytes: equal=%v err=%v", string(got) == exact, err)
+	}
+}
+
 func TestManagedCodexSkillSelectorKeepsAdminOrigin(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "managed-skills")
 	selector, err := canonicalSelector(source{

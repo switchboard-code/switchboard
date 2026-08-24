@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 )
 
 const (
@@ -205,7 +207,7 @@ func rootDiagnostic(root, code string, err error) Diagnostic {
 }
 
 func inspectDialect(candidate candidateRoot, spec dialectSpec) (Plugin, bool, *Diagnostic) {
-	root, err := os.OpenRoot(candidate.realPath)
+	root, err := rootedfs.OpenRoot(candidate.realPath)
 	if err != nil {
 		diagnostic := rootDiagnostic(candidate.root, "unreadable-root", err)
 		return Plugin{}, false, &diagnostic
@@ -875,6 +877,10 @@ func validateJSONComponent(root *os.Root, rel string) error {
 }
 
 func readBounded(root *os.Root, rel string, limit int64) ([]byte, error) {
+	return readBoundedWithHook(root, rel, limit, nil)
+}
+
+func readBoundedWithHook(root *os.Root, rel string, limit int64, beforeOpen func()) ([]byte, error) {
 	info, err := safeInfo(root, rel)
 	if err != nil {
 		return nil, err
@@ -888,20 +894,38 @@ func readBounded(root *os.Root, rel string, limit int64) ([]byte, error) {
 	if info.Size() > limit {
 		return nil, fmt.Errorf("file is %d bytes; limit is %d", info.Size(), limit)
 	}
-	file, err := root.Open(filepath.FromSlash(rel))
+	if beforeOpen != nil {
+		beforeOpen()
+	}
+	file, err := openExtensionRootRead(root, filepath.FromSlash(rel))
 	if err != nil {
 		return nil, err
 	}
-	raw, readErr := io.ReadAll(io.LimitReader(file, limit+1))
-	closeErr := file.Close()
-	if readErr != nil {
-		return nil, readErr
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil {
+		return nil, err
 	}
-	if closeErr != nil {
-		return nil, closeErr
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, errors.New("file changed while it was opened")
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
 	}
 	if int64(len(raw)) > limit {
 		return nil, fmt.Errorf("file grew beyond %d-byte limit while reading", limit)
+	}
+	finished, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	linked, linkErr := safeInfo(root, rel)
+	if linkErr != nil || linked == nil || !linked.Mode().IsRegular() ||
+		!os.SameFile(opened, finished) || !os.SameFile(finished, linked) ||
+		opened.Size() != finished.Size() || finished.Size() != int64(len(raw)) ||
+		!opened.ModTime().Equal(finished.ModTime()) {
+		return nil, errors.Join(linkErr, errors.New("file changed while it was read"))
 	}
 	return raw, nil
 }
@@ -1040,11 +1064,32 @@ func validateExcludedGit(root *os.Root, rel string) error {
 }
 
 func readDigestDirectory(root *os.Root, rel string, remaining int) ([]os.DirEntry, error) {
-	directory, err := root.Open(filepath.FromSlash(rel))
+	return readDigestDirectoryWithHook(root, rel, remaining, nil)
+}
+
+func readDigestDirectoryWithHook(root *os.Root, rel string, remaining int, beforeOpen func()) ([]os.DirEntry, error) {
+	before, err := root.Lstat(filepath.FromSlash(rel))
+	if err != nil {
+		return nil, err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.IsDir() {
+		return nil, fmt.Errorf("plugin digest path %q is not a real directory", rel)
+	}
+	if beforeOpen != nil {
+		beforeOpen()
+	}
+	directory, err := openExtensionRootRead(root, filepath.FromSlash(rel))
 	if err != nil {
 		return nil, err
 	}
 	defer directory.Close()
+	opened, err := directory.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !opened.IsDir() || !os.SameFile(before, opened) {
+		return nil, fmt.Errorf("plugin digest directory %q changed while it was opened", rel)
+	}
 
 	entries := make([]os.DirEntry, 0, min(remaining, 256))
 	for {
@@ -1059,6 +1104,16 @@ func readDigestDirectory(root *os.Root, rel string, remaining int) ([]os.DirEntr
 		if readErr != nil {
 			return nil, readErr
 		}
+	}
+	finished, err := directory.Stat()
+	if err != nil {
+		return nil, err
+	}
+	linked, linkErr := root.Lstat(filepath.FromSlash(rel))
+	if linkErr != nil || !linked.IsDir() || linked.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(opened, finished) || !os.SameFile(finished, linked) ||
+		!opened.ModTime().Equal(finished.ModTime()) {
+		return nil, errors.Join(linkErr, fmt.Errorf("plugin digest directory %q changed while it was read", rel))
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	return entries, nil

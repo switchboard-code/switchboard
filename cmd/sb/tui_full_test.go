@@ -1,9 +1,12 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/switchboard-code/switchboard/internal/tools"
 )
 
 type fullscreenProbe struct {
@@ -81,6 +84,45 @@ func TestFullscreenOwnsMouseAndView(t *testing.T) {
 	}
 	if probe.viewW != 91 || probe.viewH != 27 || probe.viewTheme != th {
 		t.Fatalf("fullscreen view args = (%d, %d, %p), want (91, 27, %p)", probe.viewW, probe.viewH, probe.viewTheme, th)
+	}
+}
+
+func TestModalPreemptsAnOpenFullscreenPanel(t *testing.T) {
+	m := testModel(t)
+	probe := &fullscreenProbe{}
+	m.full = probe
+	respond := make(chan tools.Answer, 1)
+	m.Update(questionMsg{q: tools.Question{
+		Question: "continue with the migration?",
+		Options:  []tools.QuestionOption{{Label: "continue"}, {Label: "stop"}},
+	}, respond: respond})
+
+	view := m.View()
+	if !strings.Contains(view, "continue with the migration?") || view == "fullscreen" {
+		t.Fatalf("the modal stayed hidden behind fullscreen:\n%s", view)
+	}
+	// The asynchronously opened question starts neutral; navigation is the
+	// explicit selection that makes Enter an answer.
+	m.key(tea.KeyMsg{Type: tea.KeyDown})
+	if cmd := m.key(tea.KeyMsg{Type: tea.KeyEnter}); cmd != nil {
+		t.Fatalf("answer returned unexpected command %v", cmd)
+	}
+	select {
+	case answer := <-respond:
+		if len(answer.Picked) != 1 || answer.Picked[0] != "continue" {
+			t.Fatalf("answer = %+v, want continue", answer)
+		}
+	default:
+		t.Fatal("the modal did not receive the key; the loop would remain blocked")
+	}
+	if probe.gotKey != "" {
+		t.Fatalf("fullscreen received modal key %q", probe.gotKey)
+	}
+
+	// The panel remains available after the modal closes; preemption is not a
+	// destructive close.
+	if m.full != probe || m.View() != "fullscreen" {
+		t.Fatal("answering the modal discarded the fullscreen panel")
 	}
 }
 

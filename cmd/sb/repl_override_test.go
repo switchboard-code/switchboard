@@ -27,12 +27,14 @@ import (
 )
 
 type replRequestCapture struct {
-	mu        sync.Mutex
-	bodies    []string
-	status    int
-	blockChat bool
-	entered   chan struct{}
-	showCaps  string
+	mu         sync.Mutex
+	bodies     []string
+	status     int
+	blockChat  bool
+	entered    chan struct{}
+	showCaps   string
+	promptEval int
+	onChat     func()
 }
 
 func (c *replRequestCapture) add(body string) {
@@ -64,7 +66,12 @@ func newOverrideREPL(t *testing.T, models ...string) (*repl, *replRequestCapture
 			status := capture.status
 			blockChat := capture.blockChat
 			entered := capture.entered
+			promptEval := capture.promptEval
+			onChat := capture.onChat
 			capture.mu.Unlock()
+			if onChat != nil {
+				onChat()
+			}
 			if blockChat {
 				if entered != nil {
 					close(entered)
@@ -76,7 +83,13 @@ func newOverrideREPL(t *testing.T, models ...string) (*repl, *replRequestCapture
 				http.Error(w, "forced failure", status)
 				return
 			}
-			_, _ = io.WriteString(w, `{"message":{"role":"assistant","content":"done"},"done":true,"done_reason":"stop","prompt_eval_count":8,"eval_count":1}`+"\n")
+			if promptEval == 0 {
+				promptEval = 8
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"message": map[string]string{"role": "assistant", "content": "done"},
+				"done":    true, "done_reason": "stop", "prompt_eval_count": promptEval, "eval_count": 1,
+			})
 		default:
 			http.NotFound(w, req)
 		}
@@ -346,6 +359,25 @@ func TestREPLLateSuccessfulRouteProbeCannotCommitAfterCancellation(t *testing.T)
 	}
 }
 
+func TestREPLSameTargetResolutionInstallsFreshProviderClient(t *testing.T) {
+	r, _, _ := newOverrideREPL(t, "small", "large")
+	stale := &racedProvider{}
+	fresh := &racedProvider{}
+	binding := r.loop.Binding()
+	binding.Provider = stale
+	r.loop.Bind(binding)
+
+	plan := turnPlan{Decision: route.Decision{
+		Tier: r.tier.ID, Target: r.tier.Target.ID(), Rationale: "same target after provider reset",
+	}}
+	if err := r.acceptTurnResolution(context.Background(), r.tier, fresh, "", plan); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.loop.Binding().Provider; got != fresh {
+		t.Fatalf("same-target resolution kept stale provider %p; want prepared client %p", got, fresh)
+	}
+}
+
 func TestREPLTierPromptTurnErrorRestoresExactBinding(t *testing.T) {
 	r, capture, _ := newOverrideREPL(t, "small", "large")
 	capture.mu.Lock()
@@ -513,5 +545,32 @@ func TestREPLRoutingOffPersistsAndReports(t *testing.T) {
 	}
 	if !r.config.RouteAutoOn() {
 		t.Fatal("/routing on did not restore the setting")
+	}
+}
+
+func TestREPLRoutingSaveFailureLeavesLivePostureUnchanged(t *testing.T) {
+	for _, initial := range []bool{false, true} {
+		initial := initial
+		t.Run(map[bool]string{false: "off", true: "on"}[initial], func(t *testing.T) {
+			r, _, readOutput := newOverrideREPL(t, "small", "large")
+			r.config.Path = t.TempDir() // a directory cannot be replaced by the config file
+			r.config.RouteAuto = &initial
+			r.watcher = newWatcher(nil, r.sticky, len(r.config.Tiers)-1, nil)
+			r.watcher.setPaused(!initial)
+
+			requested := !initial
+			if r.command(context.Background(), "/routing "+map[bool]string{false: "off", true: "on"}[requested]) {
+				t.Fatal("failed routing save asked the REPL to exit")
+			}
+			if out := readOutput(); !strings.Contains(out, "saving the routing setting failed") {
+				t.Fatalf("failed save output = %q", out)
+			}
+			if r.config.RouteAutoOn() != initial {
+				t.Fatalf("failed save changed live config from %v to %v", initial, r.config.RouteAutoOn())
+			}
+			if r.watcher.isPaused() != !initial {
+				t.Fatalf("failed save changed watcher pause from %v to %v", !initial, r.watcher.isPaused())
+			}
+		})
 	}
 }

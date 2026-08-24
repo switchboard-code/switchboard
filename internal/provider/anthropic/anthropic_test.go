@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -444,6 +445,54 @@ func TestThinkingBudgetAndCeiling(t *testing.T) {
 	}
 }
 
+func TestExplicitOutputCapAtOrBelowThinkingBudgetIsRefusedBeforeSend(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cap     int
+		capText string
+	}{
+		{name: "below budget", cap: 4_096, capText: "4096"},
+		{name: "equal to budget", cap: effortBudgets["high"], capText: "16384"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requests := 0
+			client := serve(t, func(http.ResponseWriter, *http.Request) { requests++ })
+			target := Target("claude-haiku-4-5")
+			target.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "high"}
+			target.Params.MaxOutputTokens = tc.cap
+
+			_, err := client.Stream(context.Background(), target, provider.Request{
+				Messages: []provider.Message{provider.UserText("hi")},
+			})
+			var capErr *provider.CapabilityError
+			if !errors.As(err, &capErr) {
+				t.Fatalf("err = %v, want a CapabilityError", err)
+			}
+			if capErr.Target != target.ID() || capErr.Capability != "max_output with token-budget reasoning" {
+				t.Fatalf("CapabilityError = %+v, want the exact target and conflicting setting", capErr)
+			}
+			for _, want := range []string{tc.capText, "16384", "raise max_output", "lower or disable reasoning"} {
+				if !strings.Contains(capErr.Detail, want) {
+					t.Fatalf("CapabilityError detail omitted %q: %q", want, capErr.Detail)
+				}
+			}
+			if provider.RequestIssued(err) {
+				t.Fatalf("local capability refusal was marked as issued: %v", err)
+			}
+			if requests != 0 {
+				t.Fatalf("explicit-cap conflict made %d HTTP requests", requests)
+			}
+			if allowance := provider.EffectiveOutputTokenAllowance(client, target, 200_000); allowance != math.MaxInt {
+				t.Fatalf("invalid explicit-cap target advertised allowance %d, want unknown/infeasible", allowance)
+			}
+			var resolvedCapErr *provider.CapabilityError
+			if _, resolvedErr := provider.ResolveOutputTokenAllowance(client, target, 200_000); !errors.As(resolvedErr, &resolvedCapErr) {
+				t.Fatalf("pre-send allowance resolution error = %v, want CapabilityError", resolvedErr)
+			}
+		})
+	}
+}
+
 // The current Opus and Sonnet models invert what claude-haiku-4-5 does: a
 // budget is a 400 and the effort is a word on output_config. The adapter's
 // catalog already offered xhigh on these targets while the budget dialect had
@@ -483,6 +532,132 @@ func TestAdaptiveModelsTakeAnEffortWordAndNoBudget(t *testing.T) {
 		if strings.Contains(string(body), "budget_tokens") {
 			t.Errorf("%s: the request carries a budget this model rejects: %s", model, body)
 		}
+	}
+}
+
+func TestCanonicalAdaptiveSnapshotsUseTheirAliasDialect(t *testing.T) {
+	for _, alias := range []string{"claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-sonnet-5"} {
+		model := alias + "-20260824"
+		t.Run(model, func(t *testing.T) {
+			target := Target(model)
+			target.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "xhigh"}
+
+			body, err := New().buildRequest(target, provider.Request{
+				Messages: []provider.Message{provider.UserText("hi")},
+			}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(body), `"thinking":{"type":"adaptive"}`) ||
+				!strings.Contains(string(body), `"output_config":{"effort":"xhigh"}`) ||
+				strings.Contains(string(body), "budget_tokens") {
+				t.Fatalf("snapshot did not use %s's adaptive wire dialect: %s", alias, body)
+			}
+		})
+	}
+}
+
+func TestOnlyCanonicalSnapshotsAcquireAdaptiveDialect(t *testing.T) {
+	for _, model := range []string{
+		"claude-opus-5x-20260824",        // near-prefix, different alias
+		"claude-opus-5-2026082",          // short date
+		"claude-opus-5-202608240",        // long date
+		"claude-opus-5-2026abcd",         // non-digits
+		"claude-opus-5-20260230",         // not a calendar date
+		"claude-opus-5-20260824-preview", // suffix after the date
+		"claude-haiku-4-5-20251001",      // canonical, but budget-dialect alias
+	} {
+		t.Run(model, func(t *testing.T) {
+			if modelUsesAdaptiveThinking(model) {
+				t.Fatalf("%q acquired adaptive semantics without an exact verified alias and canonical date", model)
+			}
+			target := Target(model)
+			target.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "xhigh"}
+			_, err := New().buildRequest(target, provider.Request{
+				Messages: []provider.Message{provider.UserText("hi")},
+			}, true)
+			var capErr *provider.CapabilityError
+			if !errors.As(err, &capErr) {
+				t.Fatalf("wire accepted adaptive-only xhigh for %q: %v", model, err)
+			}
+		})
+	}
+}
+
+func TestListedSnapshotMatchesOnlyItsExactAlias(t *testing.T) {
+	const snapshot = "claude-opus-5-20260824"
+	for requested, want := range map[string]bool{
+		"claude-opus-5":            true,
+		snapshot:                   true,
+		"claude-opus":              false,
+		"claude-opus-5-2026082":    false,
+		"claude-opus-5-20260824-x": false,
+	} {
+		if got := offeredModelMatches(snapshot, requested); got != want {
+			t.Errorf("offeredModelMatches(%q, %q) = %v, want %v", snapshot, requested, got, want)
+		}
+	}
+	if offeredModelMatches("claude-opus-5-20260230", "claude-opus-5") {
+		t.Fatal("an impossible snapshot date matched the alias")
+	}
+	if !offeredModelMatches("claude-haiku-4-5-20251001", "claude-haiku-4-5") {
+		t.Fatal("the explicitly verified Haiku snapshot did not satisfy its alias")
+	}
+	for _, offered := range []string{
+		"claude-haiku-4-5-20260824",
+		"claude-haiku-4-5x-20251001",
+		"claude-haiku-4-5-2025100",
+	} {
+		if offeredModelMatches(offered, "claude-haiku-4-5") {
+			t.Fatalf("unverified Haiku snapshot %q satisfied the alias", offered)
+		}
+	}
+}
+
+// Routing, the loop's context guard, budget admission, and the wire must all
+// reserve the same value. This matrix pins both Messages dialects and the
+// configured/default branches so a new effort cannot change one surface while
+// leaving another to price or admit different bytes.
+func TestOutputAllowanceMatchesWireAcrossReasoningDialects(t *testing.T) {
+	cases := []struct {
+		name     string
+		model    string
+		reason   *provider.Reasoning
+		explicit int
+		want     int
+	}{
+		{name: "budget default", model: "claude-haiku-4-5", want: 8_192},
+		{name: "budget low stays inside default", model: "claude-haiku-4-5", reason: &provider.Reasoning{Enabled: true, Effort: "low"}, want: 8_192},
+		{name: "budget high raises max tokens", model: "claude-haiku-4-5", reason: &provider.Reasoning{Enabled: true, Effort: "high"}, want: 16_384 + 8_192},
+		{name: "budget explicit one above budget stays exact", model: "claude-haiku-4-5", reason: &provider.Reasoning{Enabled: true, Effort: "high"}, explicit: 16_385, want: 16_385},
+		{name: "budget explicit ceiling already clears budget", model: "claude-haiku-4-5", reason: &provider.Reasoning{Enabled: true, Effort: "max"}, explicit: 40_000, want: 40_000},
+		{name: "adaptive high has no token budget", model: "claude-opus-5", reason: &provider.Reasoning{Enabled: true, Effort: "high"}, want: 8_192},
+		{name: "adaptive xhigh preserves a small explicit limit", model: "claude-sonnet-5", reason: &provider.Reasoning{Enabled: true, Effort: "xhigh"}, explicit: 1_234, want: 1_234},
+		{name: "unlisted messages model uses budget dialect", model: "kimi-k2-thinking", reason: &provider.Reasoning{Enabled: true, Effort: "high"}, want: 16_384 + 8_192},
+	}
+
+	client := New()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := Target(tc.model)
+			target.Params.Reasoning = tc.reason
+			target.Params.MaxOutputTokens = tc.explicit
+
+			body, err := client.buildRequest(target, provider.Request{Messages: []provider.Message{provider.UserText("hi")}}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire struct {
+				MaxTokens int `json:"max_tokens"`
+			}
+			if err := json.Unmarshal(body, &wire); err != nil {
+				t.Fatal(err)
+			}
+			allowance := provider.EffectiveOutputTokenAllowance(client, target, 128_000)
+			if wire.MaxTokens != tc.want || allowance != wire.MaxTokens {
+				t.Fatalf("allowance=%d wire max_tokens=%d, want both %d; body=%s", allowance, wire.MaxTokens, tc.want, body)
+			}
+		})
 	}
 }
 
@@ -576,6 +751,29 @@ func TestErrorShapeIsUnwrapped(t *testing.T) {
 	}
 }
 
+func TestHTTPErrorCredentialBodyIsRedactedBeforeItsCap(t *testing.T) {
+	token := "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for name, body := range map[string]string{
+		"complete":       `{"error":{"message":"rejected ` + token + `"}}`,
+		"cross-boundary": strings.Repeat("x", provider.MaxAPIErrorBodyBytes-len(token)+1) + token,
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, body)
+			})
+			_, err := c.Stream(context.Background(), Target("claude-haiku-4-5"), provider.Request{})
+			var apiErr *provider.APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("err = %v, want APIError", err)
+			}
+			if strings.Contains(apiErr.Body, token) || strings.Contains(apiErr.Body, "ghp_") {
+				t.Fatalf("API error body exposed a credential fragment: %q", apiErr.Body)
+			}
+		})
+	}
+}
+
 func TestTruncatedStreamIsDistinguishable(t *testing.T) {
 	c := serve(t, func(w http.ResponseWriter, _ *http.Request) {
 		io.WriteString(w, `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half a th"}}`+"\n")
@@ -653,6 +851,46 @@ func TestCountRequestOmitsGenerationFields(t *testing.T) {
 	}
 }
 
+func TestReplayExcludesIncompleteAssistantFromAnthropicWire(t *testing.T) {
+	const partial = "PARTIAL MUST NOT REPLAY"
+	body, err := New().buildRequest(Target("claude-haiku-4-5"), provider.Request{
+		Messages: []provider.Message{
+			provider.UserText("before"),
+			{
+				Role:       provider.RoleAssistant,
+				Incomplete: true,
+				Content:    []provider.Block{provider.Text{Text: partial}},
+			},
+			provider.UserText("after"),
+		},
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), partial) {
+		t.Fatalf("incomplete assistant reached Anthropic wire:\n%s", body)
+	}
+	if !strings.Contains(string(body), "before") || !strings.Contains(string(body), "after") {
+		t.Fatalf("projection removed surrounding durable messages:\n%s", body)
+	}
+
+	// Marker indexes only have meaning after projection. A direct adapter call
+	// carrying pre-projection indexes must fail rather than silently attach a
+	// cache marker to a different message.
+	_, err = New().buildRequest(Target("claude-haiku-4-5"), provider.Request{
+		Messages: []provider.Message{
+			provider.UserText("before"),
+			{Role: provider.RoleAssistant, Incomplete: true, Content: []provider.Block{provider.Text{Text: partial}}},
+			provider.UserText("after"),
+		},
+		CachePlan: &provider.CachePlan{Breakpoints: []provider.Breakpoint{{}}},
+	}, true)
+	var capabilityErr *provider.CapabilityError
+	if !errors.As(err, &capabilityErr) {
+		t.Fatalf("stale pre-projection cache plan error = %v, want CapabilityError", err)
+	}
+}
+
 func TestCountTokensIsExact(t *testing.T) {
 	c := serve(t, func(w http.ResponseWriter, _ *http.Request) {
 		io.WriteString(w, `{"input_tokens":1234}`)
@@ -712,4 +950,27 @@ func TestModelsListsTheAccountsModels(t *testing.T) {
 	if len(names) != 2 || names[0] != "k3-256k" {
 		t.Fatalf("Models() = %v, want the two ids the server listed", names)
 	}
+}
+
+func TestSuccessfulMetadataBodiesAreBoundedAndModelIDsAreValidated(t *testing.T) {
+	t.Run("count body", func(t *testing.T) {
+		c := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, strings.Repeat(" ", provider.MaxProviderJSONBodyBytes+1))
+		})
+		_, err := c.CountTokens(context.Background(), Target("claude-haiku-4-5"), provider.Request{})
+		if err == nil || !strings.Contains(err.Error(), "response limit") {
+			t.Fatalf("err = %v, want response-limit refusal", err)
+		}
+	})
+
+	t.Run("credential shaped model id", func(t *testing.T) {
+		token := "ghp_" + strings.Repeat("A", 40)
+		c := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{"data":[{"id":"model-`+token+`"}]}`)
+		})
+		_, err := c.Models(context.Background())
+		if err == nil || strings.Contains(err.Error(), token) {
+			t.Fatalf("unsafe model ID was accepted or echoed: %v", err)
+		}
+	})
 }

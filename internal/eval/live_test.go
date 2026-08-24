@@ -60,10 +60,75 @@ func compatArm(t *testing.T) Arm {
 	if err != nil {
 		t.Fatalf("assembling the compatible endpoint: %v", err)
 	}
+	target, err := configuredCompatTarget(cfg, model)
+	if err != nil {
+		t.Fatalf("resolving the configured compatible target: %v", err)
+	}
 	return Arm{
-		Name:     "pin-compat",
-		Target:   provider.RouteTarget{Provider: openaicompat.Name, Surface: "generic", ModelID: model},
-		Provider: client,
+		Name:          "pin-compat",
+		Target:        target,
+		Provider:      client,
+		ContextWindow: settings.ContextWindow,
+	}
+}
+
+// configuredCompatTarget reuses the exact target identity the TUI persisted,
+// including its rung-scoped output cap. Reconstructing only provider/surface/
+// model here would make a real eval refuse a custom model that the interactive
+// session can run, or price a different wire request under the same label.
+func configuredCompatTarget(cfg *config.Config, model string) (provider.RouteTarget, error) {
+	bare := provider.RouteTarget{Provider: openaicompat.Name, Surface: "generic", ModelID: model}
+	if cfg == nil {
+		return bare, nil
+	}
+	var matched *provider.RouteTarget
+	for _, tier := range cfg.Tiers {
+		targets := append([]provider.RouteTarget{tier.Target}, tier.Fallbacks...)
+		for _, target := range targets {
+			if target.Provider != bare.Provider || target.Surface != bare.Surface || target.ModelID != model {
+				continue
+			}
+			if matched != nil && matched.ID() != target.ID() {
+				return provider.RouteTarget{}, fmt.Errorf(
+					"model %q has more than one configured max_output; pin an unambiguous target", model)
+			}
+			copy := target
+			matched = &copy
+		}
+	}
+	if matched != nil {
+		return *matched, nil
+	}
+	return bare, nil
+}
+
+func TestConfiguredCompatTargetKeepsRungCapAndSurfaceContext(t *testing.T) {
+	target := provider.RouteTarget{
+		Provider: openaicompat.Name, Surface: "generic", ModelID: "custom-eval-model",
+		Params: provider.Params{MaxOutputTokens: 4096},
+	}
+	cfg := &config.Config{
+		Tiers: []config.Tier{{ID: "t1", Target: target}},
+		Providers: map[string]config.ProviderSettings{
+			"openaicompat/generic": {ContextWindow: 32_768},
+		},
+	}
+	got, err := configuredCompatTarget(cfg, target.ModelID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID() != target.ID() || got.Params.MaxOutputTokens != 4096 {
+		t.Fatalf("configured compatible target = %+v, want exact capped target %+v", got, target)
+	}
+	if window := cfg.ProviderForTarget(got.Provider, got.Surface).ContextWindow; window != 32_768 {
+		t.Fatalf("configured compatible context = %d, want 32768", window)
+	}
+
+	conflicting := target
+	conflicting.Params.MaxOutputTokens = 2048
+	cfg.Tiers = append(cfg.Tiers, config.Tier{ID: "t2", Target: conflicting})
+	if _, err := configuredCompatTarget(cfg, target.ModelID); err == nil || !strings.Contains(err.Error(), "more than one configured max_output") {
+		t.Fatalf("ambiguous configured cap error = %v", err)
 	}
 }
 

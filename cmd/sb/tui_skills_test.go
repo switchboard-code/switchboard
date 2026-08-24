@@ -11,7 +11,7 @@ import (
 func TestSkillsCommandShowsCanonicalOriginsAndInvocationState(t *testing.T) {
 	m := testModel(t)
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateTestHome(t, home)
 	m.app.workspace = filepath.Join(t.TempDir(), "repo")
 	m.app.skills = []skills.Skill{
 		{

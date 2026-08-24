@@ -13,6 +13,8 @@ import (
 	"github.com/switchboard-code/switchboard/internal/config"
 	"github.com/switchboard-code/switchboard/internal/costmodel"
 	"github.com/switchboard-code/switchboard/internal/provider"
+	"github.com/switchboard-code/switchboard/internal/provider/anthropic"
+	"github.com/switchboard-code/switchboard/internal/provider/kimi"
 	route "github.com/switchboard-code/switchboard/internal/router"
 )
 
@@ -126,7 +128,21 @@ func candidateForTierContext(tier config.Tier, rank int, cat *catalog.Catalog, p
 }
 
 func reservedOutputTokens(target provider.RouteTarget, info catalog.ModelInfo) int {
-	return provider.EffectiveOutputTokenReserve(target, info.MaxOutput)
+	return effectiveOutputTokenAllowance(nil, target, info.MaxOutput)
+}
+
+// effectiveOutputTokenAllowance is the serving-surface resolver shared by
+// routing, context admission, and budget admission. A bound adapter gets first
+// say; Messages targets can also be scored before binding through the same pure
+// dialect policy their adapter uses to build max_tokens.
+func effectiveOutputTokenAllowance(bound provider.Provider, target provider.RouteTarget, catalogMax int) int {
+	if bound != nil {
+		return provider.EffectiveOutputTokenAllowance(bound, target, catalogMax)
+	}
+	if target.Provider == anthropic.Name || target.Provider == kimi.Name {
+		return anthropic.OutputTokenAllowance(target)
+	}
+	return provider.EffectiveOutputTokenAllowance(nil, target, catalogMax)
 }
 
 // describeRoute renders a decision.

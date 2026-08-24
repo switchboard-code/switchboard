@@ -236,7 +236,7 @@ func runNativeMCPActionContext(ctx context.Context, w io.Writer, workspace strin
 		if action == "disable" {
 			past = "disabled"
 		}
-		fmt.Fprintf(w, "%s %s in Switchboard; the change applies on the next Switchboard run\n", past, server.ID)
+		fmt.Fprintf(w, "%s %s in Switchboard; the change applies on the next Switchboard run\n", past, cliText(server.ID))
 		if action == "enable" && server.ExecutionTrustRequired {
 			fmt.Fprintf(w, "workspace execution trust is separate; grant it with /trust grant before this project server may start\n")
 		}
@@ -300,17 +300,17 @@ func writeNativeMCPList(w io.Writer, inv *nativeMCPInventory) {
 	} else {
 		fmt.Fprintln(w, "SERVER\tSTATE\tNATIVE\tTRANSPORT\tSOURCE\tRECOVERY")
 		for _, server := range inv.result.Servers {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", server.ID,
-				nativeMCPActivationLabel(inv, server), nativeMCPEnabledLabel(server),
-				valueOrDash(string(server.Transport)), valueOrDash(server.Provenance.RealPath),
-				valueOrDash(inv.recoveryToken(server)))
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", cliText(server.ID),
+				cliText(nativeMCPActivationLabel(inv, server)), cliText(nativeMCPEnabledLabel(server)),
+				cliText(valueOrDash(string(server.Transport))), cliText(valueOrDash(server.Provenance.RealPath)),
+				cliText(valueOrDash(inv.recoveryToken(server))))
 		}
 		for _, reference := range stale {
-			fmt.Fprintf(w, "%s\tsaved-unavailable\tunknown\t-\t%s\t%s\n", reference.ID, reference.RealPath, reference.RecoveryToken)
+			fmt.Fprintf(w, "%s\tsaved-unavailable\tunknown\t-\t%s\t%s\n", cliText(reference.ID), cliText(reference.RealPath), cliText(reference.RecoveryToken))
 		}
 	}
 	for _, note := range inv.notes {
-		fmt.Fprintf(w, "%s: %s\n", note.level, note.text)
+		fmt.Fprintf(w, "%s: %s\n", cliText(note.level), cliText(note.text))
 	}
 }
 
@@ -358,13 +358,13 @@ func (inv *nativeMCPInventory) staleActivationReferences() []nativeMCPActivation
 
 func writeNativeMCPInspect(w io.Writer, inv *nativeMCPInventory, server mcpnative.Server) {
 	fmt.Fprintf(w, "server: %s\nname: %s\ndialect: %s\nscope: %s\nsource: %s\npath: %s\n",
-		server.ID, server.Name, server.Provenance.Dialect, server.Provenance.Scope,
-		server.Provenance.Source, server.Provenance.RealPath)
+		cliText(server.ID), cliText(server.Name), cliText(string(server.Provenance.Dialect)), cliText(string(server.Provenance.Scope)),
+		cliText(string(server.Provenance.Source)), cliText(server.Provenance.RealPath))
 	fmt.Fprintf(w, "state: %s\nnative: %s\nsupported: %t\ntransport: %s\nrequired: %t\n",
-		nativeMCPActivationLabel(inv, server), nativeMCPEnabledLabel(server), server.Supported,
-		valueOrDash(string(server.Transport)), server.Required)
+		cliText(nativeMCPActivationLabel(inv, server)), cliText(nativeMCPEnabledLabel(server)), server.Supported,
+		cliText(valueOrDash(string(server.Transport))), server.Required)
 	if server.ExecutionTrustRequired {
-		fmt.Fprintf(w, "workspace trust: required for %s\n", server.TrustRoot)
+		fmt.Fprintf(w, "workspace trust: required for %s\n", cliText(server.TrustRoot))
 	} else {
 		fmt.Fprintln(w, "workspace trust: not required")
 	}
@@ -377,16 +377,16 @@ func writeNativeMCPInspect(w io.Writer, inv *nativeMCPInventory, server mcpnativ
 			parts[i] = string(feature)
 		}
 		sort.Strings(parts)
-		fmt.Fprintf(w, "runtime features: %s\n", strings.Join(parts, ", "))
+		fmt.Fprintf(w, "runtime features: %s\n", cliText(strings.Join(parts, ", ")))
 	}
 	if len(server.UnsupportedFields) > 0 {
-		fmt.Fprintf(w, "unsupported fields: %s\n", strings.Join(server.UnsupportedFields, ", "))
+		fmt.Fprintf(w, "unsupported fields: %s\n", cliText(strings.Join(server.UnsupportedFields, ", ")))
 	}
 	if len(server.Env) > 0 {
-		fmt.Fprintf(w, "environment names: %s\n", strings.Join(sortedNativeMCPMapKeys(server.Env), ", "))
+		fmt.Fprintf(w, "environment names: %s\n", cliText(strings.Join(sortedNativeMCPMapKeys(server.Env), ", ")))
 	}
 	if len(server.Headers) > 0 {
-		fmt.Fprintf(w, "header names: %s\n", strings.Join(sortedNativeMCPMapKeys(server.Headers), ", "))
+		fmt.Fprintf(w, "header names: %s\n", cliText(strings.Join(sortedNativeMCPMapKeys(server.Headers), ", ")))
 	}
 	if len(server.HeaderEnv) > 0 {
 		names := make([]string, 0, len(server.HeaderEnv))
@@ -394,7 +394,7 @@ func writeNativeMCPInspect(w io.Writer, inv *nativeMCPInventory, server mcpnativ
 			names = append(names, name)
 		}
 		sort.Strings(names)
-		fmt.Fprintf(w, "environment-backed headers: %s\n", strings.Join(names, ", "))
+		fmt.Fprintf(w, "environment-backed headers: %s\n", cliText(strings.Join(names, ", ")))
 	}
 }
 

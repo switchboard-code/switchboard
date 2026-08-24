@@ -118,6 +118,43 @@ func TestREPLModelAndNoticeTextCannotWriteTerminalControls(t *testing.T) {
 	}
 }
 
+func TestTerminalQuestionEscapesControlsWithoutChangingPickedLabel(t *testing.T) {
+	question := "choose\n> forged prompt\x1b]2;forged title\a\u202e"
+	label := "original\n  [9] forged\x1b[2J"
+	detail := "detail\rrewritten\u2066"
+	var buf bytes.Buffer
+	r := &renderer{w: bufio.NewWriter(&buf), atLineTop: true}
+	questioner := terminalQuestioner{
+		in:  bufio.NewReader(strings.NewReader("1\n")),
+		out: r,
+	}
+	answer, err := questioner.AskUser(context.Background(), tools.Question{
+		Question: question,
+		Options:  []tools.QuestionOption{{Label: label, Detail: detail}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(answer.Picked) != 1 || answer.Picked[0] != label {
+		t.Fatalf("picked label was changed by display escaping: %+v", answer)
+	}
+
+	got := buf.String()
+	for _, unsafe := range []string{"\x1b", "\a", "\r", "\u202e", "\u2066"} {
+		if strings.Contains(got, unsafe) {
+			t.Fatalf("question retained terminal control %q: %q", unsafe, got)
+		}
+	}
+	if strings.Contains(got, "choose\n> forged prompt") || strings.Contains(got, "original\n  [9] forged") {
+		t.Fatalf("model-authored newline created terminal structure: %q", got)
+	}
+	for _, escaped := range []string{`choose\x0a> forged prompt`, `original\x0a  [9] forged`, `\x1b`, `\u202e`} {
+		if !strings.Contains(got, escaped) {
+			t.Fatalf("question did not visibly escape %q: %q", escaped, got)
+		}
+	}
+}
+
 func TestConcurrentObserverWritesUseOneRendererTransaction(t *testing.T) {
 	w := &overlapDetectWriter{}
 	r := &renderer{w: bufio.NewWriter(w), atLineTop: true}

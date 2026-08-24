@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,6 +21,8 @@ import (
 	"github.com/switchboard-code/switchboard/internal/catalog"
 	"github.com/switchboard-code/switchboard/internal/config"
 	"github.com/switchboard-code/switchboard/internal/credential"
+	"github.com/switchboard-code/switchboard/internal/provider/anthropic"
+	"github.com/switchboard-code/switchboard/internal/provider/kimi"
 	"github.com/switchboard-code/switchboard/internal/provider/ollama"
 	"github.com/switchboard-code/switchboard/internal/provider/openaicompat"
 )
@@ -34,6 +37,14 @@ type modelChoice struct {
 	surface      string
 	desc         string
 	effortLevels []string
+
+	// catalogMaxOutput is evidence used to admit the target without rewriting
+	// its identity. maxOutput is different: it is the explicit cap a user chose
+	// for an unlisted target, and is therefore persisted on RouteTarget.Params
+	// and sent on the wire. Keeping the two apart prevents a catalog maximum
+	// from silently turning into a user-configured inference parameter.
+	catalogMaxOutput int
+	maxOutput        int
 
 	// browse marks a surface rather than a model. The catalog knows a
 	// surface exists and what it costs; only its server knows which models
@@ -67,18 +78,20 @@ func gatherModelChoices(ctx context.Context, reg *providers, cat *catalog.Catalo
 		sort.Strings(local)
 		for _, name := range local {
 			c := modelChoice{ref: "ollama/" + name, provider: "ollama", surface: "local", desc: "pulled locally"}
-			add(c.ref+" "+c.surface, c, c.ref, c.desc)
+			c = withModelChoiceCatalogEvidence(cat, c)
+			add(c.ref+" "+c.surface, c, modelChoiceLabel(c), c.desc)
 		}
 	}
 	for _, info := range cat.Entries() {
 		c := modelChoice{
-			ref:          info.Provider + "/" + info.ProviderModelID,
-			provider:     info.Provider,
-			surface:      info.Surface,
-			desc:         catalogDesc(info),
-			effortLevels: info.EffortLevels,
+			ref:              info.Provider + "/" + info.ProviderModelID,
+			provider:         info.Provider,
+			surface:          info.Surface,
+			desc:             catalogDesc(info),
+			effortLevels:     info.EffortLevels,
+			catalogMaxOutput: info.MaxOutput,
 		}
-		add(c.ref+" "+c.surface, c, c.ref, c.desc)
+		add(c.ref+" "+c.surface, c, modelChoiceLabel(c), c.desc)
 	}
 	// Everything the machine is actually connected to, asked live. The
 	// catalog above is what has been priced; this is what the account holds,
@@ -89,20 +102,20 @@ func gatherModelChoices(ctx context.Context, reg *providers, cat *catalog.Catalo
 	asked := listConnectedSurfaces(ctx, reg, cfg, surfaces)
 	for _, c := range surfaces {
 		for _, name := range asked[surfaceKey(c)].models {
-			// The model's own stated levels where the surface reported them,
-			// the surface's floor where it did not.
-			levels := c.effortLevels
-			if stated := asked[surfaceKey(c)].efforts[name]; len(stated) > 0 {
-				levels = stated
-			}
 			bound := modelChoice{
-				ref:          c.provider + "/" + name,
-				provider:     c.provider,
-				surface:      c.surface,
-				desc:         c.desc,
-				effortLevels: levels,
+				ref:      c.provider + "/" + name,
+				provider: c.provider,
+				surface:  c.surface,
+				desc:     c.desc,
 			}
-			add(bound.ref+" "+bound.surface, bound, bound.ref, bound.desc)
+			bound = withModelChoiceCatalogEvidence(cat, bound)
+			// Per-model live evidence is newer than the catalog. Surface-level
+			// effort words are not inherited: on mixed-dialect APIs that made an
+			// unrecognized model look safely configurable when it was not.
+			if stated := asked[surfaceKey(c)].efforts[name]; len(stated) > 0 {
+				bound.effortLevels = append([]string(nil), stated...)
+			}
+			add(bound.ref+" "+bound.surface, bound, modelChoiceLabel(bound), bound.desc)
 		}
 	}
 
@@ -126,6 +139,54 @@ func gatherModelChoices(ctx context.Context, reg *providers, cat *catalog.Catalo
 		}
 	}
 	return items, choices
+}
+
+// withModelChoiceCatalogEvidence keeps a live account/server listing tied to
+// exact model evidence the catalog already has, including a canonical dated
+// snapshot of a catalogued alias. A surface prior is deliberately insufficient:
+// model-specific reasoning dialects and output ceilings vary on one surface.
+// The catalog's limit is an admission fact, not a reason to persist a redundant
+// target parameter, so it stays on the choice rather than RouteTarget.Params.
+func withModelChoiceCatalogEvidence(cat *catalog.Catalog, choice modelChoice) modelChoice {
+	if cat == nil || choice.ref == "" {
+		return choice
+	}
+	target, err := config.ParseTarget(choice.ref, choice.surface, "")
+	if err != nil {
+		return choice
+	}
+	if info, confidence, ok := cat.Lookup(target); ok && confidence == catalog.Verified {
+		choice.catalogMaxOutput = info.MaxOutput
+		choice.effortLevels = append([]string(nil), info.EffortLevels...)
+		choice.desc = catalogDesc(info)
+	}
+	return choice
+}
+
+// modelChoiceLabel includes the serving surface because the same provider
+// model reached through two surfaces is two different targets. The id already
+// carried this distinction; hiding it in the picker made first-party and plan
+// rows with the same model text visually indistinguishable.
+func modelChoiceLabel(choice modelChoice) string {
+	providerName := choice.provider
+	model := strings.TrimPrefix(choice.ref, providerName+"/")
+	if providerName == "" {
+		if parsedProvider, parsedModel, ok := strings.Cut(choice.ref, "/"); ok {
+			providerName, model = parsedProvider, parsedModel
+		}
+	}
+	if providerName == "" || choice.surface == "" {
+		return choice.ref
+	}
+	return providerName + "/" + choice.surface + "/" + model
+}
+
+func tierBindingSummary(tier config.Tier) string {
+	summary := tier.ID + " now runs " + tier.Target.Display()
+	if tier.Target.Params.MaxOutputTokens > 0 {
+		summary += " (rung max_output applies to primary and fallbacks)"
+	}
+	return summary
 }
 
 func surfaceKey(c modelChoice) string { return c.provider + "/" + c.surface }
@@ -243,10 +304,20 @@ func browsableSurfaces(cat *catalog.Catalog, cfg *config.Config, localErr error)
 	})
 	for _, info := range cat.Surfaces() {
 		add(modelChoice{
-			provider:     info.Provider,
-			surface:      info.Surface,
-			desc:         catalogDesc(info),
-			effortLevels: info.EffortLevels,
+			provider: info.Provider,
+			surface:  info.Surface,
+			desc:     catalogDesc(info),
+		})
+	}
+	// A concrete catalog entry proves that a surface exists, but none of that
+	// model's capabilities are a surface default. Add any entry-only surfaces
+	// as neutral browse destinations; Entries is sorted, so both the chosen
+	// description and the final order are deterministic.
+	for _, info := range cat.Entries() {
+		add(modelChoice{
+			provider: info.Provider,
+			surface:  info.Surface,
+			desc:     "catalogued surface; model capabilities are resolved after selection",
 		})
 	}
 	return out
@@ -254,22 +325,27 @@ func browsableSurfaces(cat *catalog.Catalog, cfg *config.Config, localErr error)
 
 func cmdModels(m *tuiModel, args string) tea.Cmd {
 	reg, cat, cfg := m.app.providers, m.app.catalog, m.app.config
+	readCfg := cfg.Snapshot()
+	readReg := reg.discoverySnapshot(readCfg)
+	hasTiers := len(readCfg.Tiers) > 0
+	binding := m.bindAsyncResult()
 	return func() tea.Msg {
+		defer readReg.releaseSnapshot()
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 
-		items, choices := gatherModelChoices(ctx, reg, cat, cfg)
+		items, choices := gatherModelChoices(ctx, readReg, cat, readCfg)
 		if len(items) == 0 {
 			// The compatible-endpoint row is unconditional, so this is
 			// unreachable rather than a state worth diagnosing. It stays as
 			// the guard that keeps an empty picker from ever being drawn.
-			return noticeMsg{level: "error", text: "nothing to offer; bind a rung by hand in " + cfg.Path}
+			return noticeMsg{level: "error", text: "nothing to offer; bind a rung by hand in " + readCfg.Path}
 		}
-		if len(cfg.Tiers) > 0 {
+		if hasTiers {
 			items = append(items, pickerItem{id: removeRungID, label: "remove a rung…", desc: "drop a tier from the ladder"})
 		}
 
-		return pickerMsg{
+		return binding.bindPicker(pickerMsg{
 			title: "bind a model to a tier",
 			items: items,
 			action: func(id string) tea.Cmd {
@@ -278,12 +354,80 @@ func cmdModels(m *tuiModel, args string) tea.Cmd {
 				}
 				choice := choices[id]
 				if choice.browse {
-					return browseSurfaceCmd(reg, cfg, choice,
-						func(c modelChoice) tea.Cmd { return chooseTierCmd(m, c) })
+					return browseSurfaceCmdForTUI(m, reg, cfg, choice,
+						func(c modelChoice) tea.Cmd { return chooseTierOrOutputCapCmd(m, c) })
 				}
-				return chooseTierCmd(m, choice)
+				return chooseTierOrOutputCapCmd(m, choice)
+			},
+		})
+	}
+}
+
+// chooseTierOrOutputCapCmd admits a choice only when its concrete adapter,
+// explicit target parameters, or catalog evidence supplies a finite wire
+// allowance. An omitted limit on a custom server is not a small limit: Ollama
+// documents it as infinite and compatible endpoints choose their own default.
+// The cap is therefore a deliberate user choice, before any rung is changed.
+func chooseTierOrOutputCapCmd(m *tuiModel, choice modelChoice) tea.Cmd {
+	if !modelChoiceNeedsExplicitOutputCap(m.app.providers, choice) {
+		return chooseTierCmd(m, choice)
+	}
+	binding := m.bindAsyncResult()
+	return modelOutputCapPromptCmd(choice, "", "", binding.bindText,
+		func(chosen modelChoice) tea.Cmd { return chooseTierCmd(m, chosen) })
+}
+
+func modelChoiceNeedsExplicitOutputCap(reg *providers, choice modelChoice) bool {
+	// A Messages adapter's required default is a wire value, not evidence about
+	// an unrecognized model's supported maximum. A live or typed model with no
+	// exact catalog evidence therefore gets an explicit rung cap before
+	// publication, just like an uncharacterized server target.
+	messagesSurface := choice.provider == anthropic.Name || choice.provider == kimi.Name
+	needsExplicitMessagesCap := messagesSurface &&
+		choice.catalogMaxOutput <= 0 && choice.maxOutput <= 0
+	return needsExplicitMessagesCap || modelChoiceOutputAllowance(reg, choice) == math.MaxInt
+}
+
+func modelChoiceOutputAllowance(reg *providers, choice modelChoice) int {
+	target, err := config.ParseTarget(choice.ref, choice.surface, "")
+	if err != nil {
+		return math.MaxInt
+	}
+	target.Params.MaxOutputTokens = choice.maxOutput
+	return reg.outputTokenAllowance(target, choice.catalogMaxOutput)
+}
+
+// modelOutputCapPromptCmd is shared by /models and first-run onboarding. bind
+// stamps asynchronous TUI ownership in the former and is the identity in the
+// standalone wizard. Invalid input reopens the same owned prompt; empty input
+// and Esc follow textDialog's ordinary cancellation path and publish nothing.
+func modelOutputCapPromptCmd(choice modelChoice, initial, problem string,
+	bind func(textPromptMsg) textPromptMsg, next func(modelChoice) tea.Cmd,
+) tea.Cmd {
+	return func() tea.Msg {
+		help := "sent on every request; for example 4096"
+		if problem != "" {
+			help = problem
+		}
+		msg := textPromptMsg{
+			title:   "positive maximum output for " + modelChoiceLabel(choice),
+			help:    help,
+			initial: initial,
+			submit: func(value string) tea.Cmd {
+				n, err := strconv.Atoi(strings.TrimSpace(value))
+				if err != nil || n <= 0 {
+					return modelOutputCapPromptCmd(choice, value,
+						"0=unbounded; positive cap required",
+						bind, next)
+				}
+				choice.maxOutput = n
+				return next(choice)
 			},
 		}
+		if bind != nil {
+			msg = bind(msg)
+		}
+		return msg
 	}
 }
 
@@ -315,9 +459,11 @@ func catalogDesc(info catalog.ModelInfo) string {
 // offered, which is how a ladder grows and how the first tier gets made.
 func chooseTierCmd(m *tuiModel, choice modelChoice) tea.Cmd {
 	cfg := m.app.config
+	tiers := cfg.Snapshot().Tiers
+	binding := m.bindAsyncResult()
 	return func() tea.Msg {
 		var items []pickerItem
-		for _, t := range cfg.Tiers {
+		for _, t := range tiers {
 			items = append(items, pickerItem{
 				id:    t.ID,
 				label: t.ID,
@@ -326,11 +472,11 @@ func chooseTierCmd(m *tuiModel, choice modelChoice) tea.Cmd {
 		}
 		// One past the highest rung, not the count plus one: the ladder can
 		// have gaps (t1, t3) and a "new" rung must not collide with t3.
-		next := "t" + strconv.Itoa(highestRung(cfg)+1)
+		next := "t" + strconv.Itoa(highestRung(&config.Config{Tiers: tiers})+1)
 		items = append(items, pickerItem{id: next, label: next, desc: "new rung at the top"})
 
-		return pickerMsg{
-			title: "which tier runs " + choice.ref,
+		return binding.bindPicker(pickerMsg{
+			title: "which tier runs " + modelChoiceLabel(choice),
 			items: items,
 			action: func(tierID string) tea.Cmd {
 				if len(choice.effortLevels) > 0 {
@@ -338,68 +484,90 @@ func chooseTierCmd(m *tuiModel, choice modelChoice) tea.Cmd {
 				}
 				return bindCmd(m, choice, tierID, "")
 			},
-		}
+		})
 	}
 }
 
 func chooseEffortCmd(m *tuiModel, choice modelChoice, tierID string) tea.Cmd {
+	binding := m.bindAsyncResult()
 	return func() tea.Msg {
 		items := []pickerItem{{id: "", label: "default", desc: "let the provider decide"}}
 		for _, level := range choice.effortLevels {
 			items = append(items, pickerItem{id: level, label: level})
 		}
-		return pickerMsg{
-			title: "reasoning effort for " + choice.ref + " on " + tierID,
+		return binding.bindPicker(pickerMsg{
+			title: "reasoning effort for " + modelChoiceLabel(choice) + " on " + tierID,
 			items: items,
 			action: func(effort string) tea.Cmd {
 				return bindCmd(m, choice, tierID, effort)
 			},
-		}
+		})
 	}
 }
 
 func bindCmd(m *tuiModel, choice modelChoice, tierID, effort string) tea.Cmd {
 	cfg := m.app.config
 	label := ""
+	maxOutput := choice.maxOutput
 	if existing, ok := cfg.Tier(tierID); ok {
 		label = existing.Label
+		// /models changes the primary model, not hand-authored rung policy.
+		// A prompted custom cap replaces the old one; a catalog-backed choice
+		// supplies no explicit value and therefore preserves an existing cap
+		// that may also be what keeps a custom fallback usable.
+		if maxOutput == 0 {
+			maxOutput = existing.Target.Params.MaxOutputTokens
+		}
 	}
-	if err := cfg.BindTier(tierID, label, choice.ref, choice.surface, effort); err != nil {
-		return noticeCmd("error", err.Error())
+	if choice.catalogMaxOutput > 0 && maxOutput > choice.catalogMaxOutput {
+		binding := m.bindAsyncResult()
+		problem := fmt.Sprintf(
+			"%s keeps max_output %d; this model's verified maximum is %d; enter a positive cap no greater than %d",
+			tierID, maxOutput, choice.catalogMaxOutput, choice.catalogMaxOutput)
+		// Do not prefill a valid value in an asynchronously opened prompt: a
+		// delayed Enter must cancel, not silently accept a suggested wire cap.
+		return modelOutputCapPromptCmd(choice, "", problem, binding.bindText,
+			func(chosen modelChoice) tea.Cmd { return bindCmd(m, chosen, tierID, effort) })
 	}
-	if err := cfg.Save(); err != nil {
-		return noticeCmd("error", "binding "+tierID+" failed to save: "+err.Error())
+	if err := cfg.BindTierAndSave(tierID, label, choice.ref, choice.surface, effort, maxOutput); err != nil {
+		return noticeCmd("error", "binding "+tierID+" failed: "+err.Error())
 	}
-	return noticeCmd("", tierID+" now runs "+choice.ref+"; /"+tierID+" switches to it")
+	tier, ok := cfg.Tier(tierID)
+	if !ok {
+		return noticeCmd("error", "binding "+tierID+" saved but is absent from the live ladder")
+	}
+	return noticeCmd("", tierBindingSummary(tier)+"; /"+tierID+" switches to it")
 }
 
 func removeRungCmd(m *tuiModel) tea.Cmd {
 	cfg := m.app.config
-	return func() tea.Msg {
-		var items []pickerItem
-		for _, t := range cfg.Tiers {
-			desc := t.Target.Display()
-			if t.ID == m.app.tier.ID {
-				desc += " · active now"
-			}
-			items = append(items, pickerItem{id: t.ID, label: t.ID, desc: desc})
+	binding := m.bindAsyncResult()
+	var items []pickerItem
+	for _, t := range cfg.Snapshot().Tiers {
+		desc := t.Target.Display()
+		if t.ID == m.app.tier.ID {
+			desc += " · active now"
 		}
-		return pickerMsg{
+		items = append(items, pickerItem{id: t.ID, label: t.ID, desc: desc})
+	}
+	return func() tea.Msg {
+		return binding.bindPicker(pickerMsg{
 			title: "remove which rung",
 			items: items,
 			action: func(tierID string) tea.Cmd {
 				if tierID == m.app.tier.ID {
 					return noticeCmd("error", tierID+" is the active tier; switch off it before removing it")
 				}
-				if !cfg.RemoveTier(tierID) {
-					return noticeCmd("error", "no rung named "+tierID)
-				}
-				if err := cfg.Save(); err != nil {
+				removed, err := cfg.RemoveTierAndSave(tierID)
+				if err != nil {
 					return noticeCmd("error", "removing "+tierID+" failed to save: "+err.Error())
+				}
+				if !removed {
+					return noticeCmd("error", "no rung named "+tierID)
 				}
 				return noticeCmd("", tierID+" removed from the ladder")
 			},
-		}
+		})
 	}
 }
 

@@ -4,12 +4,12 @@ package tools
 
 import "os"
 
-func replaceMutationPath(from, to string) error {
-	return os.Rename(from, to)
+func replaceMutationPath(parent *os.Root, from, to string) error {
+	return parent.Rename(from, to)
 }
 
-func syncMutationDirectory(path string) error {
-	dir, err := os.Open(path)
+func syncMutationDirectory(parent *os.Root) error {
+	dir, err := parent.Open(".")
 	if err != nil {
 		return err
 	}

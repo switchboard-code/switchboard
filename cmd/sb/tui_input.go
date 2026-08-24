@@ -3,12 +3,15 @@ package main
 import (
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/switchboard-code/switchboard/internal/permission"
+	"github.com/switchboard-code/switchboard/internal/terminaltext"
 )
 
 // --- slash-command suggestions ----------------------------------------------
@@ -21,8 +24,9 @@ func (m *tuiModel) suggestions() []commandItem {
 	prefix := strings.TrimPrefix(v, "/")
 	out := matchingCommands(prefix, m.app.config)
 	for _, c := range m.custom {
-		if strings.HasPrefix(c.name, prefix) {
-			out = append(out, commandItem{name: c.name, desc: c.desc})
+		selector := customSelector(m, c)
+		if strings.HasPrefix(selector, prefix) || strings.HasPrefix(c.name, prefix) {
+			out = append(out, commandItem{name: selector, desc: customCommandDescription(c)})
 		}
 	}
 	return out
@@ -37,7 +41,16 @@ func (m *tuiModel) suggestionsView() string {
 	if !m.suggestionsVisible() || len(items) == 0 {
 		return ""
 	}
-	const maxRows = 6
+	maxRows := 6
+	if m.height > 0 {
+		// Keep one row each for the transcript and status plus the prompt's
+		// content and two-row border. On a short terminal, suggestions yield
+		// rows before the conversation or composer does.
+		maxRows = min(maxRows, max(m.height-m.ta.Height()-4, 0))
+		if maxRows == 0 {
+			return ""
+		}
+	}
 	if m.sugSel >= len(items) {
 		m.sugSel = len(items) - 1
 	}
@@ -54,11 +67,33 @@ func (m *tuiModel) suggestionsView() string {
 		}
 	}
 
-	width := 0
-	for _, it := range items {
-		if n := len(it.name) + len(it.usage) + 1; n > width {
-			width = n
+	rowWidth := max(m.width-1, 1) // inputZoneView adds the one-cell page gutter
+	contentWidth := max(rowWidth-1, 0)
+	nameWidth := 0
+	hasDescription := false
+	for _, it := range shown {
+		name := "/" + terminaltext.Escape(it.name)
+		if it.usage != "" {
+			name += " " + terminaltext.Escape(it.usage)
 		}
+		if n := ansi.StringWidth(name); n > nameWidth {
+			nameWidth = n
+		}
+		if it.desc != "" {
+			hasDescription = true
+		}
+	}
+	gapWidth := 0
+	descWidth := 0
+	if hasDescription && contentWidth >= 20 {
+		// Past the narrow-phone case, keep both the command and its purpose
+		// visible. Neither column may consume the other merely because one
+		// legal label is very long.
+		nameWidth = min(nameWidth, max(contentWidth/2, 8))
+		gapWidth = 2
+		descWidth = max(contentWidth-nameWidth-gapWidth, 0)
+	} else {
+		nameWidth = min(nameWidth, contentWidth)
 	}
 
 	// The selected row is one object: the highlight runs the row's full
@@ -66,27 +101,29 @@ func (m *tuiModel) suggestionsView() string {
 	// terminal-tool generation the user's hands know behaves.
 	var rows []string
 	for i, it := range shown {
-		name := "/" + it.name
+		name := "/" + terminaltext.Escape(it.name)
 		if it.usage != "" {
-			name += " " + it.usage
+			name += " " + terminaltext.Escape(it.usage)
 		}
+		desc := terminaltext.Escape(it.desc)
+		name = padRight(fitCells(name, nameWidth), nameWidth)
+		if descWidth > 0 {
+			desc = padRight(fitCells(desc, descWidth), descWidth)
+		} else {
+			desc = ""
+			name = padRight(name, contentWidth)
+		}
+		gap := strings.Repeat(" ", gapWidth)
 		if start+i == m.sugSel {
 			on := func(s lipgloss.Style) lipgloss.Style { return s.Background(m.th.selected.GetBackground()) }
 			rows = append(rows, m.th.accent.Render("▌")+
-				on(m.th.bold).Render(padRight(name, width+2))+
-				on(m.th.dim).Render(padRight(it.desc, max(m.width-width-5, 0))))
+				on(m.th.bold).Render(name)+
+				on(m.th.dim).Render(gap+desc))
 			continue
 		}
-		rows = append(rows, " "+padRight(name, width+2)+m.th.dim.Render(it.desc))
+		rows = append(rows, " "+name+gap+m.th.dim.Render(desc))
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, rows...)
-}
-
-func padRight(s string, n int) string {
-	if len(s) >= n {
-		return s
-	}
-	return s + strings.Repeat(" ", n-len(s))
 }
 
 func (m *tuiModel) acceptSuggestion() {
@@ -99,6 +136,7 @@ func (m *tuiModel) acceptSuggestion() {
 	}
 	m.ta.SetValue("/" + items[m.sugSel].name + " ")
 	m.ta.CursorEnd()
+	m.resetHistoryNavigation()
 	m.sugSel = 0
 }
 
@@ -120,19 +158,40 @@ func (m *tuiModel) historyMove(delta int) {
 	if len(m.history) == 0 {
 		return
 	}
-	m.histIdx += delta
-	if m.histIdx < 0 {
-		m.histIdx = 0
+	if m.histIdx < 0 || m.histIdx > len(m.history) {
+		m.histIdx = len(m.history)
+	}
+	if delta < 0 && m.histIdx == len(m.history) {
+		m.histDraft = m.ta.Value()
+		m.histDraftSet = true
+	}
+	next := min(max(m.histIdx+delta, 0), len(m.history))
+	if next == m.histIdx {
 		return
 	}
-	if m.histIdx >= len(m.history) {
-		m.histIdx = len(m.history)
-		m.ta.SetValue("")
+	m.histIdx = next
+	if m.histIdx == len(m.history) {
+		if m.histDraftSet {
+			m.ta.SetValue(m.histDraft)
+		} else {
+			m.ta.SetValue("")
+		}
+		m.histDraft = ""
+		m.histDraftSet = false
 	} else {
 		m.ta.SetValue(m.history[m.histIdx])
 	}
 	m.ta.CursorEnd()
 	m.growInput()
+}
+
+// resetHistoryNavigation turns the currently visible composer text back into
+// the live draft. Editing a recalled entry starts a new draft; no stale saved
+// value may replace it on the next down-arrow or session boundary.
+func (m *tuiModel) resetHistoryNavigation() {
+	m.histIdx = len(m.history)
+	m.histDraft = ""
+	m.histDraftSet = false
 }
 
 // growInput sizes the prompt to what is actually in it.
@@ -204,8 +263,28 @@ func inputRows(ta textarea.Model) int {
 // runSlash handles a /command. While a turn runs, commands that would touch
 // the session are refused rather than racing it; /exit still works.
 func (m *tuiModel) runSlash(v string) tea.Cmd {
-	name, rest, _ := strings.Cut(strings.TrimPrefix(v, "/"), " ")
+	raw := strings.TrimPrefix(v, "/")
+	name, rest := raw, ""
+	if split := strings.IndexFunc(raw, unicode.IsSpace); split >= 0 {
+		name, rest = raw[:split], raw[split:]
+	}
 	rest = strings.TrimSpace(rest)
+	if m.retryRecoveryExists() && !retryRecoveryCommandAllowed(name, rest) {
+		return noticeCmd("warn", retryRecoveryGuardText)
+	}
+
+	// The explicit namespace is resolved before dynamic tier shorthands. A
+	// tier may legally have almost any id, but it must not make the escape
+	// hatch for a colliding custom command lie; `/tier <id>` still reaches
+	// such an unusually named tier.
+	if customName, explicit := customNameFromSelector(name); explicit {
+		for _, c := range m.custom {
+			if c.name == customName {
+				return runCustom(m, c, rest)
+			}
+		}
+		return noticeCmd("error", "unknown custom command "+customName+"; try ctrl+p")
+	}
 
 	// A bare tier name switches to it; with a prompt attached it runs just this
 	// prompt there, which is §14's command-prefix override.
@@ -218,7 +297,6 @@ func (m *tuiModel) runSlash(v string) tea.Cmd {
 		}
 		return m.enqueue(rest, name)
 	}
-
 	for _, c := range commands() {
 		if c.name == name || slices.Contains(c.aliases, name) {
 			if m.busy && !c.busySafe {
@@ -298,10 +376,10 @@ func (m *tuiModel) openTierPicker() tea.Cmd {
 			current: t.ID == m.app.tier.ID,
 		})
 	}
-	m.dlg = &pickerDialog{
+	m.openDialog(&pickerDialog{
 		title:  "switch tier",
 		items:  items,
 		onPick: func(id string) tea.Cmd { return m.switchTier(id) },
-	}
+	})
 	return nil
 }

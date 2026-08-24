@@ -5,14 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/switchboard-code/switchboard/internal/agent"
 	"github.com/switchboard-code/switchboard/internal/catalog"
+	"github.com/switchboard-code/switchboard/internal/costmodel"
 	"github.com/switchboard-code/switchboard/internal/prefix"
 	"github.com/switchboard-code/switchboard/internal/provider"
+	"github.com/switchboard-code/switchboard/internal/provider/anthropic"
 	"github.com/switchboard-code/switchboard/internal/router"
 )
 
@@ -119,7 +124,7 @@ func TestRoutedRunScoresTheExactRequestTheSelectedProviderReceives(t *testing.T)
 	task := Task{
 		ID: "assembled", Provenance: HandWritten, Prompt: "choose deliberately",
 		Setup:  func(string) error { return nil },
-		Verify: func(string) (bool, string, error) { return true, "", nil },
+		Verify: func(context.Context, string) (bool, string, error) { return true, "", nil },
 	}
 
 	got := routed.Run(context.Background(), Runner{Catalog: cat}, task, 7)
@@ -145,14 +150,144 @@ func TestRoutedRunScoresTheExactRequestTheSelectedProviderReceives(t *testing.T)
 		t.Fatalf("session tokens = (%d, %d), want (%d, %d)",
 			selector.input.Session.PromptTokens, selector.input.Session.ContextTokens, wantPrompt, wantContext)
 	}
+	bindings := map[string]provider.Provider{
+		"low": lowProvider, "high": highProvider,
+	}
 	for _, candidate := range selector.input.Candidates {
 		if candidate.PromptTokens != wantPrompt || candidate.ContextTokens != wantContext {
 			t.Errorf("candidate %s tokens = (%d, %d), want (%d, %d)",
 				candidate.Tier, candidate.PromptTokens, candidate.ContextTokens, wantPrompt, wantContext)
 		}
-		if candidate.ReservedOutputTokens != provider.EffectiveOutputTokenReserve(candidate.Target, candidate.Info.MaxOutput) {
+		if candidate.ReservedOutputTokens != provider.EffectiveOutputTokenAllowance(
+			bindings[candidate.Tier], candidate.Target, candidate.Info.MaxOutput) {
 			t.Errorf("candidate %s output reserve = %d", candidate.Tier, candidate.ReservedOutputTokens)
 		}
+	}
+}
+
+func TestCandidatePricesTheConcreteAnthropicOutputAllowance(t *testing.T) {
+	cat := evalCatalog(t)
+	client := anthropic.New()
+	cases := []struct {
+		name     string
+		model    string
+		reason   *provider.Reasoning
+		explicit int
+		want     int
+	}{
+		{name: "default", model: "claude-haiku-4-5", want: 8_192},
+		{
+			name: "adaptive effort has no token budget", model: "claude-opus-5",
+			reason: &provider.Reasoning{Enabled: true, Effort: "high"}, want: 8_192,
+		},
+		{
+			name: "token budget raises the wire allowance", model: "claude-haiku-4-5",
+			reason: &provider.Reasoning{Enabled: true, Effort: "high"}, want: 16_384 + 8_192,
+		},
+		{
+			name: "explicit custom cap", model: "claude-opus-5",
+			reason: &provider.Reasoning{Enabled: true, Effort: "xhigh"}, explicit: 1_234, want: 1_234,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := anthropic.Target(tc.model)
+			target.Params.Reasoning = tc.reason
+			target.Params.MaxOutputTokens = tc.explicit
+			info, _, ok := cat.Lookup(target)
+			if !ok {
+				t.Fatalf("test target %s is absent from catalog", target.Display())
+			}
+
+			const promptTokens, contextTokens = 300, 500
+			candidate := candidateForRequest(
+				Arm{Name: "only", Target: target, Provider: client},
+				0, info, promptTokens, contextTokens)
+			if candidate.ReservedOutputTokens != tc.want {
+				t.Fatalf("reserved output = %d, want concrete wire allowance %d",
+					candidate.ReservedOutputTokens, tc.want)
+			}
+			wantCost := costmodel.Estimator{}.Turn(costmodel.Inputs{
+				Target: target, Info: info, PrefixTokens: contextTokens,
+				OutputTokens:   tc.want,
+				Eligible:       info.Cache.UsageAccounting == catalog.AccountingSeparate,
+				TokensAreExact: true,
+			}).High
+			if candidate.CeilingCost != wantCost {
+				t.Fatalf("ceiling cost = %s, want exact allowance cost %s",
+					candidate.CeilingCost, wantCost)
+			}
+			catalogCost := costmodel.Estimator{}.Turn(costmodel.Inputs{
+				Target: target, Info: info, PrefixTokens: contextTokens,
+				OutputTokens:   info.MaxOutput,
+				Eligible:       info.Cache.UsageAccounting == catalog.AccountingSeparate,
+				TokensAreExact: true,
+			}).High
+			if candidate.CeilingCost >= catalogCost {
+				t.Fatalf("ceiling still prices catalog maximum: concrete=%s catalog=%s",
+					candidate.CeilingCost, catalogCost)
+			}
+		})
+	}
+}
+
+func TestCandidateRejectsAnthropicExplicitCapReasoningConflict(t *testing.T) {
+	cat := evalCatalog(t)
+	client := anthropic.New()
+	target := anthropic.Target("claude-haiku-4-5")
+	target.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "high"}
+	target.Params.MaxOutputTokens = 4096
+	info, _, ok := cat.Lookup(target)
+	if !ok {
+		t.Fatalf("test target %s is absent from catalog", target.Display())
+	}
+	candidate := candidateForRequest(
+		Arm{Name: "only", Target: target, Provider: client}, 0, info, 100, 100)
+	if candidate.ReservedOutputTokens != math.MaxInt {
+		t.Fatalf("invalid Anthropic parameters reserved %d, want no finite allowance", candidate.ReservedOutputTokens)
+	}
+	decision, err := (router.Heuristic{}).Route(router.Input{Candidates: []router.Candidate{candidate}, Pin: "only"})
+	if err == nil {
+		t.Fatal("eval admitted conflicting Anthropic cap and reasoning")
+	}
+	text := err.Error() + " " + strings.Join(decision.Infeasible, " ")
+	for _, want := range []string{"configured max_output 4096", "raise max_output", "lower or disable reasoning"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("eval explicit-cap conflict omitted %q: %s", want, text)
+		}
+	}
+}
+
+func TestEvalBudgetPricesTheBoundProviderOutputAllowance(t *testing.T) {
+	cat := evalCatalog(t)
+	target := anthropic.Target("claude-haiku-4-5")
+	target.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "high"}
+	client := anthropic.New()
+	info, _, ok := cat.Lookup(target)
+	if !ok {
+		t.Fatalf("test target %s is absent from catalog", target.Display())
+	}
+
+	const contextTokens = 500
+	bound := candidateForRequest(
+		Arm{Name: "only", Target: target, Provider: client},
+		0, info, contextTokens, contextTokens).CeilingCost
+	unbound := candidateForRequest(
+		Arm{Name: "only", Target: target},
+		0, info, contextTokens, contextTokens).CeilingCost
+	if bound >= unbound {
+		t.Fatalf("test does not distinguish bound allowance from catalog fallback: bound=%s unbound=%s",
+			bound, unbound)
+	}
+
+	routed := RoutedArmFor{Catalog: cat, Ladder: []Arm{{
+		Name: "only", Target: target, Provider: client,
+	}}}
+	_, loop := escalationHarness(t, routed, provider.UserText("continue"))
+	guard := newEvalBudget(router.Budgets{MaxCost: bound, MaxCostSet: true}, cat, loop)
+	if err := guard.before(contextTokens, 1); err != nil {
+		t.Fatalf("per-call budget rejected the exact bound-provider allowance: %v", err)
 	}
 }
 
@@ -169,6 +304,8 @@ func TestRoutedPickUsesFirstLiveFeasibleFallback(t *testing.T) {
 	fallback := &recordingProvider{probe: liveProbe()}
 	primaryTarget := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "claude-haiku-4-5"}
 	fallbackTarget := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "claude-opus-5"}
+	primaryTarget.Params.MaxOutputTokens = 100
+	fallbackTarget.Params.MaxOutputTokens = 100
 	routed := RoutedArmFor{Catalog: cat, Ladder: []Arm{{
 		Name: "low", Target: primaryTarget, Provider: primary,
 		Fallbacks: []Fallback{{Target: fallbackTarget, Provider: fallback}},
@@ -181,6 +318,73 @@ func TestRoutedPickUsesFirstLiveFeasibleFallback(t *testing.T) {
 	}
 	if arm.Target.ID() != fallbackTarget.ID() || decision.Target != fallbackTarget.ID() {
 		t.Fatalf("fallback was not bound: arm=%s decision=%s", arm.Target.ID(), decision.Target)
+	}
+	if primary.probes != 1 || fallback.probes != 1 {
+		t.Fatalf("primary/fallback probes = %d/%d, want one outage probe followed by one fallback probe",
+			primary.probes, fallback.probes)
+	}
+}
+
+func TestRoutedPickDoesNotUseFallbackAfterReachablePrimaryHardRefusal(t *testing.T) {
+	cat := evalCatalog(t)
+	primaryProbe := liveProbe()
+	primaryProbe.VisionKnown = true
+	primaryProbe.Vision = false
+	primary := &recordingProvider{probe: primaryProbe}
+	fallback := &recordingProvider{probe: liveProbe()}
+	primaryTarget := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "claude-haiku-4-5"}
+	fallbackTarget := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "claude-opus-5"}
+	routed := RoutedArmFor{Catalog: cat, Ladder: []Arm{{
+		Name: "only", Target: primaryTarget, Provider: primary,
+		Fallbacks: []Fallback{{Target: fallbackTarget, Provider: fallback}},
+	}}}
+	request := provider.Request{Messages: []provider.Message{{
+		Role: provider.RoleUser,
+		Content: []provider.Block{
+			provider.Text{Text: "inspect"},
+			provider.Image{MediaType: "image/png", Data: []byte("fixture")},
+		},
+	}}}
+
+	_, _, err := routed.PickRequest(context.Background(), Task{Prompt: "inspect"}, request)
+	if !errors.Is(err, errRoutedFidelity) || !strings.Contains(err.Error(), "primary") ||
+		!strings.Contains(err.Error(), "cannot read images") {
+		t.Fatalf("reachable primary hard refusal = %v", err)
+	}
+	if primary.probes != 1 || fallback.probes != 0 {
+		t.Fatalf("primary/fallback probes = %d/%d, availability fallback escaped a hard refusal",
+			primary.probes, fallback.probes)
+	}
+}
+
+func TestRoutedPickRejectsFallbackCapMismatchBeforeProbing(t *testing.T) {
+	cat := evalCatalog(t)
+	valid := &recordingProvider{probe: liveProbe()}
+	primary := &recordingProvider{probe: liveProbe()}
+	fallback := &recordingProvider{probe: liveProbe()}
+	validTarget := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "claude-opus-4-8"}
+	primaryTarget := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "claude-haiku-4-5"}
+	fallbackTarget := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "claude-opus-5"}
+	primaryTarget.Params.MaxOutputTokens = 100
+	fallbackTarget.Params.MaxOutputTokens = 200
+	routed := RoutedArmFor{Catalog: cat, Ladder: []Arm{
+		{Name: "valid", Target: validTarget, Provider: valid},
+		{
+			Name: "invalid", Target: primaryTarget, Provider: primary,
+			Fallbacks: []Fallback{{Target: fallbackTarget, Provider: fallback}},
+		},
+	}}
+
+	_, _, err := routed.PickRequest(context.Background(), Task{Prompt: "small fix"}, provider.Request{
+		Messages: []provider.Message{provider.UserText("small fix")},
+	})
+	if !errors.Is(err, errRoutedFidelity) || !strings.Contains(err.Error(), "fallback 1 has max_output 200") ||
+		!strings.Contains(err.Error(), "rung's 100") {
+		t.Fatalf("fallback cap mismatch = %v", err)
+	}
+	if valid.probes != 0 || primary.probes != 0 || fallback.probes != 0 {
+		t.Fatalf("cap mismatch probed valid/primary/fallback = %d/%d/%d",
+			valid.probes, primary.probes, fallback.probes)
 	}
 }
 
@@ -298,7 +502,7 @@ func TestRoutedRunEscalatesOnlyAfterPreparedMoveAndMarksOpeningEstimateUnavailab
 		Setup: func(dir string) error {
 			return os.WriteFile(filepath.Join(dir, "note.txt"), []byte("hello\n"), 0o600)
 		},
-		Verify: func(string) (bool, string, error) { return true, "", nil },
+		Verify: func(context.Context, string) (bool, string, error) { return true, "", nil },
 	}
 
 	got := routed.Run(context.Background(), Runner{Catalog: cat, MaxRounds: 5}, task, 0)
@@ -334,7 +538,7 @@ func TestUnpreparableEscalationStaysAndLetsTheRoutedRunContinue(t *testing.T) {
 		Setup: func(dir string) error {
 			return os.WriteFile(filepath.Join(dir, "note.txt"), []byte("hello\n"), 0o600)
 		},
-		Verify: func(string) (bool, string, error) {
+		Verify: func(context.Context, string) (bool, string, error) {
 			verified = true
 			return true, "", nil
 		},
@@ -366,7 +570,7 @@ func TestUnpreparableEscalationStaysAndLetsTheRoutedRunContinue(t *testing.T) {
 	}
 }
 
-func TestFixedArmIgnoresRoutedFallbacksAndDoesNotProbe(t *testing.T) {
+func TestFixedArmProbesOnlyItsPrimaryAndIgnoresRoutedFallbacks(t *testing.T) {
 	cat := evalCatalog(t)
 	primary := &recordingProvider{probe: liveProbe(), turns: [][]provider.Event{completedTurn()}}
 	fallback := &recordingProvider{probe: liveProbe(), turns: [][]provider.Event{completedTurn()}}
@@ -382,16 +586,182 @@ func TestFixedArmIgnoresRoutedFallbacksAndDoesNotProbe(t *testing.T) {
 	task := Task{
 		ID: "fixed", Provenance: HandWritten, Prompt: "answer",
 		Setup:  func(string) error { return nil },
-		Verify: func(string) (bool, string, error) { return true, "", nil },
+		Verify: func(context.Context, string) (bool, string, error) { return true, "", nil },
 	}
 
 	got := (Runner{Catalog: cat}).Run(context.Background(), task, arm, 0)
 	if !got.Solved || got.Target != arm.Target.ID() {
 		t.Fatalf("fixed run = %#v", got)
 	}
-	if primary.probes != 0 || fallback.probes != 0 || len(fallback.requests) != 0 {
-		t.Fatalf("fixed arm used routed resolution: primary probes=%d fallback probes=%d requests=%d",
+	if primary.probes != 1 || fallback.probes != 0 || len(fallback.requests) != 0 {
+		t.Fatalf("fixed arm evidence/fallback use: primary probes=%d fallback probes=%d requests=%d",
 			primary.probes, fallback.probes, len(fallback.requests))
+	}
+}
+
+func TestResolvedContextWindowMatchesProductionPrecedence(t *testing.T) {
+	tests := []struct {
+		name                      string
+		declared, probed, catalog int
+		enforced                  bool
+		want                      int
+	}{
+		{name: "enforced live beats declaration", declared: 32_000, probed: 16_000, catalog: 128_000, enforced: true, want: 16_000},
+		{name: "declaration beats metadata hint", declared: 32_000, probed: 64_000, catalog: 128_000, want: 32_000},
+		{name: "metadata hint beats catalog", probed: 64_000, catalog: 128_000, want: 64_000},
+		{name: "catalog is fallback", catalog: 128_000, want: 128_000},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := resolvedContextWindow(test.declared, test.probed, test.enforced, test.catalog); got != test.want {
+				t.Fatalf("resolved context = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestOpeningRouteUsesLiveNegativeVisionAndEnforcedContextEvidence(t *testing.T) {
+	cat := evalCatalog(t)
+	target := anthropic.Target("claude-opus-5")
+	info, _, ok := cat.Lookup(target)
+	if !ok || !info.Vision || info.ContextWindow <= 100 {
+		t.Fatalf("fixture needs a catalogued vision target with a broad context: %+v", info)
+	}
+
+	visionProbe := liveProbe()
+	visionProbe.VisionKnown = true
+	visionProbe.Vision = false
+	visionless := RoutedArmFor{
+		Catalog:      cat,
+		Ladder:       []Arm{{Name: "only", Target: target, Provider: &recordingProvider{probe: visionProbe}}},
+		Requirements: router.Requirements{NeedsVision: true},
+	}
+	_, _, err := visionless.PickRequest(context.Background(), Task{Prompt: "inspect"}, provider.Request{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: []provider.Block{
+			provider.Text{Text: "inspect"}, provider.Image{MediaType: "image/png", Data: []byte("x")},
+		}}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot read images") {
+		t.Fatalf("live text-only evidence did not override catalog vision: %v", err)
+	}
+
+	tightTarget := target
+	tightTarget.Params.MaxOutputTokens = 100
+	windowProbe := liveProbe()
+	windowProbe.ContextWindow = 100
+	windowProbe.WindowEnforced = true
+	tight := RoutedArmFor{Catalog: cat, Ladder: []Arm{{
+		Name: "only", Target: tightTarget, Provider: &recordingProvider{probe: windowProbe}, ContextWindow: 10_000,
+	}}}
+	_, _, err = tight.PickRequest(context.Background(), Task{Prompt: "answer"}, provider.Request{
+		Messages: []provider.Message{provider.UserText("answer")},
+	})
+	if err == nil || !strings.Contains(err.Error(), "holds 100 tokens") {
+		t.Fatalf("enforced live context did not override the declared/catalog window: %v", err)
+	}
+}
+
+func TestFixedArmLoopUsesProbedContextBeforeStreaming(t *testing.T) {
+	cat := evalCatalog(t)
+	target := anthropic.Target("claude-haiku-4-5")
+	target.Params.MaxOutputTokens = 64
+	probe := liveProbe()
+	probe.ContextWindow = 64
+	probe.WindowEnforced = true
+	primary := &recordingProvider{probe: probe, turns: [][]provider.Event{completedTurn()}}
+	arm := Arm{Name: "fixed", Target: target, Provider: primary, ContextWindow: 100_000}
+	task := Task{
+		ID: "fixed-live-window", Provenance: HandWritten, Prompt: "answer",
+		Setup: func(string) error { return nil }, Verify: func(context.Context, string) (bool, string, error) { return true, "", nil },
+	}
+
+	got := (Runner{Catalog: cat}).Run(context.Background(), task, arm, 0)
+	if got.Failure != FailureTurn || !strings.Contains(got.Detail, "holds 64 tokens") {
+		t.Fatalf("fixed run did not enforce probed context: %#v", got)
+	}
+	if primary.probes != 1 || len(primary.requests) != 0 {
+		t.Fatalf("fixed run probes/requests = %d/%d, want 1/0", primary.probes, len(primary.requests))
+	}
+}
+
+func TestLiveCustomCapFitsAtBoundaryAndRefusesOneTokenOver(t *testing.T) {
+	target := provider.RouteTarget{
+		Provider: "openaicompat", Surface: "generic", ModelID: "custom-not-in-catalog",
+		Params: provider.Params{MaxOutputTokens: 4096},
+	}
+	probe := liveProbe()
+	probe.ContextWindow = 32_768
+	probe.WindowEnforced = true
+	bound := &recordingProvider{probe: probe}
+	resolved, info, err := resolveArmEvidence(context.Background(), evalCatalog(t), Arm{
+		Name: "only", Target: target, Provider: bound,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.resolvedContextWindow != 32_768 || info.ContextWindow != 32_768 {
+		t.Fatalf("resolved/live context = %d/%d, want 32768", resolved.resolvedContextWindow, info.ContextWindow)
+	}
+
+	for _, test := range []struct {
+		name    string
+		context int
+		wantErr bool
+	}{
+		{name: "exact boundary", context: 28_672},
+		{name: "one token over", context: 28_673, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := candidateForRequest(resolved, 0, info, test.context, test.context)
+			candidate.CatalogKnown = false
+			_, routeErr := (router.Heuristic{}).Route(router.Input{
+				Candidates: []router.Candidate{candidate}, Pin: "only",
+				Requirements: router.Requirements{NeedsTools: true},
+			})
+			if (routeErr != nil) != test.wantErr {
+				t.Fatalf("context %d route error = %v, wantErr %v", test.context, routeErr, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestEvalLoopRechecksLiveCustomCapAfterToolRound(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "note.txt"), []byte("boundary evidence"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	task := Task{ID: "post-tool-window", Provenance: HandWritten, Prompt: "read note.txt and continue"}
+	prepared, err := prepareAttempt(task, workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opening := prefix.RequestTokenCeiling(prepared.openingRequest())
+	const outputCap = 4096
+	probe := liveProbe()
+	probe.ContextWindow = opening + outputCap
+	probe.WindowEnforced = true
+	target := provider.RouteTarget{
+		Provider: "openaicompat", Surface: "generic", ModelID: "custom-not-in-catalog",
+		Params: provider.Params{MaxOutputTokens: outputCap},
+	}
+	bound := &recordingProvider{probe: probe, turns: [][]provider.Event{readTurn("read-boundary")}}
+	arm, _, err := resolveArmEvidence(context.Background(), evalCatalog(t), Arm{
+		Name: "fixed", Target: target, Provider: bound,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, runErr := (Runner{Catalog: evalCatalog(t), MaxRounds: 3}).attempt(context.Background(), arm, prepared, nil)
+	var windowErr *agent.ContextWindowError
+	if !errors.As(runErr, &windowErr) {
+		t.Fatalf("post-tool refusal = %v, want ContextWindowError", runErr)
+	}
+	if windowErr.Window != opening+outputCap || windowErr.ReservedOutput != outputCap || windowErr.InputTokens <= opening {
+		t.Fatalf("post-tool context refusal = %+v, opening input %d", windowErr, opening)
+	}
+	if len(bound.requests) != 1 {
+		t.Fatalf("provider received %d requests, want only the fitting opening request", len(bound.requests))
 	}
 }
 

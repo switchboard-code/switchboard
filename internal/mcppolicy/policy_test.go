@@ -705,7 +705,7 @@ func TestMalformedDuplicateAndEscapingSettingsQuarantineClaude(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := os.Symlink(outside, paths.ClaudeProjectSettings); err != nil {
-			t.Fatal(err)
+			t.Skipf("symlinks unavailable: %v", err)
 		}
 		checker, diagnostics, err := Load(options)
 		if err != nil || len(diagnostics) == 0 {

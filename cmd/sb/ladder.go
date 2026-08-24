@@ -237,7 +237,7 @@ func cmdLadder(m *tuiModel, args string) tea.Cmd {
 func runLadderCLI(w io.Writer, tiers []config.Tier, store *session.Store, workspace string) error {
 	fmt.Fprintln(w, "the ladder at work")
 	for _, line := range ladderLines(tiers, store, workspace) {
-		fmt.Fprintln(w, strings.TrimRight(line, " "))
+		fmt.Fprintln(w, cliText(strings.TrimRight(line, " ")))
 	}
 	return nil
 }

@@ -23,12 +23,14 @@ import (
 // Origin is one distinct source of lines: a turn, on a target, in a
 // session. Two edits from the same turn and target are one origin.
 type Origin struct {
-	SessionID string
-	Turn      int
-	Prompt    string
-	Tier      string // "" when the log's route record cannot vouch for one
-	Target    string
-	At        time.Time
+	SessionID           string
+	Turn                int
+	Prompt              string
+	PromptAuthoredKnown bool
+	PromptSynthetic     bool
+	Tier                string // "" when the log's route record cannot vouch for one
+	Target              string
+	At                  time.Time
 }
 
 // Annotation is a file's lines mapped to what wrote them.
@@ -85,12 +87,14 @@ func Annotate(disk []byte, edits []session.FileEdit) Annotation {
 			origin = len(origins)
 			index[key] = origin
 			origins = append(origins, Origin{
-				SessionID: e.SessionID,
-				Turn:      e.Turn,
-				Prompt:    e.Prompt,
-				Tier:      e.Tier,
-				Target:    e.Target,
-				At:        e.At,
+				SessionID:           e.SessionID,
+				Turn:                e.Turn,
+				Prompt:              e.Prompt,
+				PromptAuthoredKnown: e.PromptAuthoredKnown,
+				PromptSynthetic:     e.PromptSynthetic,
+				Tier:                e.Tier,
+				Target:              e.Target,
+				At:                  e.At,
 			})
 		}
 

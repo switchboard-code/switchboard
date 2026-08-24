@@ -58,7 +58,47 @@ func parseCLIOptions(args []string) (options, []string, error) {
 // subcommandSessionFlags are meaningful only while assembling a session.
 var subcommandSessionFlags = []string{
 	"model", "tier", "mode", "sandbox", "think",
-	"p", "output", "resume", "continue", "sessions", "tiers", "repl", "allow-secrets",
+	"p", "workflow", "output", "resume", "continue", "sessions", "tiers", "repl", "allow-secrets",
+}
+
+// validateSessionInvocation rejects two independently terminal ways to run a
+// session. Letting one silently win would be especially misleading with
+// -output json: the flag describes a single -p result, not workflow output.
+func validateSessionInvocation(opts options) error {
+	promptSet := opts.prompt != "" || opts.cliSetFlags != nil && opts.cliSetFlags["p"]
+	workflowSet := opts.workflow != "" || opts.cliSetFlags != nil && opts.cliSetFlags["workflow"]
+	if promptSet && workflowSet {
+		return fmt.Errorf("-p and -workflow cannot be combined; run either one prompt or one workflow")
+	}
+	if workflowSet && strings.TrimSpace(opts.workflow) == "" {
+		return fmt.Errorf("-workflow needs a non-empty workflow name")
+	}
+	if workflowSet {
+		switch {
+		case opts.list:
+			return fmt.Errorf("-workflow and -sessions cannot be combined")
+		case opts.showTiers:
+			return fmt.Errorf("-workflow and -tiers cannot be combined")
+		case opts.repl:
+			return fmt.Errorf("-workflow and -repl cannot be combined; omit -repl for the unattended workflow surface")
+		}
+	}
+	return nil
+}
+
+// consumeWorkflowArguments gives an explicitly selected workflow ownership of
+// the remaining positional words. The standard flag parser stops at the first
+// one; leaving them in args would either dispatch an accidental subcommand or
+// silently drop the workflow's arguments.
+func consumeWorkflowArguments(opts *options, args []string) []string {
+	if opts == nil || len(args) == 0 || opts.cliSetFlags == nil || !opts.cliSetFlags["workflow"] {
+		return args
+	}
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, opts.workflow)
+	parts = append(parts, args...)
+	opts.workflow = strings.TrimSpace(strings.Join(parts, " "))
+	return nil
 }
 
 // validateSubcommandFlags rejects flags that select or modify a session when
@@ -91,6 +131,11 @@ func runCLISubcommand(ctx context.Context, w io.Writer, opts options, args []str
 	}
 	command, commandArgs := args[0], args[1:]
 	switch command {
+	case codexCredentialHelperCommand:
+		if len(opts.cliSetFlags) != 0 {
+			return true, fmt.Errorf("internal credential-helper dispatch accepts no flags")
+		}
+		return true, runCredentialHelperDispatch(w, commandArgs)
 	case "completion":
 		if len(commandArgs) > 1 {
 			return true, fmt.Errorf("sb completion takes one shell; %q is extra", commandArgs[1])

@@ -35,7 +35,7 @@ func scheduleLine(e schedule.Entry, now time.Time) string {
 	if e.Recurring() {
 		kind = "every " + e.Every.String()
 	}
-	prompt := truncate(workspaceSanitize(e.Prompt), 40)
+	prompt := workspaceSanitize(redactCredentialTextBeforeTruncate(e.Prompt, 40))
 	return fmt.Sprintf("%-4s %-13s %-22s %s",
 		e.ID, kind, relativeFire(now, e.NextFire)+" ("+wallClock(now, e.NextFire)+")", prompt)
 }

@@ -13,8 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
-
-	"github.com/switchboard-code/switchboard/internal/terminaltext"
 )
 
 const (
@@ -212,8 +210,8 @@ func sortStartupNotes(notes []mcpNote) {
 
 func sanitizeStartupNote(note mcpNote) mcpNote {
 	return mcpNote{
-		level: terminaltext.Escape(note.level),
-		text:  terminaltext.Escape(note.text),
+		level: cliText(note.level),
+		text:  cliText(note.text),
 	}
 }
 

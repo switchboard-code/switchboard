@@ -59,12 +59,14 @@ func currentVersion() string {
 var updateHTTP = &http.Client{Timeout: 8 * time.Second}
 
 type ghRelease struct {
-	TagName    string `json:"tag_name"`
-	Prerelease bool   `json:"prerelease"`
-	Assets     []struct {
-		Name string `json:"name"`
-		URL  string `json:"browser_download_url"`
-	} `json:"assets"`
+	TagName    string    `json:"tag_name"`
+	Prerelease bool      `json:"prerelease"`
+	Assets     []ghAsset `json:"assets"`
+}
+
+type ghAsset struct {
+	Name string `json:"name"`
+	URL  string `json:"browser_download_url"`
 }
 
 // fetchLatest resolves the newest release the channel accepts. Stable asks
@@ -110,11 +112,30 @@ func fetchJSON[T any](ctx context.Context, url string) (*T, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("release check answered %s", resp.Status)
 	}
+	body, err := readBounded(resp.Body, 1<<20, "release response")
+	if err != nil {
+		return nil, err
+	}
 	var out T
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if err := decoder.Decode(&out); err != nil {
+		return nil, err
+	}
+	if err := requireJSONEOF(decoder); err != nil {
 		return nil, err
 	}
 	return &out, nil
+}
+
+func requireJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("release response contains more than one JSON value")
+		}
+		return fmt.Errorf("reading release response tail: %w", err)
+	}
+	return nil
 }
 
 var errNoRelease = errors.New("no releases published yet")
@@ -142,20 +163,28 @@ func newerVersion(candidate, current string) bool {
 }
 
 type semver struct {
-	core [3]int
+	core [3]uint64
 	pre  string
 }
 
 func parseSemver(v string) (semver, bool) {
-	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
 	var out semver
-	v, out.pre, _ = strings.Cut(v, "-")
-	parts := strings.Split(v, ".")
-	if len(parts) > 3 {
+	version, ok := canonicalReleaseVersion(v)
+	if !ok {
 		return out, false
 	}
+	// Build metadata identifies release artifacts but has no SemVer
+	// precedence. The release pipeline and asset resolver accept it, so the
+	// update chooser must ignore it rather than making that valid release
+	// unreachable from (or after) an ordinary build.
+	precedence, _, _ := strings.Cut(version, "+")
+	core, pre, hasPrerelease := strings.Cut(precedence, "-")
+	if hasPrerelease {
+		out.pre = pre
+	}
+	parts := strings.Split(core, ".")
 	for i, p := range parts {
-		n, err := strconv.Atoi(p)
+		n, err := strconv.ParseUint(p, 10, 64)
 		if err != nil {
 			return out, false
 		}
@@ -170,19 +199,25 @@ func parseSemver(v string) (semver, bool) {
 func comparePrerelease(a, b string) int {
 	as, bs := strings.Split(a, "."), strings.Split(b, ".")
 	for i := 0; i < len(as) && i < len(bs); i++ {
-		an, aNum := strconv.Atoi(as[i])
-		bn, bNum := strconv.Atoi(bs[i])
+		aNumeric := asciiDigits(as[i])
+		bNumeric := asciiDigits(bs[i])
 		switch {
-		case aNum == nil && bNum == nil:
-			if an != bn {
-				if an > bn {
+		case aNumeric && bNumeric:
+			// SemVer numeric identifiers have no size bound. Canonical tags have
+			// no leading zero, so digit count followed by lexical order is exact
+			// without overflowing a machine integer.
+			if len(as[i]) != len(bs[i]) {
+				if len(as[i]) > len(bs[i]) {
 					return 1
 				}
 				return -1
 			}
-		case aNum == nil:
+			if c := strings.Compare(as[i], bs[i]); c != 0 {
+				return c
+			}
+		case aNumeric:
 			return -1
-		case bNum == nil:
+		case bNumeric:
 			return 1
 		default:
 			if c := strings.Compare(as[i], bs[i]); c != 0 {
@@ -199,28 +234,43 @@ func comparePrerelease(a, b string) int {
 	return 0
 }
 
-// startupUpdate runs once at TUI startup. With auto on it goes all the way:
+// startupUpdate runs once at TUI startup. The default notice-only posture does
+// not replace the executable. An explicit auto opt-in goes all the way:
 // download, verify, replace, and say so; the running process is untouched and
 // the next start runs the new binary. Failure is silent beyond falling back
 // to the notice, because a tool that nags about its own update check failing
 // is worse than one that skips it.
-func startupUpdate(cfg *config.Config) tea.Cmd {
+func startupUpdate(cfg *config.Config) func(context.Context) tea.Msg {
+	return startupUpdateWith(cfg, startupUpdateRuntime{
+		current: currentVersion,
+		fetch:   fetchLatest,
+		apply:   selfUpdate,
+	})
+}
+
+type startupUpdateRuntime struct {
+	current func() string
+	fetch   func(context.Context, string) (*ghRelease, error)
+	apply   func(context.Context, *ghRelease) error
+}
+
+func startupUpdateWith(cfg *config.Config, rt startupUpdateRuntime) func(context.Context) tea.Msg {
 	channel, auto := cfg.UpdateChannel, cfg.UpdateAuto
-	return func() tea.Msg {
-		current := currentVersion()
+	return func(lifetime context.Context) tea.Msg {
+		current := rt.current()
 		if current == "" {
 			return updateCheckMsg{}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		ctx, cancel := context.WithTimeout(lifetime, 3*time.Minute)
 		defer cancel()
-		rel, err := fetchLatest(ctx, channel)
+		rel, err := rt.fetch(ctx, channel)
 		if err != nil || !newerVersion(rel.TagName, current) {
 			return updateCheckMsg{}
 		}
 		if !auto {
 			return updateCheckMsg{latest: rel.TagName}
 		}
-		if err := selfUpdate(ctx, rel); err != nil {
+		if err := rt.apply(ctx, rel); err != nil {
 			// Including installs a package manager owns: those fall back to
 			// the notice, which /update explains rather than fights.
 			return updateCheckMsg{latest: rel.TagName}
@@ -246,13 +296,13 @@ func runUpdateCLI(ctx context.Context, cfg *config.Config) error {
 		return fmt.Errorf("update check failed: %w", err)
 	}
 	if current := currentVersion(); current != "" && !newerVersion(rel.TagName, current) {
-		fmt.Println("already on the latest (" + current + ")")
+		fmt.Println("already on the latest (" + cliText(current) + ")")
 		return nil
 	}
 	if err := selfUpdate(ctx, rel); err != nil {
 		return fmt.Errorf("update failed: %w", err)
 	}
-	fmt.Println("updated to " + rel.TagName)
+	fmt.Println("updated to " + cliText(rel.TagName))
 	return nil
 }
 
@@ -261,8 +311,8 @@ func cmdUpdate(m *tuiModel, args string) tea.Cmd {
 		return updateSettings(m, args)
 	}
 	channel := m.app.config.UpdateChannel
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	return m.ownUpdateCmd(func(lifetime context.Context) tea.Msg {
+		ctx, cancel := context.WithTimeout(lifetime, 3*time.Minute)
 		defer cancel()
 
 		rel, err := fetchLatest(ctx, channel)
@@ -279,7 +329,7 @@ func cmdUpdate(m *tuiModel, args string) tea.Cmd {
 			return noticeMsg{level: "error", text: "update failed: " + err.Error()}
 		}
 		return noticeMsg{text: "updated to " + rel.TagName + "; restart sb to run it"}
-	}
+	})
 }
 
 // updateSettings is /update channel and /update auto: the update posture is
@@ -298,9 +348,8 @@ func updateSettings(m *tuiModel, args string) tea.Cmd {
 			}
 			return noticeCmd("", "update channel is "+ch)
 		case "stable", "beta":
-			cfg.UpdateChannel = value
-			if err := cfg.Save(); err != nil {
-				return noticeCmd("error", "saving the channel failed: "+err.Error())
+			if err := cfg.SetUpdateChannelAndSave(value); err != nil {
+				return noticeCmd("error", "saving the channel failed, nothing changed: "+err.Error())
 			}
 			return noticeCmd("", "update channel is now "+value)
 		default:
@@ -315,9 +364,8 @@ func updateSettings(m *tuiModel, args string) tea.Cmd {
 			}
 			return noticeCmd("", "auto-update is "+state)
 		case "on", "off":
-			cfg.UpdateAuto = value == "on"
-			if err := cfg.Save(); err != nil {
-				return noticeCmd("error", "saving the setting failed: "+err.Error())
+			if err := cfg.SetUpdateAutoAndSave(value == "on"); err != nil {
+				return noticeCmd("error", "saving the setting failed, nothing changed: "+err.Error())
 			}
 			return noticeCmd("", "auto-update is now "+value)
 		default:
@@ -339,87 +387,201 @@ func selfUpdate(ctx context.Context, rel *ghRelease) error {
 	if err != nil {
 		return err
 	}
+	return selfUpdateExecutable(ctx, rel, exe, updateRuntime{
+		goos:    runtime.GOOS,
+		goarch:  runtime.GOARCH,
+		fetch:   download,
+		replace: installUpdateBinary,
+	})
+}
+
+const (
+	maxUpdateChecksums = int64(1 << 16)
+	maxUpdateArchive   = int64(128 << 20)
+	maxUpdateBinary    = int64(256 << 20)
+	maxUpdateTarTail   = int64(1 << 20)
+)
+
+type updateRuntime struct {
+	goos    string
+	goarch  string
+	fetch   func(context.Context, string, int64) ([]byte, error)
+	replace func(string, []byte) error
+}
+
+func selfUpdateExecutable(ctx context.Context, rel *ghRelease, exe string, rt updateRuntime) error {
+	if rel == nil {
+		return errors.New("release metadata is missing")
+	}
+	if rt.fetch == nil || rt.replace == nil {
+		return errors.New("update runtime is incomplete")
+	}
+	if rt.goos == "" || rt.goarch == "" {
+		return errors.New("update platform is missing")
+	}
 
 	// §18: an install that came from a package manager defers to it rather
 	// than fighting it.
-	if managedBy, ok := packageManagerFor(exe); ok {
+	if managedBy, ok := packageManagerForPlatform(exe, rt.goos); ok {
 		return fmt.Errorf("this install is managed by %s; update through it", managedBy)
 	}
 
-	assetName := fmt.Sprintf("sb_%s_%s_%s.tar.gz",
-		strings.TrimPrefix(rel.TagName, "v"), runtime.GOOS, runtime.GOARCH)
-	assetURL, sumsURL := "", ""
-	for _, a := range rel.Assets {
-		switch a.Name {
-		case assetName:
-			assetURL = a.URL
-		case "checksums.txt":
-			sumsURL = a.URL
-		}
-	}
-	if assetURL == "" {
-		return fmt.Errorf("release %s has no build for %s/%s", rel.TagName, runtime.GOOS, runtime.GOARCH)
-	}
-	if sumsURL == "" {
-		return errors.New("release has no checksums.txt; refusing to install unverified bits")
-	}
-
-	sums, err := download(ctx, sumsURL, 1<<16)
+	assetName, err := updateAssetName(rel.TagName, rt.goos, rt.goarch)
 	if err != nil {
 		return err
+	}
+	assetURL, sumsURL, err := updateAssetURLs(rel, assetName)
+	if err != nil {
+		return err
+	}
+
+	sums, err := rt.fetch(ctx, sumsURL, maxUpdateChecksums)
+	if err != nil {
+		return fmt.Errorf("downloading checksums.txt: %w", err)
 	}
 	want, err := checksumFor(sums, assetName)
 	if err != nil {
 		return err
 	}
 
-	archive, err := download(ctx, assetURL, 128<<20)
+	archive, err := rt.fetch(ctx, assetURL, maxUpdateArchive)
 	if err != nil {
-		return err
+		return fmt.Errorf("downloading %s: %w", assetName, err)
 	}
 	sum := sha256.Sum256(archive)
-	if !equalFoldHex(hex.EncodeToString(sum[:]), want) {
+	if hex.EncodeToString(sum[:]) != want {
 		return errors.New("checksum mismatch; nothing was installed")
 	}
 
-	binary, err := extractSB(archive)
+	member := "sb"
+	if rt.goos == "windows" {
+		member = "sb.exe"
+	}
+	binary, err := extractUpdateBinary(archive, member, maxUpdateBinary)
 	if err != nil {
 		return err
 	}
+	// Cancellation before publication leaves the currently installed binary
+	// untouched. Once replacement starts it is deliberately not interruptible;
+	// the TUI lifetime owner joins the complete namespace transaction instead.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return rt.replace(exe, binary)
+}
 
-	tmp, err := os.CreateTemp(filepath.Dir(exe), ".sb-update-*")
-	if err != nil {
-		return err
+func updateAssetName(tag, goos, goarch string) (string, error) {
+	version, ok := canonicalReleaseVersion(tag)
+	if !ok {
+		return "", fmt.Errorf("release tag %q is not a canonical vX.Y.Z version", tag)
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if _, err := tmp.Write(binary); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpPath, 0o755); err != nil {
-		return err
-	}
-	// Rename is atomic on the same filesystem, which is why the temp file lives
-	// beside the binary rather than in /tmp. Windows refuses to rename over a
-	// running executable, so there the old binary steps aside first and the
-	// leftover .old is swept on the next start.
-	if runtime.GOOS == "windows" {
-		old := exe + ".old"
-		os.Remove(old)
-		if err := os.Rename(exe, old); err != nil {
-			return err
+	for _, value := range []string{version, goos, goarch} {
+		if value == "" || strings.ContainsAny(value, "/\\\x00 \t\r\n") {
+			return "", errors.New("release identity contains an unsafe asset-name component")
 		}
-		if err := os.Rename(tmpPath, exe); err != nil {
-			os.Rename(old, exe)
-			return err
-		}
-		return nil
 	}
-	return os.Rename(tmpPath, exe)
+	return fmt.Sprintf("sb_%s_%s_%s.tar.gz", version, goos, goarch), nil
+}
+
+func canonicalReleaseVersion(tag string) (string, bool) {
+	if strings.TrimSpace(tag) != tag || !strings.HasPrefix(tag, "v") || len(tag) == 1 || len(tag) > 128 {
+		return "", false
+	}
+	version := tag[1:]
+	main, build, hasBuild := strings.Cut(version, "+")
+	if hasBuild && !validSemverIdentifiers(build, false) {
+		return "", false
+	}
+	core, prerelease, hasPrerelease := strings.Cut(main, "-")
+	if hasPrerelease && !validSemverIdentifiers(prerelease, true) {
+		return "", false
+	}
+	parts := strings.Split(core, ".")
+	if len(parts) != 3 {
+		return "", false
+	}
+	for _, part := range parts {
+		if !asciiDigits(part) || len(part) > 1 && part[0] == '0' {
+			return "", false
+		}
+		if _, err := strconv.ParseUint(part, 10, 64); err != nil {
+			return "", false
+		}
+	}
+	return version, true
+}
+
+func validSemverIdentifiers(value string, rejectNumericLeadingZero bool) bool {
+	if value == "" {
+		return false
+	}
+	for _, identifier := range strings.Split(value, ".") {
+		if identifier == "" {
+			return false
+		}
+		numeric := true
+		for _, r := range identifier {
+			if r < '0' || r > '9' {
+				numeric = false
+			}
+			if r < '0' || r > '9' {
+				if r < 'A' || r > 'Z' {
+					if r < 'a' || r > 'z' {
+						if r != '-' {
+							return false
+						}
+					}
+				}
+			}
+		}
+		if rejectNumericLeadingZero && numeric && len(identifier) > 1 && identifier[0] == '0' {
+			return false
+		}
+	}
+	return true
+}
+
+func asciiDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func updateAssetURLs(rel *ghRelease, assetName string) (string, string, error) {
+	var assetURL, sumsURL string
+	assetCount, sumsCount := 0, 0
+	for _, asset := range rel.Assets {
+		switch asset.Name {
+		case assetName:
+			assetCount++
+			assetURL = asset.URL
+		case "checksums.txt":
+			sumsCount++
+			sumsURL = asset.URL
+		}
+	}
+	if assetCount == 0 {
+		return "", "", fmt.Errorf("release %s has no build named %s", rel.TagName, assetName)
+	}
+	if assetCount != 1 {
+		return "", "", fmt.Errorf("release %s has %d assets named %s", rel.TagName, assetCount, assetName)
+	}
+	if sumsCount == 0 {
+		return "", "", errors.New("release has no checksums.txt; refusing to install unverified bits")
+	}
+	if sumsCount != 1 {
+		return "", "", fmt.Errorf("release %s has %d assets named checksums.txt", rel.TagName, sumsCount)
+	}
+	if assetURL == "" || sumsURL == "" {
+		return "", "", errors.New("release asset has an empty download URL")
+	}
+	return assetURL, sumsURL, nil
 }
 
 // sweepOldBinary removes the .old a Windows self-update leaves behind. Called
@@ -437,19 +599,28 @@ func sweepOldBinary() {
 // packageManagerFor recognizes install layouts that belong to a package
 // manager by where the binary lives.
 func packageManagerFor(exe string) (string, bool) {
+	return packageManagerForPlatform(exe, runtime.GOOS)
+}
+
+func packageManagerForPlatform(exe, goos string) (string, bool) {
+	normalized := strings.ReplaceAll(filepath.ToSlash(exe), `\`, "/")
+	lower := strings.ToLower(normalized)
 	switch {
-	case strings.Contains(exe, "/Cellar/"), strings.Contains(exe, "/homebrew/"), strings.Contains(exe, "/linuxbrew/"):
+	case strings.Contains(normalized, "/Cellar/"), strings.Contains(lower, "/homebrew/"), strings.Contains(lower, "/linuxbrew/"):
 		return "Homebrew", true
-	case strings.Contains(exe, "scoop"):
+	case goos == "windows" && strings.Contains(lower, "/scoop/"):
 		return "Scoop", true
-	case strings.HasPrefix(exe, "/usr/local/bin/") && runtime.GOOS == "linux",
-		strings.HasPrefix(exe, "/usr/bin/"):
+	case strings.HasPrefix(normalized, "/usr/local/bin/") && goos == "linux",
+		strings.HasPrefix(normalized, "/usr/bin/"):
 		return "the system package manager", true
 	}
 	return "", false
 }
 
 func download(ctx context.Context, url string, cap int64) ([]byte, error) {
+	if cap < 0 {
+		return nil, errors.New("download byte cap is invalid")
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -463,46 +634,120 @@ func download(ctx context.Context, url string, cap int64) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("downloading %s: %s", url, resp.Status)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, cap+1))
+	if resp.ContentLength > cap {
+		return nil, fmt.Errorf("download exceeds the %d-byte limit", cap)
+	}
+	return readBounded(resp.Body, cap, "download")
+}
+
+func readBounded(r io.Reader, cap int64, label string) ([]byte, error) {
+	if cap < 0 || cap == int64(^uint64(0)>>1) {
+		return nil, fmt.Errorf("%s byte cap is invalid", label)
+	}
+	data, err := io.ReadAll(io.LimitReader(r, cap+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > cap {
+		return nil, fmt.Errorf("%s exceeds the %d-byte limit", label, cap)
+	}
+	return data, nil
 }
 
 // checksumFor reads a sha256sum-format checksums file.
 func checksumFor(sums []byte, name string) (string, error) {
+	if filepath.Base(name) != name || name == "" || strings.ContainsAny(name, "\x00\r\n") {
+		return "", errors.New("checksum lookup has an unsafe asset name")
+	}
+	found := ""
 	for line := range strings.Lines(string(sums)) {
-		sum, file, ok := strings.Cut(strings.TrimSpace(line), " ")
-		if !ok {
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r")
+		if line == "" {
 			continue
 		}
-		if strings.TrimSpace(strings.TrimPrefix(file, "*")) == name {
-			return sum, nil
+		if len(line) < 67 || line[64] != ' ' || line[65] != ' ' && line[65] != '*' {
+			return "", errors.New("checksums.txt is not in sha256sum format")
+		}
+		sum, file := line[:64], line[66:]
+		decoded, err := hex.DecodeString(sum)
+		if err != nil || len(decoded) != sha256.Size || file == "" {
+			return "", errors.New("checksums.txt contains an invalid sha256 entry")
+		}
+		if file == name {
+			if found != "" {
+				return "", fmt.Errorf("checksums.txt has more than one entry for %s", name)
+			}
+			found = strings.ToLower(sum)
 		}
 	}
-	return "", fmt.Errorf("checksums.txt has no entry for %s", name)
-}
-
-func equalFoldHex(a, b string) bool {
-	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
-}
-
-// extractSB pulls the sb binary out of the release archive.
-func extractSB(archive []byte) ([]byte, error) {
-	gz, err := gzip.NewReader(bytes.NewReader(archive))
-	if err != nil {
-		return nil, err
+	if found == "" {
+		return "", fmt.Errorf("checksums.txt has no entry for %s", name)
 	}
+	return found, nil
+}
+
+// extractSB retains the historical test seam while applying the current
+// platform's exact archive-member contract.
+func extractSB(archive []byte) ([]byte, error) {
+	member := "sb"
+	if runtime.GOOS == "windows" {
+		member = "sb.exe"
+	}
+	return extractUpdateBinary(archive, member, maxUpdateBinary)
+}
+
+func extractUpdateBinary(archive []byte, member string, cap int64) ([]byte, error) {
+	if member != "sb" && member != "sb.exe" {
+		return nil, errors.New("release archive member is invalid")
+	}
+	compressed := bytes.NewReader(archive)
+	gz, err := gzip.NewReader(compressed)
+	if err != nil {
+		return nil, fmt.Errorf("opening release gzip: %w", err)
+	}
+	gz.Multistream(false)
+	defer gz.Close()
 	tr := tar.NewReader(gz)
+	var binary []byte
+	entries := 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
+			return nil, fmt.Errorf("reading release tar: %w", err)
+		}
+		entries++
+		if entries != 1 || hdr.Name != member || hdr.Typeflag != tar.TypeReg {
+			return nil, fmt.Errorf("release archive must contain exactly one regular file named %s", member)
+		}
+		if hdr.Size <= 0 || hdr.Size > cap {
+			return nil, fmt.Errorf("release binary size %d is outside the 1..%d byte bound", hdr.Size, cap)
+		}
+		binary, err = readBounded(tr, cap, "release binary")
+		if err != nil {
 			return nil, err
 		}
-		base := filepath.Base(hdr.Name)
-		if hdr.Typeflag == tar.TypeReg && (base == "sb" || base == "sb.exe") {
-			return io.ReadAll(io.LimitReader(tr, 256<<20))
+		if int64(len(binary)) != hdr.Size {
+			return nil, errors.New("release binary is truncated")
 		}
 	}
-	return nil, errors.New("no sb binary in the release archive")
+	if entries != 1 || len(binary) == 0 {
+		return nil, fmt.Errorf("release archive must contain exactly one regular file named %s", member)
+	}
+	tail, err := readBounded(gz, maxUpdateTarTail, "release tar padding")
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range tail {
+		if b != 0 {
+			return nil, errors.New("release tar has non-zero data after its end marker")
+		}
+	}
+	if compressed.Len() != 0 {
+		return nil, errors.New("release archive contains trailing or concatenated gzip data")
+	}
+	return binary, nil
 }

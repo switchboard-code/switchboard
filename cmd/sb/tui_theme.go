@@ -88,40 +88,42 @@ func darkTheme() *theme {
 	t := &theme{name: "dark", dark: true}
 	// The neutral scale does most of the hierarchy work: body, metadata,
 	// whisper. Weight and these three grays carry a line before color ever
-	// speaks, so color stays free to mean something (a rung, a severity).
+	// speaks, so color stays free to mean something (a rung, a severity). Even
+	// the whisper clears 4.5:1 on the raised surfaces it can occupy; "quiet"
+	// must not mean illegible on a calibrated terminal.
 	t.text = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-	t.dim = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	t.faint = lipgloss.NewStyle().Foreground(lipgloss.Color("239"))
+	t.dim = lipgloss.NewStyle().Foreground(lipgloss.Color("248"))
+	t.faint = lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
 	t.bold = lipgloss.NewStyle().Bold(true)
 	t.accent = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
 	t.user = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Bold(true)
 	t.ok = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 	t.warn = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	t.err = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	t.thinking = lipgloss.NewStyle().Foreground(lipgloss.Color("242")).Italic(true)
+	t.err = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	t.thinking = lipgloss.NewStyle().Foreground(lipgloss.Color("246")).Italic(true)
 
-	t.tierChip = lipgloss.NewStyle().Foreground(lipgloss.Color("235")).Background(lipgloss.Color("39")).Bold(true)
+	t.tierChip = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("39")).Bold(true)
 	t.modeChip = map[string]lipgloss.Style{
-		"plan":        lipgloss.NewStyle().Foreground(lipgloss.Color("235")).Background(lipgloss.Color("75")),
+		"plan":        lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("75")),
 		"default":     lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Background(lipgloss.Color("238")),
-		"acceptEdits": lipgloss.NewStyle().Foreground(lipgloss.Color("235")).Background(lipgloss.Color("42")),
-		"auto":        lipgloss.NewStyle().Foreground(lipgloss.Color("235")).Background(lipgloss.Color("39")),
-		"yolo":        lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Background(lipgloss.Color("196")).Bold(true),
-		"bypass":      lipgloss.NewStyle().Foreground(lipgloss.Color("235")).Background(lipgloss.Color("214")),
+		"acceptEdits": lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("42")),
+		"auto":        lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("39")),
+		"yolo":        lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("203")).Bold(true),
+		"bypass":      lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("214")),
 	}
 	t.barFill = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
-	t.barEmpty = lipgloss.NewStyle().Foreground(lipgloss.Color("236"))
-	t.selected = lipgloss.NewStyle().Background(lipgloss.Color("237"))
-	t.border = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
-	t.barBg = lipgloss.Color("234")
+	t.barEmpty = lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	t.selected = lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Background(lipgloss.Color("237"))
+	t.border = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	t.barBg = lipgloss.Color("232")
 	t.surface = lipgloss.Color("235")
 
 	// Cool to warm, muted rather than neon: teal, steel blue, violet, copper,
 	// amber, coral. Mid-brightness values chosen to read on a dark ground.
-	for _, c := range []string{"73", "68", "134", "173", "179", "203"} {
+	for _, c := range []string{"73", "69", "140", "173", "179", "209"} {
 		t.rungs = append(t.rungs, lipgloss.NewStyle().Foreground(lipgloss.Color(c)))
 		t.rungChips = append(t.rungChips, lipgloss.NewStyle().
-			Foreground(lipgloss.Color("235")).Background(lipgloss.Color(c)).Bold(true))
+			Foreground(lipgloss.Color("16")).Background(lipgloss.Color(c)).Bold(true))
 	}
 	return t
 }
@@ -129,37 +131,37 @@ func darkTheme() *theme {
 func lightTheme() *theme {
 	t := &theme{name: "light", dark: false}
 	t.text = lipgloss.NewStyle().Foreground(lipgloss.Color("235"))
-	t.dim = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
-	t.faint = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+	t.dim = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	t.faint = lipgloss.NewStyle().Foreground(lipgloss.Color("242"))
 	t.bold = lipgloss.NewStyle().Bold(true)
-	t.accent = lipgloss.NewStyle().Foreground(lipgloss.Color("27"))
+	t.accent = lipgloss.NewStyle().Foreground(lipgloss.Color("26"))
 	t.user = lipgloss.NewStyle().Foreground(lipgloss.Color("94")).Bold(true)
-	t.ok = lipgloss.NewStyle().Foreground(lipgloss.Color("28"))
-	t.warn = lipgloss.NewStyle().Foreground(lipgloss.Color("166"))
+	t.ok = lipgloss.NewStyle().Foreground(lipgloss.Color("22"))
+	t.warn = lipgloss.NewStyle().Foreground(lipgloss.Color("94"))
 	t.err = lipgloss.NewStyle().Foreground(lipgloss.Color("160"))
-	t.thinking = lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Italic(true)
+	t.thinking = lipgloss.NewStyle().Foreground(lipgloss.Color("242")).Italic(true)
 
-	t.tierChip = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Background(lipgloss.Color("27")).Bold(true)
+	t.tierChip = lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("26")).Bold(true)
 	t.modeChip = map[string]lipgloss.Style{
-		"plan":        lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Background(lipgloss.Color("61")),
+		"plan":        lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("61")),
 		"default":     lipgloss.NewStyle().Foreground(lipgloss.Color("235")).Background(lipgloss.Color("252")),
-		"acceptEdits": lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Background(lipgloss.Color("28")),
-		"auto":        lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Background(lipgloss.Color("27")),
-		"yolo":        lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Background(lipgloss.Color("160")).Bold(true),
-		"bypass":      lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Background(lipgloss.Color("166")),
+		"acceptEdits": lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("22")),
+		"auto":        lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("26")),
+		"yolo":        lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("160")).Bold(true),
+		"bypass":      lipgloss.NewStyle().Foreground(lipgloss.Color("231")).Background(lipgloss.Color("94")),
 	}
-	t.barFill = lipgloss.NewStyle().Foreground(lipgloss.Color("27"))
-	t.barEmpty = lipgloss.NewStyle().Foreground(lipgloss.Color("254"))
-	t.selected = lipgloss.NewStyle().Background(lipgloss.Color("254"))
-	t.border = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
-	t.barBg = lipgloss.Color("253")
+	t.barFill = lipgloss.NewStyle().Foreground(lipgloss.Color("26"))
+	t.barEmpty = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	t.selected = lipgloss.NewStyle().Foreground(lipgloss.Color("235")).Background(lipgloss.Color("254"))
+	t.border = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	t.barBg = lipgloss.Color("255")
 	t.surface = lipgloss.Color("255")
 
 	// The same ramp, darkened to hold contrast on a light ground.
-	for _, c := range []string{"30", "25", "91", "130", "136", "161"} {
+	for _, c := range []string{"23", "25", "91", "94", "58", "124"} {
 		t.rungs = append(t.rungs, lipgloss.NewStyle().Foreground(lipgloss.Color(c)))
 		t.rungChips = append(t.rungChips, lipgloss.NewStyle().
-			Foreground(lipgloss.Color("255")).Background(lipgloss.Color(c)).Bold(true))
+			Foreground(lipgloss.Color("231")).Background(lipgloss.Color(c)).Bold(true))
 	}
 	return t
 }

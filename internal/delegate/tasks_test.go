@@ -118,6 +118,45 @@ func TestCancelOneTaskDoesNotCancelSibling(t *testing.T) {
 	}
 }
 
+func TestCancelWinningTerminalRaceSuppressesSuccessfulResult(t *testing.T) {
+	manager := NewTaskManager(1)
+	ref := manager.Reserve("cancel at completion", "", "t1", "parent")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	type outcome struct {
+		result tools.Result
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := manager.Execute(context.Background(), ref, func(context.Context, *TaskHandle) (tools.Result, error) {
+			close(started)
+			<-release
+			// Model a provider that completed concurrently and did not observe
+			// cancellation before handing its terminal answer to the owner.
+			return tools.Result{Content: "must not escape"}, nil
+		})
+		done <- outcome{result: result, err: err}
+	}()
+
+	<-started
+	if err := manager.Cancel(ref.ID); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	got := <-done
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("cancel-wins Execute error = %v, want context.Canceled", got.err)
+	}
+	if got.result != (tools.Result{}) {
+		t.Fatalf("cancel-wins Execute leaked result %+v", got.result)
+	}
+	task := taskMap(manager.List())[ref.ID]
+	if task.Status != TaskCanceled || task.Error != context.Canceled.Error() {
+		t.Fatalf("cancel-wins terminal state = %+v", task)
+	}
+}
+
 func TestCancelQueuedTaskDoesNotWaitForWorkerSlot(t *testing.T) {
 	manager := NewTaskManager(1)
 	running := manager.Reserve("running", "", "t1", "parent")

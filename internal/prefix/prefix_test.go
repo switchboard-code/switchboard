@@ -317,6 +317,33 @@ func TestRequestTokensCountsEveryZone(t *testing.T) {
 	}
 }
 
+func TestRequestEstimatesExcludeIncompleteAssistantMessages(t *testing.T) {
+	baseline := provider.Request{Messages: []provider.Message{
+		provider.UserText("before"),
+		provider.UserText("after"),
+	}}
+	withPartial := baseline
+	withPartial.Messages = []provider.Message{
+		baseline.Messages[0],
+		{
+			Role:       provider.RoleAssistant,
+			Incomplete: true,
+			Content:    []provider.Block{provider.Text{Text: strings.Repeat("must not be estimated", 10_000)}},
+		},
+		baseline.Messages[1],
+	}
+
+	if got, want := RequestTokens(withPartial), RequestTokens(baseline); got != want {
+		t.Fatalf("estimated tokens = %d, want %d after replay projection", got, want)
+	}
+	if got, want := RequestTokenCeiling(withPartial), RequestTokenCeiling(baseline); got != want {
+		t.Fatalf("token ceiling = %d, want %d after replay projection", got, want)
+	}
+	if len(withPartial.Messages) != 3 {
+		t.Fatal("estimation mutated the durable request")
+	}
+}
+
 func TestRequestTokenCeilingCountsShortBlockFraming(t *testing.T) {
 	req := provider.Request{}
 	for range 1_000 {

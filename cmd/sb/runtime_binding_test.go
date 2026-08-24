@@ -233,7 +233,7 @@ func TestRetryAfterMovedTurnKeepsCurrentDurableBindingLiveAndOnReopen(t *testing
 		t.Fatalf("retry did not produce a session swap: %#v", swap)
 	}
 	if got := swap.sess.State().RuntimeBinding; got.Tier != "t1" {
-		swap.sess.Close()
+		swap.sess.CloseDiscardingStaged()
 		t.Fatalf("test setup did not cut away the move made in the retried turn: %+v", got)
 	}
 	continuation := m.onSessionSwap(swap)
@@ -272,6 +272,39 @@ func TestTierForSessionStateUsesDurableTierAndExactTarget(t *testing.T) {
 	}})
 	if err != nil || configured || got.ID != "removed" || got.Target.ID() != fallback.ID() {
 		t.Fatalf("removed tier resumed as %+v configured=%v err=%v", got, configured, err)
+	}
+}
+
+func TestTierForSessionStateDoesNotBorrowFallbacksAcrossRungCapMigration(t *testing.T) {
+	for _, test := range []struct {
+		name                     string
+		configuredCap, recordCap int
+	}{
+		{name: "cap added after session", configuredCap: 4096},
+		{name: "cap removed after session", recordCap: 4096},
+		{name: "cap changed after session", configuredCap: 8192, recordCap: 4096},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			configuredTarget := provider.RouteTarget{Provider: "ollama", Surface: "local", ModelID: "same"}
+			configuredTarget.Params.MaxOutputTokens = test.configuredCap
+			fallback := provider.RouteTarget{Provider: "ollama", Surface: "local", ModelID: "backup"}
+			fallback.Params.MaxOutputTokens = test.configuredCap
+			recordedTarget := provider.RouteTarget{Provider: "ollama", Surface: "local", ModelID: "same"}
+			recordedTarget.Params.MaxOutputTokens = test.recordCap
+			cfg := &config.Config{Tiers: []config.Tier{{
+				ID: "t1", Label: "light", Target: configuredTarget, Fallbacks: []provider.RouteTarget{fallback},
+			}}}
+
+			got, configured, err := tierForSessionState(cfg, session.State{RuntimeBinding: session.RuntimeBinding{
+				Tier: "t1", Target: recordedTarget.ID(), Pinned: true,
+			}})
+			if err != nil || !configured {
+				t.Fatalf("migrated binding = %+v configured=%v err=%v", got, configured, err)
+			}
+			if got.ID != "t1" || got.Target.ID() != recordedTarget.ID() || len(got.Fallbacks) != 0 {
+				t.Fatalf("migrated binding borrowed current rung policy: %+v", got)
+			}
+		})
 	}
 }
 

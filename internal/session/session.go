@@ -25,6 +25,7 @@ import (
 
 	"github.com/switchboard-code/switchboard/internal/continuity"
 	"github.com/switchboard-code/switchboard/internal/provider"
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 )
 
 // ErrSessionLocked reports that another process is appending to this session.
@@ -41,8 +42,39 @@ var ErrRaceBranchPending = errors.New("race branch is not resumable until its or
 
 var ErrNoSessions = errors.New("no sessions recorded for this workspace")
 
+var ErrSessionInventoryTooLarge = errors.New("session inventory exceeds its directory-entry limit")
+
+const (
+	maxSessionWorkspaceDirectories = 4096
+	maxSessionDirectoryEntries     = 16384
+	sessionDirectoryReadBatch      = 256
+)
+
+// ErrSessionUnpublished means a durable child log exists but has not crossed
+// its adoption commit point. Discovery and resume treat it as nonexistent.
+var ErrSessionUnpublished = errors.New("session is staged and not published")
+
+// ErrPublicationOwnership means Publish was attempted through a replayed or
+// otherwise foreign handle. Only the handle that created a staged log holds
+// the in-memory capability that can make it discoverable.
+var ErrPublicationOwnership = errors.New("session publication is not owned by this handle")
+
 type Store struct {
-	root string
+	root        string
+	maintenance StagedMaintenanceReport
+	replayLimit replayLimits // zero selects the production limits; tests may narrow it
+
+	createDirectorySync            func(string) error               // test-only durability fault seam
+	maintenanceValidate            func(string, SessionStart) error // test-only fault seam
+	maintenanceBeforeOpen          func(string)                     // test-only entry swap seam
+	maintenanceBeforeOwned         func(string)                     // test-only race seam
+	maintenanceBeforeRemove        func(string)                     // test-only log swap seam
+	maintenanceBeforeMarkerRemove  func(string)                     // test-only marker swap seam
+	latestAfterList                func()                           // test-only inventory interleaving seam
+	openPublicationMarkerSync      func(*os.File) error             // test-only resume durability seam
+	openPublicationDirectorySync   func(*os.File) error             // test-only resume durability seam
+	openPublicationBeforeDirectory func(string)                     // test-only parent swap seam
+	openPublicationAfterMarker     func(string)                     // test-only marker swap seam
 }
 
 // DefaultStore places sessions under the user's config directory rather than in
@@ -56,10 +88,12 @@ func DefaultStore() (*Store, error) {
 }
 
 func NewStore(root string) (*Store, error) {
-	if err := os.MkdirAll(root, 0o700); err != nil {
+	if err := preparePrivateSessionStore(root); err != nil {
 		return nil, fmt.Errorf("creating session store: %w", err)
 	}
-	return &Store{root: root}, nil
+	store := &Store{root: root}
+	store.maintenance = store.cleanupExpiredStaged(time.Now().Add(-stagedRetention), stagedCleanupLimit)
+	return store, nil
 }
 
 // State is the result of replaying a log.
@@ -69,13 +103,24 @@ type State struct {
 	Target    string
 	CreatedAt time.Time
 
+	// WorkspaceBinding is the canonical workspace identity durably proven for
+	// a legacy session whose immutable SessionStart.Workspace used a symlink
+	// spelling. Empty means the start path remains authoritative.
+	WorkspaceBinding string
+
+	// RetryIntent is non-nil only while a published retry child still has a
+	// durable replay handoff. Pending is safe to start once from its exact source
+	// coordinate; started is deliberately ambiguous and never auto-replayed.
+	RetryIntent *RetryIntent
+
 	// RuntimeBinding is the latest committed tier/target/pin state. Its zero
 	// value identifies a legacy log that only has SessionStart.Target.
 	RuntimeBinding RuntimeBinding
 
 	// Messages includes assistant messages marked Incomplete. They are kept for
-	// diagnosis and display; adapters drop them when rendering a request so an
-	// interrupted turn is never replayed as a finished one (§10.3).
+	// diagnosis and display; the provider replay projection excludes them from
+	// estimation, cache planning, and wire rendering so an interrupted turn is
+	// never replayed as a finished one (§10.3).
 	Messages []provider.Message
 
 	Usage provider.Usage
@@ -125,6 +170,9 @@ type State struct {
 	raceBranchPending      bool
 	raceBranchFinalized    bool
 	raceBranchContinuation bool
+	publicationPending     bool
+	publicationID          string
+	retryIntentSeen        bool
 }
 
 // AccountedCostMicroUSD is the observed dollar cost attributable to this
@@ -211,8 +259,35 @@ type Session struct {
 	path     string
 	seq      int
 	poisoned error
+	closed   bool
 
 	state State
+
+	// publicationOwner is an in-memory capability held only by the handle that
+	// created a staged log. It is deliberately not reconstructed by replay.
+	// publicationCommitted makes a second Publish by that same handle
+	// idempotent without accepting a pre-existing sidecar as proof of ownership.
+	// publicationDurable remains false when the exact marker became visible but
+	// a later file or directory sync failed; retry journals must survive that
+	// distinction. publicationMarkerInfo remembers the marker inode created by
+	// this live handle. It is the authority for continuing an interrupted strict
+	// prefix without deleting or accepting a pre-existing partial sidecar.
+	publicationOwner      string
+	publicationCommitted  bool
+	publicationDurable    bool
+	publicationMarkerInfo os.FileInfo
+	publicationLogStamp   publicationMutationStamp
+	publicationLogStamped bool
+	publicationFault      func(publicationStep) error // test-only fault seam
+	publicationFailCheck  func(string)                // test-only failure-commit seam
+	discardBeforeInspect  func(string)                // test-only marker-commit seam
+	discardBeforeClose    func(string)                // test-only pathname-swap seam
+
+	// assistantDrafts indexes logical incomplete messages assembled from
+	// append-only streaming checkpoints. A final ordinary Message carrying the
+	// same DraftID replaces the indexed message and removes this transient fold
+	// state; the map itself is fully replay-derived and never serialized.
+	assistantDrafts map[string]*assistantDraftState
 
 	// liveUsages only holds calls appended since this Session handle was
 	// opened. A UsageCursor can therefore name an exact live interval without
@@ -226,6 +301,10 @@ type Session struct {
 	// truncated counts bytes discarded by replay because the tail of the log was
 	// unreadable. Non-zero means the user lost recorded work and must be told.
 	truncated int64
+
+	// replayLimit is inherited from the Store that opens this handle. It is not
+	// durable policy; zero selects the production limits.
+	replayLimit replayLimits
 }
 
 type sequencedUsage struct {
@@ -246,12 +325,25 @@ type UsageCursor struct {
 // in force, so a cost recorded in this log stays checkable against the data
 // that produced it rather than whatever is current when it is read back.
 func (s *Store) Create(workspace string, target provider.RouteTargetID, catalogRevision string) (*Session, error) {
+	return s.create(workspace, target, catalogRevision, false)
+}
+
+// CreateStaged starts a durable session that is invisible to List, Latest,
+// Open, and read-only replay until its creating handle calls PublishDurably. It
+// is the construction primitive for clear, compact, fork, retry, and race adoption:
+// a failed or crashed operation may leave bytes for diagnosis, but can never
+// hijack --continue.
+func (s *Store) CreateStaged(workspace string, target provider.RouteTargetID, catalogRevision string) (*Session, error) {
+	return s.create(workspace, target, catalogRevision, true)
+}
+
+func (s *Store) create(workspace string, target provider.RouteTargetID, catalogRevision string, staged bool) (*Session, error) {
 	workspace, err := filepath.Abs(workspace)
 	if err != nil {
 		return nil, err
 	}
 	dir := filepath.Join(s.root, workspaceKey(workspace))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := ensurePrivateSessionDirectory(dir); err != nil {
 		return nil, err
 	}
 
@@ -260,30 +352,37 @@ func (s *Store) Create(workspace string, target provider.RouteTargetID, catalogR
 		return nil, err
 	}
 	path := filepath.Join(dir, id+".log")
+	publicationID := ""
+	if staged {
+		publicationID, err = newPublicationID()
+		if err != nil {
+			return nil, err
+		}
+	}
 
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := createPrivateSessionFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("creating session file: %w", err)
 	}
 	if err := acquireLock(f); err != nil {
-		f.Close()
-		return nil, err
+		return nil, errors.Join(err, discardCreatedSessionFile(f, path, false))
 	}
 	if _, err := fmt.Fprintf(f, "%s %d\n", magic, SchemaVersion); err != nil {
-		releaseLock(f)
-		f.Close()
-		return nil, err
+		return nil, errors.Join(err, discardCreatedSessionFile(f, path, true))
 	}
 
 	sess := &Session{
-		f:    f,
-		path: path,
+		f:                f,
+		path:             path,
+		publicationOwner: publicationID,
 		state: State{
-			ID:              id,
-			Workspace:       workspace,
-			Target:          string(target),
-			CatalogRevision: catalogRevision,
-			CreatedAt:       time.Now().UTC(),
+			ID:                 id,
+			Workspace:          workspace,
+			Target:             string(target),
+			CatalogRevision:    catalogRevision,
+			CreatedAt:          time.Now().UTC(),
+			publicationPending: staged,
+			publicationID:      publicationID,
 		},
 	}
 	err = sess.append(RecordSessionStart, SessionStart{
@@ -292,12 +391,50 @@ func (s *Store) Create(workspace string, target provider.RouteTargetID, catalogR
 		Target:          string(target),
 		Binary:          binaryVersion(),
 		CatalogRevision: catalogRevision,
+		Staged:          staged,
+		PublicationID:   publicationID,
 	})
 	if err != nil {
-		sess.Close()
-		return nil, err
+		sess.closed = true
+		return nil, errors.Join(err, discardCreatedSessionFile(f, path, true))
+	}
+	// File.Sync above makes the session_start bytes durable. The containing
+	// directory is a separate crash-consistency boundary: without syncing it,
+	// Create could return a session whose directory entry disappears on power
+	// loss. Sync the workspace directory first, then the store root that names a
+	// newly-created workspace directory.
+	if err := s.syncCreatedDirectory(dir); err != nil {
+		sess.closed = true
+		return nil, errors.Join(fmt.Errorf("syncing new session directory: %w", err), discardCreatedSessionFile(f, path, true))
+	}
+	if err := s.syncCreatedDirectory(s.root); err != nil {
+		sess.closed = true
+		return nil, errors.Join(fmt.Errorf("syncing session store directory: %w", err), discardCreatedSessionFile(f, path, true))
 	}
 	return sess, nil
+}
+
+func (s *Store) syncCreatedDirectory(path string) error {
+	if s.createDirectorySync != nil {
+		return s.createDirectorySync(path)
+	}
+	return syncSessionDirectory(path)
+}
+
+// discardCreatedSessionFile is only used before a new Session escapes its
+// creator. Identity-checked removal ensures even this error path cannot delete
+// a pathname replacement installed between creation and cleanup.
+func discardCreatedSessionFile(f *os.File, path string, locked bool) error {
+	info, statErr := f.Stat()
+	var unlockErr error
+	if locked {
+		unlockErr = releaseLock(f)
+	}
+	closeErr := f.Close()
+	if statErr != nil {
+		return errors.Join(statErr, unlockErr, closeErr)
+	}
+	return errors.Join(unlockErr, closeErr, removePathIfSame(path, info))
 }
 
 // WorkspaceDir is the per-workspace directory the store keeps logs in,
@@ -310,22 +447,47 @@ func (s *Store) WorkspaceDir(workspace string) (string, error) {
 		return "", err
 	}
 	dir := filepath.Join(s.root, workspaceKey(workspace))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := ensurePrivateSessionDirectory(dir); err != nil {
 		return "", err
 	}
 	return dir, nil
 }
 
-// Open replays a session by ID and reopens it for appending.
+// Open replays a session by ID and reopens it for appending. A caller adopting
+// the transcript into an existing tool runtime must use OpenInWorkspace.
 func (s *Store) Open(id string) (*Session, error) {
-	matches, err := filepath.Glob(filepath.Join(s.root, "*", id+".log"))
+	candidate, err := s.resolveCandidate(id)
 	if err != nil {
 		return nil, err
 	}
-	if len(matches) == 0 {
-		return nil, fmt.Errorf("session %s not found", id)
+	return s.openPath(candidate.path, candidateExpectation{
+		id:        id,
+		workspace: effectiveWorkspace(candidate.start.Workspace, candidate.state.WorkspaceBinding),
+	})
+}
+
+// OpenInWorkspace is the interactive-resume boundary. A session's transcript
+// and the process's tools must name the same workspace: adopting a log from a
+// different workspace would let its next model request drive tools, trust,
+// hooks, MCP, and language services rooted in the wrong tree. Open remains for
+// callers that deliberately rebuild their entire runtime from the returned
+// session's recorded workspace.
+func (s *Store) OpenInWorkspace(id, workspace string) (*Session, error) {
+	workspace, err := cleanAbsoluteWorkspace(workspace)
+	if err != nil {
+		return nil, err
 	}
-	return openPath(matches[0])
+	candidate, err := s.resolveCandidate(id)
+	if err != nil {
+		return nil, err
+	}
+	if !workspaceIdentityMatches(effectiveWorkspace(candidate.start.Workspace, candidate.state.WorkspaceBinding), workspace) {
+		return nil, fmt.Errorf(
+			"session %s belongs to workspace %q, not %q; restart switchboard with -workspace %q to resume it",
+			id, effectiveWorkspace(candidate.start.Workspace, candidate.state.WorkspaceBinding), workspace,
+			effectiveWorkspace(candidate.start.Workspace, candidate.state.WorkspaceBinding))
+	}
+	return s.openPathInWorkspace(candidate.path, id, workspace)
 }
 
 // Latest opens the most recently modified session for a workspace, which is
@@ -335,20 +497,94 @@ func (s *Store) Latest(workspace string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
+	if s.latestAfterList != nil {
+		s.latestAfterList()
+	}
 	if len(infos) == 0 {
 		return nil, ErrNoSessions
+	}
+	// A published retry child with an unresolved execution handoff owns the
+	// workspace even if the source's post-commit outcome note gave that source a
+	// later mtime. Choosing the source beside the child's pre-turn files would
+	// split conversation from workspace. Ambiguous children fail closed rather
+	// than picking one by mtime.
+	if id, _, found, retryErr := unresolvedRetryFromInfos(infos); retryErr != nil {
+		return nil, retryErr
+	} else if found {
+		return s.OpenInWorkspace(id, workspace)
 	}
 	// A completed race keeps both fully accounted answers explicitly
 	// resumable, but --continue must select the branch the user chose rather
 	// than a later-touched alternative. If all records predate this marker,
 	// fall back to the ordinary mtime ordering for compatibility.
-	for _, info := range infos {
-		state, stateErr := ReadState(info.Path)
-		if stateErr == nil && !state.raceAlternative() {
-			return openPath(info.Path)
+	var fallback *Info
+	for i := range infos {
+		info := &infos[i]
+		checked, stateErr := s.validateCandidate(info.Path, candidateExpectation{id: info.ID, workspace: workspace})
+		if stateErr != nil {
+			continue
+		}
+		if fallback == nil {
+			fallback = info
+		}
+		if !checked.state.raceAlternative() {
+			return s.openPathInWorkspace(info.Path, info.ID, workspace)
 		}
 	}
-	return openPath(infos[0].Path)
+	if fallback != nil {
+		return s.openPathInWorkspace(fallback.Path, fallback.ID, workspace)
+	}
+	// If every listed session is integrity-blocked, surface the newest one's
+	// exact refusal rather than pretending the workspace has no history.
+	return s.openPathInWorkspace(infos[0].Path, infos[0].ID, workspace)
+}
+
+// UnresolvedRetry returns the published child whose execution handoff still
+// governs the workspace. It is read-only: default startup uses it before
+// deciding whether to create a fresh session, while an explicit -resume keeps
+// the user's chosen conversation.
+func (s *Store) UnresolvedRetry(workspace string) (string, RetryIntentStatus, bool, error) {
+	infos, err := s.List(workspace)
+	if err != nil {
+		return "", "", false, err
+	}
+	return unresolvedRetryFromInfos(infos)
+}
+
+// unresolvedRetryFromInfos deliberately consumes the same descriptor-stable
+// inventory snapshot that supplied Latest's modification ordering. Re-listing
+// here can combine an old order with a newer completed retry status and resume
+// the source beside the child's already-published workspace state.
+func unresolvedRetryFromInfos(infos []Info) (string, RetryIntentStatus, bool, error) {
+	type unresolved struct {
+		id     string
+		status RetryIntentStatus
+	}
+	var found []unresolved
+	for _, info := range infos {
+		if info.Health.ReplayLimit {
+			return "", "", false, fmt.Errorf("session %s exceeds the cumulative replay limit; automatic continue cannot prove workspace retry state: %w", info.ID, ErrSessionReplayTooLarge)
+		}
+		if info.Health.RetryIntent == "" {
+			continue
+		}
+		if info.Health.CorruptRecord {
+			return "", "", false, fmt.Errorf("unresolved retry child %s is corrupt or unreadable: %w", info.ID, ErrCorruptRecord)
+		}
+		found = append(found, unresolved{id: info.ID, status: info.Health.RetryIntent})
+	}
+	switch len(found) {
+	case 0:
+		return "", "", false, nil
+	case 1:
+		return found[0].id, found[0].status, true, nil
+	default:
+		ids := make([]string, len(found))
+		for i := range found {
+			ids[i] = found[i].id
+		}
+		return "", "", false, fmt.Errorf("workspace has %d unresolved retry children (%s); refusing to guess", len(found), strings.Join(ids, ", "))
+	}
 }
 
 type Info struct {
@@ -356,15 +592,17 @@ type Info struct {
 	Path     string
 	Modified time.Time
 	Size     int64
+	Health   ResumeHealth
 }
 
 // ListAll returns every workspace's sessions, keyed by the workspace path
 // each log's own header records. The store's directories are content
 // hashes, so the answer comes from the logs rather than from names that
-// never held it; a directory whose logs are all unreadable is skipped,
-// the same posture List takes per file.
+// never held it. A log whose complete start binds a valid identity remains
+// listed when later corruption blocks resume; a header or start too damaged to
+// establish ownership is skipped, the same posture List takes per file.
 func (s *Store) ListAll() (map[string][]Info, error) {
-	dirs, err := os.ReadDir(s.root)
+	dirs, err := readSessionDirectory(s.root, maxSessionWorkspaceDirectories)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -376,8 +614,11 @@ func (s *Store) ListAll() (map[string][]Info, error) {
 		if !d.IsDir() {
 			continue
 		}
-		entries, err := os.ReadDir(filepath.Join(s.root, d.Name()))
+		entries, err := readSessionDirectory(filepath.Join(s.root, d.Name()), maxSessionDirectoryEntries)
 		if err != nil {
+			if errors.Is(err, ErrSessionInventoryTooLarge) {
+				return nil, err
+			}
 			continue
 		}
 		for _, e := range entries {
@@ -385,35 +626,45 @@ func (s *Store) ListAll() (map[string][]Info, error) {
 				continue
 			}
 			path := filepath.Join(s.root, d.Name(), e.Name())
-			if !hasValidHeader(path) {
+			id := strings.TrimSuffix(e.Name(), ".log")
+			checked, err := s.validateCandidate(path, candidateExpectation{id: id})
+			if err != nil && !checked.blockedForInventory() {
 				continue
 			}
-			state, err := ReadState(path)
-			if err != nil || state.RaceBranchPending() {
+			start, state := checked.start, checked.state
+			if state.RaceBranchPending() || state.ID != start.ID || state.Workspace != start.Workspace {
 				continue
 			}
-			fi, err := e.Info()
-			if err != nil {
+			fi := checked.fileInfo
+			if fi == nil {
 				continue
 			}
-			out[state.Workspace] = append(out[state.Workspace], Info{
-				ID:       strings.TrimSuffix(e.Name(), ".log"),
+			health := ResumeHealthForState(state, checked.recoveredCorruptTail)
+			health.CorruptRecord = checked.blockedByCorruption
+			health.ReplayLimit = checked.blockedByReplayLimit
+			workspace := effectiveWorkspace(start.Workspace, state.WorkspaceBinding)
+			out[workspace] = append(out[workspace], Info{
+				ID:       start.ID,
 				Path:     path,
 				Modified: fi.ModTime(),
 				Size:     fi.Size(),
+				Health:   health,
 			})
 		}
 	}
 	return out, nil
 }
 
-// List returns a workspace's sessions, most recent first.
+// List returns a workspace's published session inventory, most recent first.
+// A log with a validated identity and later complete corruption remains in the
+// inventory with Health.CorruptRecord set; opening or fully replaying it still
+// fails closed.
 func (s *Store) List(workspace string) ([]Info, error) {
-	workspace, err := filepath.Abs(workspace)
+	workspace, err := cleanAbsoluteWorkspace(workspace)
 	if err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(filepath.Join(s.root, workspaceKey(workspace)))
+	dirs, err := readSessionDirectory(s.root, maxSessionWorkspaceDirectories)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -422,31 +673,61 @@ func (s *Store) List(workspace string) ([]Info, error) {
 	}
 
 	var infos []Info
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".log") {
+	seen := make(map[string]string)
+	for _, dir := range dirs {
+		if !dir.IsDir() {
 			continue
 		}
-		fi, err := e.Info()
-		if err != nil {
+		entries, readErr := readSessionDirectory(filepath.Join(s.root, dir.Name()), maxSessionDirectoryEntries)
+		if readErr != nil {
+			if errors.Is(readErr, ErrSessionInventoryTooLarge) {
+				return nil, readErr
+			}
+			// Preserve the exact directory's historical error behavior. An
+			// unrelated or obsolete alias directory cannot make this workspace's
+			// inventory unavailable merely because it is unreadable.
+			if dir.Name() == workspaceKey(workspace) {
+				return nil, readErr
+			}
 			continue
 		}
-		// A crash between creating the file and syncing its header leaves a stub
-		// that cannot be replayed. Skipping it keeps `--continue` from resuming
-		// into a parse failure on a session that never held anything.
-		path := filepath.Join(s.root, workspaceKey(workspace), e.Name())
-		if !hasValidHeader(path) {
-			continue
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".log") {
+				continue
+			}
+			// A candidate needs its complete first session_start, not merely the
+			// magic header. Validation also binds the physical log to its immutable
+			// start directory, then proves either an exact workspace binding or a
+			// live same-directory legacy alias.
+			path := filepath.Join(s.root, dir.Name(), e.Name())
+			id := strings.TrimSuffix(e.Name(), ".log")
+			checked, candidateErr := s.validateCandidate(path, candidateExpectation{id: id, workspace: workspace})
+			if candidateErr != nil && !checked.blockedForInventory() {
+				continue
+			}
+			start, state := checked.start, checked.state
+			if state.RaceBranchPending() || state.ID != start.ID || state.Workspace != start.Workspace {
+				continue
+			}
+			fi := checked.fileInfo
+			if fi == nil {
+				continue
+			}
+			if previous, duplicate := seen[start.ID]; duplicate {
+				return nil, fmt.Errorf("session %s is ambiguous between %s and %s", start.ID, previous, path)
+			}
+			seen[start.ID] = path
+			health := ResumeHealthForState(state, checked.recoveredCorruptTail)
+			health.CorruptRecord = checked.blockedByCorruption
+			health.ReplayLimit = checked.blockedByReplayLimit
+			infos = append(infos, Info{
+				ID:       start.ID,
+				Path:     path,
+				Modified: fi.ModTime(),
+				Size:     fi.Size(),
+				Health:   health,
+			})
 		}
-		state, err := ReadState(path)
-		if err != nil || state.RaceBranchPending() {
-			continue
-		}
-		infos = append(infos, Info{
-			ID:       strings.TrimSuffix(e.Name(), ".log"),
-			Path:     path,
-			Modified: fi.ModTime(),
-			Size:     fi.Size(),
-		})
 	}
 	// Modification time first, then the id, because a filesystem can stamp two
 	// files in the same tick and mtime alone would then leave `--continue`
@@ -463,22 +744,98 @@ func (s *Store) List(workspace string) ([]Info, error) {
 	return infos, nil
 }
 
-func hasValidHeader(path string) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return false
+func readSessionDirectory(path string, limit int) ([]os.DirEntry, error) {
+	if limit < 1 {
+		return nil, fmt.Errorf("session inventory limit must be positive")
 	}
-	defer f.Close()
-	line, err := bufio.NewReader(f).ReadString('\n')
-	return err == nil && strings.HasPrefix(line, magic+" ")
+	root, err := rootedfs.OpenRoot(path)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	directory, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer directory.Close()
+	entries := make([]os.DirEntry, 0, min(limit, sessionDirectoryReadBatch))
+	for {
+		batch, readErr := directory.ReadDir(sessionDirectoryReadBatch)
+		entries = append(entries, batch...)
+		if len(entries) > limit {
+			return nil, fmt.Errorf("%w: %s contains more than %d entries; archive stale sessions or move unrelated files", ErrSessionInventoryTooLarge, path, limit)
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	return entries, nil
 }
 
-func openPath(path string) (*Session, error) {
-	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+// openPathInWorkspace is the writable compatibility boundary for a session
+// discovered through an old symlink spelling. The append lock and a second
+// same-directory proof come first; only then is the canonical binding made
+// durable. A later run can use that record even if the legacy alias is gone.
+func (s *Store) openPathInWorkspace(path, id, workspace string) (*Session, error) {
+	sess, err := s.openPath(path, candidateExpectation{id: id, workspace: workspace})
+	if err != nil {
+		return nil, err
+	}
+	state := sess.State()
+	if state.WorkspaceBinding == workspace || state.Workspace == workspace {
+		return sess, nil
+	}
+	if err := sess.AppendWorkspaceBinding(workspace); err != nil {
+		return nil, errors.Join(fmt.Errorf("recording canonical workspace binding: %w", err), sess.Close())
+	}
+	return sess, nil
+}
+
+func (s *Store) openPath(path string, expect candidateExpectation) (*Session, error) {
+	f, err := openSessionLog(path, true)
 	if err != nil {
 		return nil, err
 	}
 	if err := acquireLock(f); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if err := verifyCurrentSessionLogPath(f, path); err != nil {
+		releaseLock(f)
+		f.Close()
+		return nil, err
+	}
+	logStamp, err := captureStablePublicationLogStamp(f, path)
+	if err != nil {
+		releaseLock(f)
+		f.Close()
+		return nil, err
+	}
+	// Recheck identity under the append lock. List/Open discovery is read-only
+	// and may race a path replacement; no migration or incomplete-tail repair
+	// is allowed until the locked file proves it is the chosen session.
+	checked, err := s.validateCandidateFile(f, path, expect)
+	if err != nil {
+		releaseLock(f)
+		f.Close()
+		return nil, err
+	}
+	if err := verifyPublicationLogStamp(f, path, logStamp); err != nil {
+		releaseLock(f)
+		f.Close()
+		return nil, err
+	}
+	// A complete marker is the visibility commit, but bytes observed after a
+	// crash are not necessarily durable. Before migration, torn-tail repair, or
+	// any reconciliation append can mutate the log, flush the exact marker and
+	// its bound parent directory. This is the one writable adoption boundary
+	// shared by Open, OpenInWorkspace, Latest, and every staged-child workflow.
+	if err := s.ensurePublishedSessionDurableForOpen(f, path, checked.start, logStamp); err != nil {
+		releaseLock(f)
 		f.Close()
 		return nil, err
 	}
@@ -489,48 +846,51 @@ func openPath(path string) (*Session, error) {
 		return nil, err
 	}
 
-	sess := &Session{f: f, path: path}
+	sess := &Session{f: f, path: path, replayLimit: s.replayLimit}
 	if err := sess.replay(); err != nil {
 		releaseLock(f)
 		f.Close()
 		return nil, err
 	}
+	// validateCandidateFile proved the staged sidecar under the append lock.
+	// Replay folds immutable start provenance, so clear only the live pending
+	// bit without granting this reopened handle publication ownership.
+	sess.state.publicationPending = false
 	if sess.state.raceBranchPending {
 		releaseLock(f)
 		f.Close()
 		return nil, fmt.Errorf("%w: origin session %s", ErrRaceBranchPending, sess.state.raceBranchOrigin)
+	}
+	// Open is the writable resume boundary. Repair only after replay has
+	// truncated a torn frame and after a pending race branch has been refused;
+	// read-only List/ReadState paths never reach this append.
+	if _, err := sess.ReconcileInterruptedToolCalls(); err != nil {
+		_ = sess.Close()
+		return nil, fmt.Errorf("recovering interrupted tool calls: %w", err)
 	}
 	return sess, nil
 }
 
 // migrateForAppend upgrades old readable logs before this process is allowed
 // to append records whose execution semantics older binaries cannot preserve.
-// Schemas 1 through 4 have same-width headers, so the version byte can be
+// Schemas 1 through 5 have same-width headers, so the version byte can be
 // replaced in place while the file is exclusively locked. This works on
 // Windows too, where replacing the path of an open, non-share-delete file is
 // not permitted. Sync completes the upgrade
-// before any schema-4 record may be appended.
+// before any schema-5 record may be appended.
 func migrateForAppend(old *os.File, path string) (*os.File, error) {
 	if _, err := old.Seek(0, io.SeekStart); err != nil {
 		return old, err
 	}
 	r := bufio.NewReader(old)
-	header, err := r.ReadString('\n')
+	header, version, err := readSessionHeader(r, path)
 	if err != nil {
-		return old, fmt.Errorf("reading session header: %w", err)
-	}
-	var gotMagic string
-	var version int
-	if _, err := fmt.Sscanf(strings.TrimSpace(header), "%s %d", &gotMagic, &version); err != nil || gotMagic != magic {
-		return old, fmt.Errorf("%s is not a switchboard session log", path)
-	}
-	if version > SchemaVersion {
-		return old, fmt.Errorf("%w: log is schema %d, this binary understands %d", ErrSchemaTooNew, version, SchemaVersion)
+		return old, err
 	}
 	if version == SchemaVersion {
 		return old, nil
 	}
-	if version != 1 && version != 2 && version != 3 {
+	if version != 1 && version != 2 && version != 3 && version != 4 {
 		return old, fmt.Errorf("cannot migrate session schema %d to %d", version, SchemaVersion)
 	}
 	oldHeader := []byte(header)
@@ -554,42 +914,43 @@ func migrateForAppend(old *os.File, path string) (*os.File, error) {
 	return old, nil
 }
 
-// replay folds the log into state, truncating at the first unreadable record.
+// replay folds the log into state. It truncates only a provably incomplete
+// final frame; a complete corrupt frame is preserved and refuses the resume.
 func (s *Session) replay() error {
 	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
 	r := bufio.NewReader(s.f)
 
-	header, err := r.ReadString('\n')
+	header, _, err := readSessionHeader(r, s.path)
 	if err != nil {
-		return fmt.Errorf("reading session header: %w", err)
-	}
-	var gotMagic string
-	var version int
-	if _, err := fmt.Sscanf(strings.TrimSpace(header), "%s %d", &gotMagic, &version); err != nil || gotMagic != magic {
-		return fmt.Errorf("%s is not a switchboard session log", s.path)
-	}
-	if version > SchemaVersion {
-		return fmt.Errorf("%w: log is schema %d, this binary understands %d", ErrSchemaTooNew, version, SchemaVersion)
+		return err
 	}
 
 	offset := int64(len(header))
+	lastSeq := 0
+	budget := newReplayBudget(s.replayLimit, len(header))
 	for {
-		rec, consumed, err := decodeRecord(r)
+		rec, consumed, err := budget.decode(r, &lastSeq)
 		if errors.Is(err, io.EOF) {
 			break
 		}
-		if errors.Is(err, ErrCorruptRecord) {
+		if errors.Is(err, errTornFinalRecord) {
 			size, statErr := s.f.Seek(0, io.SeekEnd)
 			if statErr != nil {
 				return statErr
 			}
 			s.truncated = size - offset
 			if err := s.f.Truncate(offset); err != nil {
-				return fmt.Errorf("truncating corrupt log at %d: %w", offset, err)
+				return fmt.Errorf("truncating incomplete final frame at %d: %w", offset, err)
+			}
+			if err := s.f.Sync(); err != nil {
+				return fmt.Errorf("syncing incomplete-frame repair at %d: %w", offset, err)
 			}
 			break
+		}
+		if errors.Is(err, ErrCorruptRecord) {
+			return fmt.Errorf("%s contains a complete corrupt record at byte %d; original log preserved: %w", s.path, offset, err)
 		}
 		if err != nil {
 			return err
@@ -619,6 +980,8 @@ func (s *Session) apply(rec Record) error {
 		s.state.Target = p.Target
 		s.state.CatalogRevision = p.CatalogRevision
 		s.state.CreatedAt = rec.At
+		s.state.publicationPending = p.Staged
+		s.state.publicationID = p.PublicationID
 	case RecordMessage:
 		var m provider.Message
 		if err := json.Unmarshal(rec.Payload, &m); err != nil {
@@ -631,7 +994,17 @@ func (s *Session) apply(rec Record) error {
 			}
 			s.state.ContinuityRef = m.ContinuityRef
 		}
-		s.state.Messages = append(s.state.Messages, m)
+		if err := s.applyMessageState(m); err != nil {
+			return fmt.Errorf("message in record %d: %w", rec.Seq, err)
+		}
+	case RecordAssistantDraft:
+		checkpoint, err := decodeAssistantDraft(rec.Payload)
+		if err != nil {
+			return fmt.Errorf("assistant draft in record %d: %w", rec.Seq, err)
+		}
+		if err := s.applyAssistantDraft(checkpoint); err != nil {
+			return fmt.Errorf("assistant draft in record %d: %w", rec.Seq, err)
+		}
 	case RecordMessageContinuity:
 		m, capsule, err := decodeMessageContinuity(rec.Payload)
 		if err != nil {
@@ -734,7 +1107,23 @@ func (s *Session) apply(rec Record) error {
 		if p.Tier == "" || p.Target == "" {
 			return fmt.Errorf("runtime binding in record %d has an empty tier or target", rec.Seq)
 		}
+		// The optional note belongs to this record's audit timeline. Keeping it
+		// out of State preserves the equality and resume semantics of a binding.
+		p.Note = nil
 		s.state.RuntimeBinding = p
+	case RecordWorkspaceBinding:
+		var p WorkspaceBinding
+		if err := json.Unmarshal(rec.Payload, &p); err != nil {
+			return err
+		}
+		workspace, err := cleanAbsoluteWorkspace(p.Workspace)
+		if err != nil || workspace != p.Workspace {
+			return fmt.Errorf("workspace binding in record %d has an invalid workspace %q", rec.Seq, p.Workspace)
+		}
+		if s.state.WorkspaceBinding != "" && s.state.WorkspaceBinding != p.Workspace {
+			return fmt.Errorf("workspace binding in record %d changes canonical workspace from %q to %q", rec.Seq, s.state.WorkspaceBinding, p.Workspace)
+		}
+		s.state.WorkspaceBinding = p.Workspace
 	case RecordContinuity:
 		p, err := continuity.DecodeStored(rec.Payload)
 		if err != nil {
@@ -745,6 +1134,14 @@ func (s *Session) apply(rec Record) error {
 		}
 		cloned := continuity.Clone(p)
 		s.state.Continuity = &cloned
+	case RecordRetryIntent:
+		var p RetryIntent
+		if err := json.Unmarshal(rec.Payload, &p); err != nil {
+			return fmt.Errorf("retry intent in record %d: %w", rec.Seq, err)
+		}
+		if err := s.state.applyRetryIntent(p); err != nil {
+			return fmt.Errorf("retry intent in record %d: %w", rec.Seq, err)
+		}
 	case RecordPin:
 		var p Pin
 		if err := json.Unmarshal(rec.Payload, &p); err != nil {
@@ -769,9 +1166,12 @@ func (s *Session) append(t RecordType, payload any) error {
 	if err != nil {
 		return err
 	}
-	s.seq++
+	nextSeq, err := s.nextRecordSequence()
+	if err != nil {
+		return err
+	}
 	frame, err := encodeRecord(Record{
-		Seq:     s.seq,
+		Seq:     nextSeq,
 		At:      time.Now().UTC(),
 		Type:    t,
 		Payload: raw,
@@ -779,25 +1179,38 @@ func (s *Session) append(t RecordType, payload any) error {
 	if err != nil {
 		return err
 	}
-	if err := s.writeFrame(frame); err != nil {
+	if err := s.writeFrame(frame, nextSeq); err != nil {
 		return err
 	}
 	// Records are few per turn, so paying for durability here is cheap and it is
 	// what makes resume-after-interruption a guarantee rather than a hope.
 	if err := s.f.Sync(); err != nil {
-		s.poisoned = fmt.Errorf("syncing record %d: %w", s.seq, err)
+		s.poisoned = fmt.Errorf("syncing record %d: %w", nextSeq, err)
 		return fmt.Errorf("%w: %v", ErrSessionPoisoned, s.poisoned)
 	}
+	// Encoding is fallible before a byte is written. Commit the in-memory
+	// sequence only after the complete frame is durable, otherwise a rejected
+	// oversized record leaves a gap that makes the next valid append impossible
+	// to replay.
+	s.seq = nextSeq
 	return nil
 }
 
-func (s *Session) writeFrame(frame []byte) error {
+func (s *Session) nextRecordSequence() (int, error) {
+	if s.seq < 0 || s.seq == math.MaxInt {
+		s.poisoned = fmt.Errorf("record sequence cannot advance after %d", s.seq)
+		return 0, fmt.Errorf("%w: %v", ErrSessionPoisoned, s.poisoned)
+	}
+	return s.seq + 1, nil
+}
+
+func (s *Session) writeFrame(frame []byte, seq int) error {
 	n, err := s.f.Write(frame)
 	if err == nil && n != len(frame) {
 		err = io.ErrShortWrite
 	}
 	if err != nil {
-		s.poisoned = fmt.Errorf("writing record %d (%d of %d bytes): %w", s.seq, n, len(frame), err)
+		s.poisoned = fmt.Errorf("writing record %d (%d of %d bytes): %w", seq, n, len(frame), err)
 		return fmt.Errorf("%w: %v", ErrSessionPoisoned, s.poisoned)
 	}
 	return nil
@@ -807,15 +1220,24 @@ func (s *Session) AppendMessage(m provider.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m = provider.CloneMessage(m)
+	if err := validateRetryOpeningAppend(s.state, m); err != nil {
+		return err
+	}
 	if m.ContinuityRef != "" {
 		if err := validateContinuityDelivery(s.state, m); err != nil {
 			return err
 		}
 	}
+	if err := s.validateDraftFinal(m); err != nil {
+		return err
+	}
 	if err := s.append(RecordMessage, m); err != nil {
 		return err
 	}
-	s.state.Messages = append(s.state.Messages, m)
+	if err := s.applyMessageState(m); err != nil {
+		s.poisoned = fmt.Errorf("applying durable message record %d: %w", s.seq, err)
+		return fmt.Errorf("%w: %v", ErrSessionPoisoned, s.poisoned)
+	}
 	if m.ContinuityRef != "" {
 		s.state.ContinuityRef = m.ContinuityRef
 	}
@@ -877,8 +1299,8 @@ func hasSuccessfulTodoResult(message provider.Message) bool {
 // StampContinuityOpening folds the one pending capsule into a complete user
 // opening before routing or token estimation. The dedicated first text block
 // and reference are an atomic delivery stamp: AppendMessage and replay accept
-// the reference only while that exact capsule is current, undelivered, and
-// rendered byte-for-byte in this message.
+// the reference only while that exact capsule is current, undelivered,
+// non-stale, and rendered byte-for-byte in this message.
 func (s *Session) StampContinuityOpening(opening provider.Message) (provider.Message, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -893,7 +1315,7 @@ func (s *Session) StampContinuityOpening(opening provider.Message) (provider.Mes
 		return opening, true, nil
 	}
 	current := s.state.Continuity
-	if current == nil || current.Cleared || current.ID == s.state.ContinuityRef {
+	if current == nil || current.Cleared || current.ID == s.state.ContinuityRef || continuityStaleForResume(s.state) {
 		return opening, false, nil
 	}
 	rendered, err := continuityDeliveryText(*current)
@@ -920,6 +1342,9 @@ func validateContinuityDelivery(state State, message provider.Message) error {
 	}
 	if state.ContinuityRef == message.ContinuityRef {
 		return fmt.Errorf("continuity capsule %s was already delivered", message.ContinuityRef)
+	}
+	if continuityStaleForResume(state) {
+		return fmt.Errorf("message refers to continuity made stale by later user input")
 	}
 	rendered, err := continuityDeliveryText(*state.Continuity)
 	if err != nil {
@@ -1030,7 +1455,11 @@ func (s *Session) AppendUsageRecord(u Usage) (Usage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if u.CallID == "" {
-		u.CallID = fmt.Sprintf("call:%s:%d", s.state.ID, s.seq+1)
+		nextSeq, err := s.nextRecordSequence()
+		if err != nil {
+			return Usage{}, err
+		}
+		u.CallID = fmt.Sprintf("call:%s:%d", s.state.ID, nextSeq)
 	}
 	usage, err := s.state.checkedUsage(u)
 	if err != nil {
@@ -1080,7 +1509,11 @@ func (s *Session) BeginBudgetAttempt(costMicroUSD int64) (string, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	id := fmt.Sprintf("%s:%d", s.state.ID, s.seq+1)
+	nextSeq, err := s.nextRecordSequence()
+	if err != nil {
+		return "", err
+	}
+	id := fmt.Sprintf("%s:%d", s.state.ID, nextSeq)
 	p := BudgetAttempt{ID: id, CostMicroUSD: costMicroUSD}
 	if err := s.state.validateBudgetAttempt(p); err != nil {
 		return "", err
@@ -1396,19 +1829,68 @@ func (s *Session) AppendNote(level, text string) error {
 // only for permanent manual actions or committed automatic moves; temporary
 // one-turn and process-only inference-parameter overrides deliberately do not.
 func (s *Session) AppendRuntimeBinding(tier string, target provider.RouteTargetID, pinned bool) error {
+	return s.appendRuntimeBinding(tier, target, pinned, nil)
+}
+
+// AppendRuntimeBindingNote commits a moving binding and the audit sentence
+// that explains it in one framed append. A fallback substitution must not
+// leave either a false note with no binding or a binding whose substitution
+// disappeared from the durable timeline.
+func (s *Session) AppendRuntimeBindingNote(tier string, target provider.RouteTargetID, pinned bool, level, text string) error {
+	if level == "" || text == "" {
+		return fmt.Errorf("runtime binding note requires a level and text")
+	}
+	return s.appendRuntimeBinding(tier, target, pinned, &Note{Level: level, Text: text})
+}
+
+func (s *Session) appendRuntimeBinding(tier string, target provider.RouteTargetID, pinned bool, note *Note) error {
 	if tier == "" || target == "" {
 		return fmt.Errorf("runtime binding requires a tier and target")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p := RuntimeBinding{Tier: tier, Target: target, Pinned: pinned}
-	if p == s.state.RuntimeBinding {
+	p := RuntimeBinding{Tier: tier, Target: target, Pinned: pinned, Note: note}
+	stateBinding := p
+	stateBinding.Note = nil
+	if note == nil && stateBinding == s.state.RuntimeBinding {
 		return nil
 	}
 	if err := s.append(RecordRuntimeBinding, p); err != nil {
 		return err
 	}
-	s.state.RuntimeBinding = p
+	s.state.RuntimeBinding = stateBinding
+	return nil
+}
+
+// AppendWorkspaceBinding durably records the canonical identity of a legacy
+// session opened through a symlink spelling. The immutable start path must
+// still name the same live directory at this append-locked boundary; after the
+// record is synced, that one canonical binding is authoritative even if the
+// obsolete alias is later removed.
+func (s *Session) AppendWorkspaceBinding(workspace string) error {
+	workspace, err := cleanAbsoluteWorkspace(workspace)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.WorkspaceBinding != "" {
+		if s.state.WorkspaceBinding == workspace {
+			return nil
+		}
+		return fmt.Errorf("session is already bound to canonical workspace %q", s.state.WorkspaceBinding)
+	}
+	if s.state.Workspace == workspace {
+		return nil
+	}
+	if !workspaceIdentityMatches(s.state.Workspace, workspace) {
+		return fmt.Errorf("legacy workspace %q is not the same live directory as %q", s.state.Workspace, workspace)
+	}
+	p := WorkspaceBinding{Workspace: workspace}
+	if err := s.append(RecordWorkspaceBinding, p); err != nil {
+		return err
+	}
+	s.state.WorkspaceBinding = workspace
 	return nil
 }
 
@@ -1454,11 +1936,24 @@ func (s *Session) State() State {
 	defer s.mu.Unlock()
 	out := s.state
 	out.Messages = provider.CloneMessages(s.state.Messages)
+	// Active assistant drafts keep immutable text chunks off the canonical
+	// message until a reader asks for state. Materialize each one exactly once
+	// for this snapshot; checkpoint frequency therefore does not repeatedly
+	// copy the complete growing prefix.
+	for _, draft := range s.assistantDrafts {
+		if draft != nil && draft.messageIndex >= 0 && draft.messageIndex < len(out.Messages) {
+			out.Messages[draft.messageIndex] = s.materializeAssistantDraft(draft)
+		}
+	}
 	out.Pins = append([]Pin(nil), s.state.Pins...)
 	out.UsageTargets = append([]string(nil), s.state.UsageTargets...)
 	if s.state.Continuity != nil {
 		copy := continuity.Clone(*s.state.Continuity)
 		out.Continuity = &copy
+	}
+	if s.state.RetryIntent != nil {
+		copy := *s.state.RetryIntent
+		out.RetryIntent = &copy
 	}
 	if s.state.pendingBudgetAttempts != nil {
 		out.pendingBudgetAttempts = make(map[string]int64, len(s.state.pendingBudgetAttempts))
@@ -1482,12 +1977,28 @@ func (s *Session) State() State {
 }
 
 // CurrentContinuity returns an isolated snapshot of the latest capsule without
-// copying the entire conversation. Session binding and post-tool persistence
-// use this narrow projection on potentially long-running sessions.
+// copying the entire conversation. Audit, lineage, and post-tool persistence
+// use this narrow projection on potentially long-running sessions; generic
+// binding uses ResumableContinuity so later user authority wins.
 func (s *Session) CurrentContinuity() *continuity.Capsule {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.state.Continuity == nil {
+		return nil
+	}
+	copy := continuity.Clone(*s.state.Continuity)
+	return &copy
+}
+
+// ResumableContinuity returns the latest capsule only while no later
+// authoritative user input has made it stale. The capsule remains available
+// through CurrentContinuity for audit, lineage, and explicit surfaces; this
+// projection is solely the fail-closed state a generic session bind may
+// restore into the live todo registry.
+func (s *Session) ResumableContinuity() *continuity.Capsule {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.Continuity == nil || s.state.Continuity.Cleared || continuityStaleForResume(s.state) {
 		return nil
 	}
 	copy := continuity.Clone(*s.state.Continuity)
@@ -1504,8 +2015,17 @@ func (s *Session) TruncatedBytes() int64 { return s.truncated }
 func (s *Session) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	releaseLock(s.f)
-	return s.f.Close()
+	return s.closeLocked()
+}
+
+func (s *Session) closeLocked() error {
+	if s.closed || s.f == nil {
+		return nil
+	}
+	s.closed = true
+	unlockErr := releaseLock(s.f)
+	closeErr := s.f.Close()
+	return errors.Join(unlockErr, closeErr)
 }
 
 func workspaceKey(abs string) string {
@@ -1526,6 +2046,37 @@ func newID() (string, error) {
 	// moment ordering is needed. The random suffix keeps two sessions started
 	// in the same microsecond from colliding; it is not what orders them.
 	return time.Now().UTC().Format("20060102T150405.000000") + "-" + hex.EncodeToString(suffix[:]), nil
+}
+
+// validSessionID accepts only IDs generated by Switchboard. The seconds-only
+// shape is retained for pre-microsecond logs; both shapes require the exact
+// lowercase random suffix. Callers must apply this before any Glob or path
+// join, not merely after opening a candidate.
+func validSessionID(id string) bool {
+	dash := strings.LastIndexByte(id, '-')
+	var layout string
+	switch dash {
+	case len("20060102T150405"):
+		layout = "20060102T150405"
+	case len("20060102T150405.000000"):
+		layout = "20060102T150405.000000"
+	default:
+		return false
+	}
+	if len(id) != dash+1+8 {
+		return false
+	}
+	prefix, suffix := id[:dash], id[dash+1:]
+	stamp, err := time.Parse(layout, prefix)
+	if err != nil || stamp.Format(layout) != prefix {
+		return false
+	}
+	for _, ch := range suffix {
+		if !('0' <= ch && ch <= '9') && !('a' <= ch && ch <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // binaryVersion records what produced a session so a historical decision can be

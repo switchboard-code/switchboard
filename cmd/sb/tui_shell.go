@@ -8,11 +8,9 @@ package main
 // turn, which keeps every adapter's view of the conversation well-formed.
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -26,18 +24,22 @@ import (
 )
 
 const (
-	shellTimeout   = 60 * time.Second
-	shellOutputCap = 16 << 10
+	shellTimeout               = 60 * time.Second
+	shellOutputCap             = 16 << 10
+	shellCredentialScanOverlap = 256
+	shellCaptureCap            = shellOutputCap + shellCredentialScanOverlap
 )
 
 type shellDoneMsg struct {
-	command   string
-	output    string
-	err       error
-	took      time.Duration
-	result    shellResult
-	operation uint64
-	sourceID  string
+	command        string
+	output         string
+	contextCommand string
+	contextOutput  string
+	err            error
+	took           time.Duration
+	result         shellResult
+	operation      uint64
+	sourceID       string
 }
 
 type shellResultKind string
@@ -66,20 +68,37 @@ type shellResult struct {
 // cleanup return before an unkillable or deliberately detached descendant
 // releases os/exec's copy pipe.
 type shellOutput struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
+	mu        sync.Mutex
+	buf       []byte
+	truncated bool
 }
 
 func (o *shellOutput) Write(p []byte) (int, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return o.buf.Write(p)
+	written := len(p)
+	remaining := shellCaptureCap - len(o.buf)
+	if remaining > 0 {
+		keep := min(remaining, len(p))
+		o.buf = append(o.buf, p[:keep]...)
+	}
+	if len(p) > remaining {
+		o.truncated = true
+	}
+	// os/exec treats a short write as a pipe failure. Bytes beyond the bounded
+	// head are deliberately discarded, so acknowledge the caller's full chunk.
+	return written, nil
 }
 
 func (o *shellOutput) String() string {
+	text, _ := o.snapshot()
+	return text
+}
+
+func (o *shellOutput) snapshot() (string, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return string(append([]byte(nil), o.buf.Bytes()...))
+	return string(append([]byte(nil), o.buf...)), o.truncated
 }
 
 func classifyShellResult(err, contextErr error) shellResult {
@@ -165,7 +184,7 @@ func (r shellResult) contextRecord() string {
 }
 
 func (r shellResult) transcriptDetail(output string) string {
-	output = strings.TrimRight(output, "\n")
+	output = strings.TrimRight(output, "\r\n")
 	if output == "" {
 		return r.summary()
 	}
@@ -181,6 +200,18 @@ func (r shellResult) transcriptDetail(output string) string {
 
 func shellToolID(operation uint64) string {
 	return fmt.Sprintf("shell:%d", operation)
+}
+
+func capShellOutput(text string) string {
+	return capShellOutputWithDiscard(text, false)
+}
+
+func capShellOutputWithDiscard(text string, discarded bool) string {
+	bounded, truncated := truncateBytesAtGrapheme(text, shellOutputCap)
+	if !truncated && !discarded {
+		return bounded
+	}
+	return bounded + fmt.Sprintf("\n[truncated at %d-byte limit]", shellOutputCap)
 }
 
 // runShell executes the command through the user's shell in the workspace.
@@ -205,32 +236,31 @@ func (m *tuiModel) runShell(command string) tea.Cmd {
 	m.tr.scrollToBottom()
 
 	workspace := m.app.workspace
-	return func() tea.Msg {
+	return m.ownOperationCmd(generation, func() tea.Msg {
 		ctx, cancel := context.WithTimeout(opCtx, shellTimeout)
 		defer cancel()
 
-		shell := os.Getenv("SHELL")
-		if shell == "" {
-			shell = "/bin/sh"
-		}
 		start := time.Now()
 		var out shellOutput
-		cmd := exec.Command(shell, "-c", command)
+		cmd := newUserShellCommand(command)
 		cmd.Dir = workspace
 		cmd.Stdout = &out
 		cmd.Stderr = &out
 		err := execution.RunProcess(ctx, cmd)
 		took := time.Since(start)
 
-		text := out.String()
-		if len(text) > shellOutputCap {
-			text = text[:shellOutputCap] + fmt.Sprintf("\n[truncated at %d bytes]", shellOutputCap)
-		}
+		output, discarded := out.snapshot()
 		return shellDoneMsg{
-			command: command, output: text, err: err, took: took,
+			command: command, output: capShellOutputWithDiscard(output, discarded),
+			// Provider/session context gets the unattended-output posture. Scan
+			// the complete values before the byte cap so a boundary-straddling
+			// credential cannot become an undetectable partial prefix.
+			contextCommand: redactCredentialText(command),
+			contextOutput:  capShellOutputWithDiscard(redactCredentialText(output), discarded),
+			err:            err, took: took,
 			result: classifyShellResult(err, ctx.Err()), operation: generation, sourceID: sourceID,
 		}
-	}
+	})
 }
 
 func (m *tuiModel) onShellDone(msg shellDoneMsg) tea.Cmd {
@@ -266,19 +296,23 @@ func (m *tuiModel) onShellDone(msg shellDoneMsg) tea.Cmd {
 		m.tr.scrollToBottom()
 	}
 
+	contextCommand := msg.contextCommand
+	if contextCommand == "" {
+		contextCommand = redactCredentialText(msg.command)
+	}
+	contextOutput := msg.contextOutput
+	if contextOutput == "" && msg.output != "" {
+		contextOutput = redactCredentialText(msg.output)
+	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "$ %s\n%s", msg.command, strings.TrimRight(msg.output, "\n"))
-	fmt.Fprintf(&b, "\n%s", result.contextRecord())
+	fmt.Fprintf(&b, "$ %s\n%s", contextCommand, strings.TrimRight(contextOutput, "\r\n"))
+	fmt.Fprintf(&b, "\n%s", redactCredentialText(result.contextRecord()))
 	m.pendingShell = append(m.pendingShell, b.String())
 	// A shell command has full user authority and can mutate the tree even when
 	// it exits non-zero or is cancelled halfway through. Its completion is the
-	// first sound point to retire both literal-index and semantic snapshots.
-	if m.workspaceRuntime != nil {
-		m.workspaceRuntime.invalidate()
-	}
-	if view, ok := m.full.(*lspView); ok {
-		view.stale = true
-	}
+	// first sound point to retire every source surface and reject loads that
+	// began against the old tree.
+	invalidateRestoredWorkspace(m)
 	if msg.operation == 0 {
 		return nil
 	}

@@ -5,6 +5,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 )
 
 type skillMetadata struct {
@@ -598,7 +600,7 @@ func hasDynamicYAMLKey(front string) bool {
 // directory-shaped skill. Missing metadata means the documented default,
 // true. Present but malformed safety metadata fails closed.
 func codexAllowsImplicit(skillDir string) (bool, error) {
-	root, err := os.OpenRoot(skillDir)
+	root, err := rootedfs.OpenRoot(skillDir)
 	if err != nil {
 		return false, err
 	}

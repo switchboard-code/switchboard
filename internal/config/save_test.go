@@ -1,11 +1,16 @@
 package config
 
 import (
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/switchboard-code/switchboard/internal/credential"
+	"github.com/switchboard-code/switchboard/internal/fileprivacy"
+	"github.com/switchboard-code/switchboard/internal/provider"
 )
 
 // TestSaveRoundTrips is the load-save-load contract: everything the loader
@@ -16,6 +21,7 @@ func TestSaveRoundTrips(t *testing.T) {
 [tiers.t1]
 label = "light"
 model = "ollama/qwen3.5:9b-mlx"
+max_output = 4096
 
 [tiers.t2]
 label = "deep"
@@ -121,7 +127,7 @@ func TestSaveWritesTiersInNumericOrder(t *testing.T) {
 }
 
 func TestSaveOmitsWhatWasNotSet(t *testing.T) {
-	c := &Config{Path: filepath.Join(t.TempDir(), FileName), UpdateCheck: true, UpdateAuto: true}
+	c := &Config{Path: filepath.Join(t.TempDir(), FileName), UpdateCheck: true}
 	if err := c.BindTier("t1", "light", "ollama/small", "", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -132,10 +138,56 @@ func TestSaveOmitsWhatWasNotSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, absent := range []string{"[slots]", "[auth", "[providers", "[updates]", "[ui]", "surface", "effort"} {
+	for _, absent := range []string{"[slots]", "[auth", "[providers", "[updates]", "[ui]", "surface", "effort", "max_output"} {
 		if strings.Contains(string(data), absent) {
 			t.Errorf("%q appears in a file where it carries no information:\n%s", absent, data)
 		}
+	}
+}
+
+func TestAutomaticUpdateDefaultsOffAndExplicitOptInRoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	c, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.UpdateAuto {
+		t.Fatal("a missing auto setting silently enabled executable replacement")
+	}
+	if !c.UpdateCheck {
+		t.Fatal("release notices should remain enabled by default")
+	}
+
+	c.UpdateAuto = true
+	if err := c.Save(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "[updates]") || !strings.Contains(string(data), "auto = true") {
+		t.Fatalf("explicit auto-install opt-in was not persisted:\n%s", data)
+	}
+
+	after, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.UpdateAuto {
+		t.Fatal("explicit auto-install opt-in did not survive reload")
+	}
+
+	after.UpdateAuto = false
+	if err := after.Save(); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "auto =") {
+		t.Fatalf("default-off auto setting should be omitted after opt-out:\n%s", data)
 	}
 }
 
@@ -152,6 +204,159 @@ func TestBindTierReplacesInPlace(t *testing.T) {
 	}
 	if c.Tiers[0].Target.ModelID != "smaller" {
 		t.Errorf("rebinding kept the old target %q", c.Tiers[0].Target.ModelID)
+	}
+}
+
+func TestBindTierWithMaxOutputSetsAndClearsTheCap(t *testing.T) {
+	c := &Config{}
+	if err := c.BindTierWithMaxOutput("t1", "light", "ollama/small", "", "", 2048); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Tiers[0].Target.Params.MaxOutputTokens; got != 2048 {
+		t.Fatalf("max output = %d, want 2048", got)
+	}
+	fallback, err := ParseTarget("ollama/backup", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallback.Params.MaxOutputTokens = 2048
+	c.Tiers[0].Fallbacks = []provider.RouteTarget{fallback}
+	if err := c.BindTier("t1", "light", "ollama/smaller", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Tiers[0].Target.Params.MaxOutputTokens; got != 0 {
+		t.Fatalf("ordinary rebind retained max output %d from another model", got)
+	}
+	if got := c.Tiers[0].Fallbacks[0].Params.MaxOutputTokens; got != 0 {
+		t.Fatalf("ordinary rebind left fallback max output %d out of sync with the rung", got)
+	}
+	before := c.Tiers[0]
+	if err := c.BindTierWithMaxOutput("t1", "light", "ollama/smaller", "", "", -1); err == nil {
+		t.Fatal("negative max output was accepted")
+	}
+	if !reflect.DeepEqual(c.Tiers[0], before) {
+		t.Fatalf("failed binding mutated the tier: before %+v after %+v", before, c.Tiers[0])
+	}
+}
+
+func TestBindTierAndSaveDoesNotPublishAFailedWrite(t *testing.T) {
+	c := &Config{Path: filepath.Join(t.TempDir(), FileName)}
+	if err := c.BindTierWithMaxOutput("t1", "light", "ollama/original", "", "high", 2048); err != nil {
+		t.Fatal(err)
+	}
+	fallback, err := ParseTarget("ollama/backup", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallback.Params.MaxOutputTokens = 2048
+	c.Tiers[0].Fallbacks = []provider.RouteTarget{fallback}
+	before := cloneTiers(c.Tiers)
+
+	// An existing directory cannot be atomically replaced by the temporary
+	// config file, giving this test a portable failure after staging/rendering.
+	c.Path = t.TempDir()
+	pathBefore := c.Path
+	err = c.BindTierAndSave("t1", "light", "ollama/replacement", "", "low", 4096)
+	if err == nil || !strings.Contains(err.Error(), "saving configuration") {
+		t.Fatalf("BindTierAndSave error = %v, want a save failure", err)
+	}
+	if !reflect.DeepEqual(c.Tiers, before) {
+		t.Fatalf("failed durable bind changed the live ladder:\nbefore: %+v\nafter:  %+v", before, c.Tiers)
+	}
+	if c.Path != pathBefore {
+		t.Fatalf("failed durable bind changed Path from %q to %q", pathBefore, c.Path)
+	}
+}
+
+func TestProviderAddressAndSaveDoesNotPublishAFailedWrite(t *testing.T) {
+	key := ProviderSurfaceKey("openaicompat", "generic")
+	c := &Config{
+		Path: t.TempDir(), // a directory cannot be replaced by the config file
+		Providers: map[string]ProviderSettings{
+			key: {BaseURL: "http://original.invalid", ContextWindow: 32_768},
+		},
+	}
+	before := maps.Clone(c.Providers)
+	pathBefore := c.Path
+
+	err := c.SetProviderBaseURLAndSave(key, "http://replacement.invalid/v1")
+	if err == nil || !strings.Contains(err.Error(), "saving configuration") {
+		t.Fatalf("SetProviderBaseURLAndSave error = %v, want save failure", err)
+	}
+	if !reflect.DeepEqual(c.Providers, before) {
+		t.Fatalf("failed durable address change mutated providers:\nbefore: %+v\nafter:  %+v", before, c.Providers)
+	}
+	if c.Path != pathBefore {
+		t.Fatalf("failed durable address change changed Path from %q to %q", pathBefore, c.Path)
+	}
+}
+
+func TestAuthAndSaveDoesNotPublishAFailedWrite(t *testing.T) {
+	original := credential.Settings{Env: "ORIGINAL_API_KEY", Helper: []string{"original-helper"}}
+	c := &Config{
+		Path: t.TempDir(), // a directory cannot be replaced by the config file
+		Auth: map[string]credential.Settings{"openai": original},
+	}
+	before := c.Snapshot().Auth
+	pathBefore := c.Path
+
+	replacement := original
+	replacement.Helper = []string{"replacement-helper"}
+	err := c.SetAuthAndSave("openai", replacement)
+	if err == nil || !strings.Contains(err.Error(), "saving configuration") {
+		t.Fatalf("SetAuthAndSave error = %v, want save failure", err)
+	}
+	if !reflect.DeepEqual(c.Auth, before) {
+		t.Fatalf("failed durable auth change mutated auth:\nbefore: %+v\nafter:  %+v", before, c.Auth)
+	}
+	if c.Path != pathBefore {
+		t.Fatalf("failed durable auth change changed Path from %q to %q", pathBefore, c.Path)
+	}
+}
+
+func TestRemoveTierAndSaveDoesNotPublishAFailedWrite(t *testing.T) {
+	c := &Config{Path: t.TempDir()} // a directory cannot be replaced by the config file
+	if err := c.BindTier("t1", "light", "ollama/original", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.BindTier("t2", "deep", "ollama/larger", "", "high"); err != nil {
+		t.Fatal(err)
+	}
+	before := cloneTiers(c.Tiers)
+	pathBefore := c.Path
+
+	removed, err := c.RemoveTierAndSave("t2")
+	if !removed || err == nil || !strings.Contains(err.Error(), "saving configuration") {
+		t.Fatalf("RemoveTierAndSave = %v, %v; want found rung and save failure", removed, err)
+	}
+	if !reflect.DeepEqual(c.Tiers, before) {
+		t.Fatalf("failed durable removal mutated ladder:\nbefore: %+v\nafter:  %+v", before, c.Tiers)
+	}
+	if c.Path != pathBefore {
+		t.Fatalf("failed durable removal changed Path from %q to %q", pathBefore, c.Path)
+	}
+}
+
+func TestSaveRejectsNegativeMaxOutputWithoutChangingFile(t *testing.T) {
+	path := write(t, "[tiers.t1]\nmodel = \"ollama/small\"\n")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Tiers[0].Target.Params.MaxOutputTokens = -1
+	if err := c.Save(); err == nil || !strings.Contains(err.Error(), "negative max_output") {
+		t.Fatalf("Save error = %v, want negative max_output refusal", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("failed Save changed the existing file:\n%s", after)
 	}
 }
 
@@ -196,11 +401,13 @@ func TestSaveCreatesTheDirectory(t *testing.T) {
 	if err := c.Save(); err != nil {
 		t.Fatalf("first save on a fresh machine has no directory yet: %v", err)
 	}
-	info, err := os.Stat(c.Path)
+	f, err := fileprivacy.Open(c.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("config written with mode %o; it names auth sources and belongs to the user alone", perm)
+	ownerOnly, ownerErr := fileprivacy.IsOwnerOnly(f)
+	closeErr := f.Close()
+	if ownerErr != nil || closeErr != nil || !ownerOnly {
+		t.Errorf("config names auth sources but is not owner-only: owner-only=%v err=%v close=%v", ownerOnly, ownerErr, closeErr)
 	}
 }

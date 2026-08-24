@@ -167,18 +167,8 @@ func (t *astGrepTool) run(ctx context.Context, in astGrepInput, argv []string, p
 	if err != nil {
 		return Result{}, err
 	}
-	if res.TimedOut {
-		return errorf("astgrep timed out; narrow the path or the pattern")
-	}
-	// Exit 1 is grep's own convention, matches-found-none, and the JSON
-	// still arrives; only higher codes are failures.
-	if res.ExitCode > 1 {
-		return errorf("ast-grep failed (exit %d): %s", res.ExitCode, strings.TrimSpace(res.Output))
-	}
-	if res.Truncated {
-		// A truncated stream is not parseable JSON, and guessing at the cut
-		// would misreport positions (§10.3): say so instead.
-		return errorf("the match list was too large to read back; narrow the path or the pattern")
+	if result, stop := astGrepCaptureFailure(res); stop {
+		return result, nil
 	}
 
 	// The runner combines stdout and stderr, so the binary's warnings sit
@@ -228,4 +218,25 @@ func (t *astGrepTool) run(ctx context.Context, in astGrepInput, argv []string, p
 		fmt.Fprintf(&b, "[%d more matches not shown; narrow the path or the pattern]\n", len(matches)-astGrepMaxMatches)
 	}
 	return Result{Content: strings.TrimRight(b.String(), "\n")}, nil
+}
+
+func astGrepCaptureFailure(res execution.Result) (Result, bool) {
+	if res.TimedOut {
+		result, _ := errorf("astgrep timed out; narrow the path or the pattern")
+		return result, true
+	}
+	if res.Truncated {
+		// A truncated stream is neither parseable JSON nor safe diagnostic text:
+		// a credential may cross the capture's omitted middle. Withhold both
+		// retained fragments before considering the process exit code.
+		result, _ := errorf("the match list was too large to read back; narrow the path or the pattern")
+		return result, true
+	}
+	// Exit 1 is grep's own convention, matches-found-none, and the JSON
+	// still arrives; only higher codes are failures.
+	if res.ExitCode > 1 {
+		result, _ := errorf("ast-grep failed (exit %d): %s", res.ExitCode, strings.TrimSpace(res.Output))
+		return result, true
+	}
+	return Result{}, false
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/switchboard-code/switchboard/internal/execution"
 	"github.com/switchboard-code/switchboard/internal/prefix"
 	"github.com/switchboard-code/switchboard/internal/provider"
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 	route "github.com/switchboard-code/switchboard/internal/router"
 	"github.com/switchboard-code/switchboard/internal/session"
 	"github.com/switchboard-code/switchboard/internal/tools"
@@ -111,7 +112,7 @@ verified_at = 2026-08-17T00:00:00Z
 	if err := os.WriteFile(filepath.Join(dir, catalog.UserOverrideFile), []byte(contents.String()), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("HOME", home)
+	isolateTestHome(t, home)
 	cat, err := catalog.Load()
 	if err != nil {
 		t.Fatal(err)
@@ -226,6 +227,50 @@ func TestPerTurnPlanUsesStructuredSessionEvidence(t *testing.T) {
 	}
 }
 
+func TestRepoLanguagesOmitsEvidenceOnPartialTraversal(t *testing.T) {
+	root := t.TempDir()
+	for name := range map[string]struct{}{"one.go": {}, "two.py": {}} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("source"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	limits := rootedfs.WalkLimits{MaxEntries: 2, MaxDirectories: 1, MaxDepth: 0, ReadDirBatch: 1}
+	if got := strings.Join(repoLanguagesWithLimits(root, limits, nil), ","); got != "Go,Python" {
+		t.Fatalf("exact-cap languages = %q", got)
+	}
+	if err := os.WriteFile(filepath.Join(root, "three.ts"), []byte("source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := repoLanguagesWithLimits(root, limits, nil); got != nil {
+		t.Fatalf("partial traversal supplied routing evidence: %v", got)
+	}
+	if got := repoLanguagesWithLimits("", limits, nil); got != nil {
+		t.Fatalf("empty workspace scanned the process directory: %v", got)
+	}
+}
+
+func TestRepoLanguagesHasAConservativeProductionWorkBudget(t *testing.T) {
+	if routeLanguageMaxEntries >= 50_000 {
+		t.Fatalf("per-turn language scan entry limit = %d, must remain below the former synchronous ceiling", routeLanguageMaxEntries)
+	}
+	if routeLanguageBatch <= 0 || routeLanguageBatch > 256 || routeLanguageTimeout <= 0 || routeLanguageTimeout > time.Second {
+		t.Fatalf("per-turn language latency contract = batch %d timeout %s", routeLanguageBatch, routeLanguageTimeout)
+	}
+}
+
+func TestRepoLanguagesOmitsEvidenceWhenDeadlineExpires(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "one.go"), []byte("package p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	limits := rootedfs.WalkLimits{MaxEntries: 8, MaxDirectories: 2, MaxDepth: 1, ReadDirBatch: 1}
+	if got := repoLanguagesWithContext(ctx, root, limits, nil); got != nil {
+		t.Fatalf("cancelled traversal supplied routing evidence: %v", got)
+	}
+}
+
 func TestPerTurnPlanChecksTheFullProspectiveContext(t *testing.T) {
 	loop, cfg, cat, workspace := turnPlannerFixture(t)
 	// Haiku's catalog window is 200k tokens; the full system prompt alone is
@@ -328,7 +373,7 @@ func TestPositiveLiveVisionProbeOverridesSurfaceDefault(t *testing.T) {
 	}}
 	cfg := &config.Config{Tiers: []config.Tier{local}}
 	probes := &providers{probes: map[provider.RouteTargetID]provider.ProbeResult{
-		local.Target.ID(): {Reachable: true, ModelPresent: true, Tools: provider.ToolsParallel, Vision: true},
+		local.Target.ID(): {Reachable: true, ModelPresent: true, Tools: provider.ToolsParallel, Vision: true, VisionKnown: true},
 	}}
 	opening := provider.UserText("inspect")
 	opening.Content = append(opening.Content, provider.Image{MediaType: "image/png", Data: []byte{1}})
@@ -340,6 +385,28 @@ func TestPositiveLiveVisionProbeOverridesSurfaceDefault(t *testing.T) {
 	}
 	if tier.Target.ID() != local.Target.ID() {
 		t.Fatalf("live vision target = %s, want %s", tier.Target.ID(), local.Target.ID())
+	}
+}
+
+func TestLiveNegativeVisionOverridesSurfaceDefault(t *testing.T) {
+	target := provider.RouteTarget{Provider: "openai", Surface: "subscription", ModelID: "text-only"}
+	probes := &providers{probes: map[provider.RouteTargetID]provider.ProbeResult{
+		target.ID(): {Reachable: true, ModelPresent: true, Tools: provider.ToolsParallel, VisionKnown: true, Vision: false},
+	}}
+	candidate := route.Candidate{Target: target, Info: catalog.ModelInfo{Vision: true}}
+	if got := withLiveCapabilities(candidate, probes); got.Info.Vision {
+		t.Fatal("known text-only live evidence retained the surface's vision default")
+	}
+}
+
+func TestUnknownLiveVisionDoesNotOverrideVerifiedCatalog(t *testing.T) {
+	target := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "vision-catalogued"}
+	probes := &providers{probes: map[provider.RouteTargetID]provider.ProbeResult{
+		target.ID(): {Reachable: true, ModelPresent: true, Tools: provider.ToolsParallel},
+	}}
+	candidate := route.Candidate{Target: target, Info: catalog.ModelInfo{Vision: true}}
+	if got := withLiveCapabilities(candidate, probes); !got.Info.Vision {
+		t.Fatal("a protocol silent about modalities erased verified catalog vision")
 	}
 }
 
@@ -394,12 +461,12 @@ func TestFallbackSearchContinuesPastReachableInfeasibleTarget(t *testing.T) {
 	if got.Target.ModelID != "roomy" {
 		t.Fatalf("fallback = %s, want roomy after small failed feasibility", got.Target.ModelID)
 	}
-	if !strings.Contains(note, "could not serve this turn") {
-		t.Fatalf("fallback note did not distinguish feasibility: %q", note)
+	if !strings.Contains(note, "is unavailable") {
+		t.Fatalf("fallback note did not name the primary outage: %q", note)
 	}
 }
 
-func TestResolveCurrentTierUsesContextFeasibleFallback(t *testing.T) {
+func TestReachableCurrentPrimaryContextFailureDoesNotActivateFallback(t *testing.T) {
 	loop, _, _, workspace := turnPlannerFixture(t)
 	loop.System = nil
 	loop.Tools = &tools.Registry{}
@@ -413,17 +480,14 @@ func TestResolveCurrentTierUsesContextFeasibleFallback(t *testing.T) {
 	probes := newProviders(server.URL, cfg)
 	opening := provider.UserText(strings.Repeat("x", 700))
 
-	got, _, _, plan, err := resolveUserTurn(context.Background(), loop, cfg, cat, probes, nil,
+	_, _, _, _, err := resolveUserTurn(context.Background(), loop, cfg, cat, probes, nil,
 		newCacheSet(tier.Target, nil), route.NewSticky(route.Policy{}, 0), tier, probes.ollama, opening, workspace)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Target.ModelID != "roomy" || plan.Decision.Target != got.Target.ID() {
-		t.Fatalf("resolved %s with decision %s, want same-tier roomy fallback", got.Target.ID(), plan.Decision.Target)
+	if err == nil || !strings.Contains(err.Error(), "holds 100 tokens") {
+		t.Fatalf("reachable context-infeasible primary activated its fallback: %v", err)
 	}
 }
 
-func TestResolveNonCurrentTierUsesContextFeasibleFallback(t *testing.T) {
+func TestRouterDoesNotUseFallbackToRepairContextInfeasibleTier(t *testing.T) {
 	loop, _, _, workspace := turnPlannerFixture(t)
 	loop.System = nil
 	loop.Tools = &tools.Registry{}
@@ -438,14 +502,11 @@ func TestResolveNonCurrentTierUsesContextFeasibleFallback(t *testing.T) {
 	cfg := &config.Config{Tiers: []config.Tier{current, target}}
 	probes := newProviders(server.URL, cfg)
 
-	got, _, _, _, err := resolveUserTurn(context.Background(), loop, cfg, cat, probes, nil,
+	_, _, _, _, err := resolveUserTurn(context.Background(), loop, cfg, cat, probes, nil,
 		newCacheSet(current.Target, nil), route.NewSticky(route.Policy{}, 0), current, probes.ollama,
 		provider.UserText(strings.Repeat("x", 700)), workspace)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.ID != "t2" || got.Target.ModelID != "roomy" {
-		t.Fatalf("resolved %s/%s, want non-current t2 roomy fallback", got.ID, got.Target.ModelID)
+	if err == nil || !strings.Contains(err.Error(), "holds 100 tokens") {
+		t.Fatalf("context-infeasible tier activated a same-rung fallback: %v", err)
 	}
 }
 
@@ -493,7 +554,7 @@ func TestPinnedTierMayFallbackButCannotJumpTiers(t *testing.T) {
 	probes := newProviders(server.URL, &config.Config{})
 	opening := provider.UserText(strings.Repeat("x", 700))
 
-	withFallback := ollamaTier("t1", "tiny", "roomy")
+	withFallback := ollamaTier("t1", "missing", "roomy")
 	cfg := &config.Config{Tiers: []config.Tier{withFallback}}
 	probes.config = cfg
 	sticky := route.NewSticky(route.Policy{}, 0)
@@ -531,7 +592,7 @@ func TestRoutingOffHoldsTheCurrentRung(t *testing.T) {
 	opening := provider.UserText(strings.Repeat("x", 700))
 	off := false
 
-	withFallback := ollamaTier("t1", "tiny", "roomy")
+	withFallback := ollamaTier("t1", "missing", "roomy")
 	cfg := &config.Config{Tiers: []config.Tier{withFallback}, RouteAuto: &off}
 	probes := newProviders(server.URL, cfg)
 	got, _, _, _, err := resolveUserTurn(context.Background(), loop, cfg, cat, probes, nil,
@@ -559,7 +620,7 @@ func TestRoutingOffHoldsTheCurrentRung(t *testing.T) {
 	}
 }
 
-func TestResolveCurrentTierUsesVisionAndBudgetFallbacks(t *testing.T) {
+func TestReachablePrimaryHardFailuresDoNotActivateFallbacks(t *testing.T) {
 	t.Run("vision", func(t *testing.T) {
 		loop, _, _, workspace := turnPlannerFixture(t)
 		loop.System = nil
@@ -574,10 +635,10 @@ func TestResolveCurrentTierUsesVisionAndBudgetFallbacks(t *testing.T) {
 		probes := newProviders(server.URL, cfg)
 		opening := provider.UserText("inspect")
 		opening.Content = append(opening.Content, provider.Image{MediaType: "image/png", Data: []byte("invalid-image")})
-		got, _, _, _, err := resolveUserTurn(context.Background(), loop, cfg, cat, probes, nil,
+		_, _, _, _, err := resolveUserTurn(context.Background(), loop, cfg, cat, probes, nil,
 			newCacheSet(tier.Target, nil), route.NewSticky(route.Policy{}, 0), tier, probes.ollama, opening, workspace)
-		if err != nil || got.Target.ModelID != "vision" {
-			t.Fatalf("vision fallback = %s, err=%v", got.Target.ModelID, err)
+		if err == nil || !strings.Contains(err.Error(), "cannot read images") {
+			t.Fatalf("reachable vision-infeasible primary activated its fallback: %v", err)
 		}
 	})
 
@@ -595,16 +656,16 @@ func TestResolveCurrentTierUsesVisionAndBudgetFallbacks(t *testing.T) {
 		probes := newProviders(server.URL, cfg)
 		budget := &budgetState{}
 		budget.set(1_000)
-		got, _, _, plan, err := resolveUserTurn(context.Background(), loop, cfg, cat, probes, budget,
+		_, _, _, plan, err := resolveUserTurn(context.Background(), loop, cfg, cat, probes, budget,
 			newCacheSet(tier.Target, nil), route.NewSticky(route.Policy{}, 0), tier, probes.ollama,
 			provider.UserText(strings.Repeat("x", 700)), workspace)
-		if err != nil || got.Target.ModelID != "cheap" || plan.Decision.Target != got.Target.ID() {
-			t.Fatalf("budget fallback = %s decision=%s err=%v", got.Target.ModelID, plan.Decision.Target, err)
+		if err == nil || !strings.Contains(err.Error(), "ceiling") {
+			t.Fatalf("reachable over-budget primary activated its fallback; decision=%s err=%v", plan.Decision.Target, err)
 		}
 	})
 }
 
-func TestResolveUsesPriceableFallbackBeforeProviderCall(t *testing.T) {
+func TestReachablePrimaryPricingGapDoesNotActivateFallback(t *testing.T) {
 	loop, _, _, workspace := turnPlannerFixture(t)
 	loop.System = nil
 	loop.Tools = &tools.Registry{}
@@ -644,27 +705,18 @@ func TestResolveUsesPriceableFallbackBeforeProviderCall(t *testing.T) {
 	opening := provider.UserText(strings.Repeat("x", 600))
 	preview := prospectiveTurnPlan(loop, route.NewSticky(route.Policy{}, 0), opening, workspace)
 	primaryCandidate := candidateForTierContext(tier, 0, cat, preview.PromptTokens, preview.ContextTokens, 0)
-	got, client, _, plan, err := resolveUserTurn(context.Background(), loop, cfg, cat, probes, nil,
+	_, _, _, plan, err := resolveUserTurn(context.Background(), loop, cfg, cat, probes, nil,
 		newCacheSet(tier.Target, nil), route.NewSticky(route.Policy{}, 0), tier, probes.ollama,
 		opening, workspace)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Target.ModelID != "covered" {
-		t.Fatalf("priceability fallback = %s exclusions=%v primary={known:%v free:%v metering:%s ceiling:%s context:%d}",
-			got.Target.ModelID, plan.Decision.Infeasible, primaryCandidate.CatalogKnown, primaryCandidate.Info.Free(),
-			primaryCandidate.Info.Metering, primaryCandidate.CeilingCost, preview.ContextTokens)
-	}
-	loop.Catalog = cat
-	loop.Bind(agent.Binding{Provider: client, Target: got.Target})
-	loop.SetObserver(agent.NopObserver{})
-	if err := loop.TurnMessage(context.Background(), opening); err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "no positive conservative cost bound") {
+		t.Fatalf("pricing-gap primary activated a fallback; exclusions=%v primary={known:%v free:%v metering:%s ceiling:%s context:%d} err=%v",
+			plan.Decision.Infeasible, primaryCandidate.CatalogKnown, primaryCandidate.Info.Free(),
+			primaryCandidate.Info.Metering, primaryCandidate.CeilingCost, preview.ContextTokens, err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(chatModels) != 1 || chatModels[0] != "covered" {
-		t.Fatalf("provider calls = %v, want one covered fallback call and zero pricing-gap calls", chatModels)
+	if len(chatModels) != 0 {
+		t.Fatalf("provider calls = %v, want no model call after the reachable primary failed hard feasibility", chatModels)
 	}
 }
 
@@ -788,6 +840,45 @@ func TestCandidateReservesConcreteAdapterOutputAllowance(t *testing.T) {
 	thinkingCandidate := candidateForTierContext(thinking, 0, cat, 1_000, 1_000, 0)
 	if thinkingCandidate.ReservedOutputTokens != 16_384+8_192 {
 		t.Fatalf("thinking output reserve = %d, want adapter-raised allowance", thinkingCandidate.ReservedOutputTokens)
+	}
+
+	adaptive := cfg.Tiers[1]
+	adaptive.Target.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "high"}
+	adaptiveCandidate := candidateForTierContext(adaptive, 1, cat, 1_000, 1_000, 0)
+	if adaptiveCandidate.ReservedOutputTokens != 8_192 {
+		t.Fatalf("adaptive effort reserve = %d, want wire max_tokens 8192 with no invented budget", adaptiveCandidate.ReservedOutputTokens)
+	}
+}
+
+func TestCheckTurnFeasibleUsesEnforcedProbeWindow(t *testing.T) {
+	loop, cfg, cat, _ := turnPlannerFixture(t)
+	tier := cfg.Tiers[0]
+	tier.Target.Params.MaxOutputTokens = 128
+	probes := newProviders("http://127.0.0.1:1", cfg)
+	probes.mu.Lock()
+	probes.windows[bareTargetKey(tier.Target)] = probedWindow{tokens: 1_000, enforced: true}
+	probes.mu.Unlock()
+
+	plan := turnPlan{PromptTokens: 900, ContextTokens: 900}
+	err := checkTurnFeasible(loop, cat, probes, nil, nil, tier, 0, plan, provider.UserText("continue"))
+	if err == nil || !strings.Contains(err.Error(), "holds 1000 tokens") {
+		t.Fatalf("enforced live window did not reject the turn: %v", err)
+	}
+}
+
+func TestCheckTurnFeasibleUsesDeclaredWindowWhenProbeIsHeuristic(t *testing.T) {
+	loop, cfg, cat, _ := turnPlannerFixture(t)
+	tier := cfg.Tiers[0]
+	tier.Target.Params.MaxOutputTokens = 128
+	cfg.SetProviderContextWindow(config.ProviderSurfaceKey(tier.Target.Provider, tier.Target.Surface), 2_000)
+	probes := newProviders("http://127.0.0.1:1", cfg)
+	probes.mu.Lock()
+	probes.windows[bareTargetKey(tier.Target)] = probedWindow{tokens: 1_000, enforced: false}
+	probes.mu.Unlock()
+
+	plan := turnPlan{PromptTokens: 900, ContextTokens: 900}
+	if err := checkTurnFeasible(loop, cat, probes, nil, nil, tier, 0, plan, provider.UserText("continue")); err != nil {
+		t.Fatalf("heuristic probe overrode the larger declared window: %v", err)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/switchboard-code/switchboard/internal/provider"
+	"github.com/switchboard-code/switchboard/internal/terminaltext"
 )
 
 // statusLine is the always-on readout §14 requires, drawn as one continuous
@@ -21,12 +22,15 @@ import (
 //	▌t3 kimi▐ kimi/coding/kimi-for-coding-highspeed  ·· ▂▂█▂ ▁▃▆▅ ~42 tok/s acceptEdits plan ctx 34% 12:34
 func (m *tuiModel) statusLine() string {
 	th := m.th
-	width := m.width
+	width := max(m.width, 0)
+	if width == 0 {
+		return ""
+	}
 	rank := m.activeRank()
 
-	chip := m.app.tier.ID
+	chip := terminaltext.Escape(m.app.tier.ID)
 	if m.app.tier.Label != "" {
-		chip += " · " + m.app.tier.Label
+		chip += " · " + terminaltext.Escape(m.app.tier.Label)
 	}
 	chipStyle := th.tierChip
 	if rank >= 0 {
@@ -35,14 +39,17 @@ func (m *tuiModel) statusLine() string {
 
 	target := ""
 	if i := strings.Index(m.tierLine, "  "); i >= 0 {
-		target = strings.TrimSpace(m.tierLine[i:])
+		target = terminaltext.Escape(strings.TrimSpace(m.tierLine[i:]))
 	}
 
 	// Right-side segments, in display order. Optional ones carry a drop
 	// priority: when the bar does not fit, the highest number leaves first.
+	// Every segment has a priority because even the important facts cannot be
+	// allowed to spill onto a second terminal row. Mode, spend, and context are
+	// the last facts to leave; the rung chip is the final compact identity.
 	type segment struct {
 		s    string
-		drop int // 0 never leaves
+		drop int
 	}
 	var segs []segment
 	add := func(s string, drop int) {
@@ -50,25 +57,25 @@ func (m *tuiModel) statusLine() string {
 			segs = append(segs, segment{s: s, drop: drop})
 		}
 	}
-	add(m.moveDots(), 2)
-	add(m.ladderStrip(), 0)
-	add(m.sparkline(), 4)
+	add(m.moveDots(), 70)
+	add(m.ladderStrip(), 40)
+	add(m.sparkline(), 100)
 	// One filled chip on the bar reads as deliberate; three read as a
 	// toolbar. The rung chip keeps its fill; mode is its hue as text — except
 	// default, whose chip ground is the neutral gray that vanishes as a
 	// foreground, so the quiet mode speaks in the quiet color.
 	if chipS, ok := th.modeChip[string(m.mode)]; ok && m.mode != "default" {
 		modeStyle := lipgloss.NewStyle().Foreground(chipS.GetBackground())
-		add(th.onBar(modeStyle).Render(string(m.mode)), 0)
+		add(th.onBar(modeStyle).Render(terminaltext.Escape(string(m.mode))), 10)
 	} else {
-		add(th.onBar(th.dim).Render(string(m.mode)), 0)
+		add(th.onBar(th.dim).Render(terminaltext.Escape(string(m.mode))), 10)
 	}
 	if effort := effortOf(m.app.tier.Target); effort != "" {
-		add(th.onBar(th.dim).Render("think "+effort), 1)
+		add(th.onBar(th.dim).Render("think "+terminaltext.Escape(effort)), 80)
 	}
-	add(m.watchChip(), 0)
+	add(m.watchChip(), 30)
 	if m.updateAvail != "" {
-		add(th.onBar(th.warn).Render("↑ "+m.updateAvail), 0)
+		add(th.onBar(th.warn).Render("↑ "+terminaltext.Escape(m.updateAvail)), 50)
 	}
 	costStyle := th.ok
 	switch {
@@ -77,61 +84,85 @@ func (m *tuiModel) statusLine() string {
 	case m.costPct >= 60:
 		costStyle = th.warn
 	}
-	add(th.onBar(costStyle).Render(m.costLine), 0)
-	add(m.ctxPct(), 0)
-	add(m.clock(), 3)
+	add(th.onBar(costStyle).Render(terminaltext.Escape(m.costLine)), 20)
+	add(m.ctxPct(), 15)
+	add(m.clock(), 90)
 	if m.tr.offset > 0 {
-		add(th.onBar(th.dim).Render(fmt.Sprintf("↑%d", m.tr.offset)), 0)
+		add(th.onBar(th.dim).Render(fmt.Sprintf("↑%d", m.tr.offset)), 25)
 	}
 
 	sep := th.onBar(lipgloss.NewStyle()).Render("  ")
 	rightWidth := func() int {
-		w := lipgloss.Width(sep)
-		for _, s := range segs {
-			w += lipgloss.Width(s.s) + lipgloss.Width(sep)
+		w := 0
+		for i, s := range segs {
+			if i > 0 {
+				w += lipgloss.Width(sep)
+			}
+			w += lipgloss.Width(s.s)
 		}
 		return w
 	}
-	makeLeft := func() string {
-		return chipStyle.Render(" "+chip+" ") + th.onBar(th.dim).Render(" "+target)
-	}
-	left := makeLeft()
 
-	// Fit: the target shrinks first — it is the longest thing here and the
-	// chip already names the rung — down to a floor that still identifies
-	// the model. Only then do the luxuries leave, newest first.
-	chipW := lipgloss.Width(chipStyle.Render(" " + chip + " "))
-	if avail := width - rightWidth() - chipW - 3; avail < len(target) {
-		target = truncate(target, max(avail, 14))
-		left = makeLeft()
-	}
-	for drop := 4; drop >= 1; drop-- {
-		if lipgloss.Width(left)+rightWidth() <= width {
-			break
-		}
-		kept := segs[:0]
-		for _, s := range segs {
-			if s.drop != drop {
-				kept = append(kept, s)
+	// A user can name a tier with wide glyphs or a very long label. Give the
+	// chip a proportional ceiling before considering the rest of the bar; its
+	// own padding is included in that ceiling.
+	chipLimit := min(width, max(width/3, 5))
+	chip = fitCells(chip, max(chipLimit-2, 1))
+	chipRendered := chipStyle.Render(" " + chip + " ")
+	chipW := lipgloss.Width(chipRendered)
+
+	// First ensure that the compact identity plus retained facts fits. This is
+	// what makes 20-column split panes safe rather than merely uncommon.
+	for chipW+rightWidth()+boolWidth(len(segs) > 0) > width && len(segs) > 0 {
+		dropAt := 0
+		for i := 1; i < len(segs); i++ {
+			if segs[i].drop > segs[dropAt].drop {
+				dropAt = i
 			}
 		}
-		segs = kept
+		segs = append(segs[:dropAt], segs[dropAt+1:]...)
 	}
-	if avail := width - rightWidth() - chipW - 3; avail < len(target) {
-		target = truncate(target, max(avail, 8))
-		left = makeLeft()
+	if avail := width - rightWidth() - boolWidth(len(segs) > 0); chipW > avail {
+		chip = fitCells(chip, max(avail-2, 1))
+		chipRendered = chipStyle.Render(" " + chip + " ")
+		chipW = lipgloss.Width(chipRendered)
+	}
+
+	// The target takes whatever remains between the stable chip and facts. It
+	// is cell-truncated, never byte-sliced, so CJK, emoji, and combining marks
+	// stay intact.
+	targetBudget := width - chipW - rightWidth() - boolWidth(len(segs) > 0) - 1
+	if targetBudget > 0 {
+		target = fitCells(target, targetBudget)
+	} else {
+		target = ""
+	}
+	left := chipRendered
+	if target != "" {
+		left += th.onBar(th.dim).Render(" " + target)
 	}
 
 	var right []string
 	for _, s := range segs {
 		right = append(right, s.s)
 	}
-	rightStr := strings.Join(right, sep) + th.onBar(lipgloss.NewStyle()).Render(" ")
+	rightStr := strings.Join(right, sep)
 	gap := width - lipgloss.Width(left) - lipgloss.Width(rightStr)
-	if gap < 1 {
+	if rightStr != "" && gap < 1 {
 		gap = 1
 	}
-	return left + th.onBar(lipgloss.NewStyle()).Render(strings.Repeat(" ", gap)) + rightStr
+	line := left + th.onBar(lipgloss.NewStyle()).Render(strings.Repeat(" ", max(gap, 0))) + rightStr
+	// Keep a final guard at the paint boundary. All sizing above is cell-aware,
+	// but a future segment should not be able to reintroduce a wrapped status
+	// row merely by forgetting to participate in the priority scheme.
+	return fitCells(line, width)
+}
+
+func boolWidth(ok bool) int {
+	if ok {
+		return 1
+	}
+	return 0
 }
 
 // moveDots is the session's routing history at a glance: one dot per landed

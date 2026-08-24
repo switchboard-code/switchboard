@@ -22,6 +22,8 @@ sb
 ```
 
 The installer verifies release checksums and writes `sb` to `~/.local/bin`.
+Windows users can download the matching `windows_amd64` or `windows_arm64`
+archive and `checksums.txt` from the [latest release](https://github.com/switchboard-code/switchboard/releases/latest).
 To build from source with Go 1.26:
 
 ```sh
@@ -40,8 +42,10 @@ With no configuration, `sb` opens a setup checklist:
 3. Choose the model for tier 1.
 4. Enter a task.
 
-Setup can use an existing Codex CLI login through a credential helper. Keys go
-to the OS credential service, not `config.toml`. Run `/setup` to reopen the
+Setup can use an existing Codex CLI login through a credential helper. Keys
+entered on macOS or Linux go to the OS credential service, not `config.toml`.
+Windows currently requires an environment variable or credential helper; no
+native credential-store backend ships there yet. Run `/setup` to reopen the
 checklist, `/models` to add tiers, `/doctor` when a provider or tool is not
 working, and `/doctor extensions` to expand retained startup diagnostics.
 
@@ -64,8 +68,16 @@ effort = "high"
 label = "codex"
 model = "openai/gpt-5.6-sol"
 surface = "subscription"
+max_output = 8192
 fallback = ["ollama/qwen3.8:27b-mlx"]
 ```
+
+For a custom or unlisted model, `/models` asks for a finite output cap when no
+verified one is available. A saved tier `max_output` applies to its primary
+and every fallback, so an outage cannot replace a bounded target with an
+unbounded one. It is both the provider limit and the hard reserve used for
+context and budget checks. See
+[Installation and configuration](docs/configuration.md#config-file).
 
 Before each user turn, Switchboard routes the full request that would be sent,
 including replay, tools, attachments, context size, live capabilities, cache
@@ -84,15 +96,18 @@ verification, and the model ladder in one terminal.
 | --- | --- |
 | Open and search code | Ctrl+P opens the command palette; `/files` and `/search` provide revision-checked results and label partial coverage |
 | Navigate semantics | `/outline`, `/symbols`, `/definition`, and `/references` use a trusted, installed language server; `/problems` labels diagnostic freshness and partial coverage |
-| Review code changes | `/diff` shows staged, unstaged, and untracked work plus a bounded omitted-path inventory; `/review [turn]` shows one turn's recorded mutations |
+| Review code changes | After `/trust grant`, `/diff` shows staged, unstaged, and untracked work plus a bounded omitted-path inventory; Git status can execute repository filters and hooks. `/review [turn]` shows one turn's recorded mutations without Git. |
 | Edit against known state | Writes publish atomically. Edit and undo compare the expected file state immediately before publication and refuse a mismatch already present |
-| Verify and recover | `/watch`, `/bisect`, `/undo`, `/fork`, and `/retry` keep test evidence and recovery attached to the session record |
+| Verify and recover | `/watch`, `/bisect`, `/undo`, `/fork`, and transactional `/retry` keep test evidence and recovery attached to the session record |
 | Check what a turn claimed | `/audit` reads the finished turn on a second rung and reports where the closing message and the record disagree |
 | Stop re-answering the same prompt | `[[permissions]]` holds standing rules; `/permissions` lists them and `sb permissions -- <command>` says what they answer |
 | Explain the route | `/why`, `/estimate`, `/budget`, `/race`, and `/blame` connect model choice, cost, and surviving code |
-| Continue after a boundary | Bounded, redacted continuity capsules carry recorded todo state and the next action once across restart, fork, retry, or compaction without rewriting the visible conversation |
+| Resume with evidence | `/resume` and `/session` show the exact serving target, interrupted output, pending tool repair, continuity state, torn-tail recovery, and integrity-blocked logs before adoption |
+| Survive interruption | Streamed assistant text is synced before it is shown; a crash keeps visible output as explicitly incomplete evidence and never replays it as a finished answer |
+| Continue after a boundary | A validated seven-section handoff plus a bounded, redacted continuity capsule carries the active objective and execution frontier across restart, fork, retry, or compaction |
 
-Prompt history persists per workspace. Messages entered during a turn queue
+Owner-private prompt history persists per workspace (mode 0600 on Unix and a
+verified current-user-only DACL on Windows). Messages entered during a turn queue
 until it completes. Ctrl+G opens the prompt in `$VISUAL` or `$EDITOR`, Ctrl+R
 searches prompt history, Ctrl+F searches the transcript, and Ctrl+O expands
 tool rails.
@@ -110,6 +125,7 @@ Run one turn without a TUI:
 ```sh
 sb -p "explain the failing test"
 git diff | sb -p "review this"
+sb -workflow review internal/agent
 ```
 
 Piped stdin is attached as content, so it cannot also answer approval prompts.
@@ -117,9 +133,11 @@ Bypass is prompt-free only when verified confinement isolates both host network
 and host IPC. The current macOS and Linux profiles retain host IPC, so command
 approvals still fail closed in a headless bypass run.
 
-`-output json` writes one JSON object to stdout and sends the transcript to
-stderr. `-resume` and `-continue` reopen recorded sessions. More examples are
-in [Sessions and command reference](docs/session.md#scripting).
+`-workflow <name> [arguments]` runs a staged subagent workflow without opening
+an interactive prompt. `-output json` writes one JSON object to stdout and
+sends the transcript to stderr. `-resume` and `-continue` reopen recorded
+sessions. More examples are in
+[Sessions and command reference](docs/session.md#scripting).
 
 ## Extending
 
@@ -184,12 +202,12 @@ two routing targets. See
 
 ## Where this stands
 
-Version 1.2 adds the searchable workbench, exact read-only Git diff and
-turn-scoped agent review, semantic navigation and diagnostics, atomic
-revision-checked edits and undo, durable continuity capsules, visible parallel
-delegate tasks, static CLI help and completion, and bounded startup diagnostics.
-The model ladder, accounting, trust model, extensions, and computer use remain.
-See the [1.2 release notes](docs/release-1.2.md).
+Version 1.21 adds crash-durable streamed output, read-only resume health,
+validated seven-section compaction, transactional retry recovery, concrete
+serving-target output caps, denial-first modal queuing, and staged subagent
+workflows. The searchable workbench, deterministic model ladder, accounting,
+trust model, extensions, and computer use remain. See the
+[v1.21 release](https://github.com/switchboard-code/switchboard/releases/tag/v1.21.0).
 
 The learned router is intentionally absent. The current evaluation does not
 contain a clean choice between multiple useful tiers. The gate and evidence

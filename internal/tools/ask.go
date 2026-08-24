@@ -68,8 +68,8 @@ func (t *askTool) Description() string {
 }
 
 // ParallelSafe is false because every question resolves against the same
-// user, and two dialogs contending for one input zone would drop whichever
-// arrived second.
+// user. Interactive surfaces serialize it with their other modals; the tool
+// itself never creates a form by asking several questions concurrently.
 func (t *askTool) ParallelSafe() bool { return false }
 
 func (t *askTool) Schema() json.RawMessage {

@@ -50,6 +50,7 @@ func TestQuestionDialogSingleSelect(t *testing.T) {
 	}
 
 	m.dlg.update(tea.KeyMsg{Type: tea.KeyDown}, m.th)
+	m.dlg.update(tea.KeyMsg{Type: tea.KeyDown}, m.th)
 	done, _ := m.dlg.update(tea.KeyMsg{Type: tea.KeyEnter}, m.th)
 	if !done {
 		t.Fatal("enter did not close the dialog")
@@ -59,15 +60,52 @@ func TestQuestionDialogSingleSelect(t *testing.T) {
 	}
 }
 
-func TestQuestionDialogDigitQuickPick(t *testing.T) {
+func TestQuestionDialogComposerRunesDoNotChooseAnAsyncAnswer(t *testing.T) {
 	m, respond := openQuestion(t, false)
 
-	done, _ := m.dlg.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}}, m.th)
-	if !done {
-		t.Fatal("a digit on a single-select question must answer at once")
+	for _, typed := range []rune{'j', '2'} {
+		if done, cmd := m.dlg.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{typed}}, m.th); done || cmd != nil {
+			t.Fatalf("composer rune %q resolved an asynchronously opened question", typed)
+		}
 	}
-	if ans := answered(t, respond); len(ans.Picked) != 1 || ans.Picked[0] != "memory" {
-		t.Fatalf("answer = %+v, want option 3", ans)
+	if done, cmd := m.dlg.update(tea.KeyMsg{Type: tea.KeyEnter}, m.th); done || cmd != nil {
+		t.Fatal("Enter after unrelated composer runes resolved the neutral question")
+	}
+	select {
+	case ans := <-respond:
+		t.Fatalf("composer text answered the question: %+v", ans)
+	default:
+	}
+
+	m.dlg.update(tea.KeyMsg{Type: tea.KeyDown}, m.th)
+	done, _ := m.dlg.update(tea.KeyMsg{Type: tea.KeyEnter}, m.th)
+	if !done {
+		t.Fatal("arrow navigation followed by Enter did not answer")
+	}
+	if ans := answered(t, respond); len(ans.Picked) != 1 || ans.Picked[0] != "sqlite" {
+		t.Fatalf("answer = %+v, want first deliberately selected option", ans)
+	}
+}
+
+func TestQuestionDialogStrayEnterDoesNotAnswer(t *testing.T) {
+	m, respond := openQuestion(t, false)
+
+	if done, cmd := m.dlg.update(tea.KeyMsg{Type: tea.KeyEnter}, m.th); done || cmd != nil {
+		t.Fatalf("neutral Enter = done %v, cmd %v; want no action", done, cmd != nil)
+	}
+	select {
+	case ans := <-respond:
+		t.Fatalf("neutral Enter answered an asynchronously opened question: %+v", ans)
+	default:
+	}
+
+	m.dlg.update(tea.KeyMsg{Type: tea.KeyDown}, m.th)
+	done, _ := m.dlg.update(tea.KeyMsg{Type: tea.KeyEnter}, m.th)
+	if !done {
+		t.Fatal("navigation followed by Enter did not answer")
+	}
+	if ans := answered(t, respond); len(ans.Picked) != 1 || ans.Picked[0] != "sqlite" {
+		t.Fatalf("answer after navigation = %+v, want sqlite", ans)
 	}
 }
 
@@ -76,8 +114,14 @@ func TestQuestionDialogMultiMarksInOfferedOrder(t *testing.T) {
 
 	// Mark the third option first, then the first: the answer must come
 	// back in offered order, the shape the model asked the question in.
-	m.dlg.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}}, m.th)
-	m.dlg.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'1'}}, m.th)
+	for range 3 {
+		m.dlg.update(tea.KeyMsg{Type: tea.KeyDown}, m.th)
+	}
+	m.dlg.update(tea.KeyMsg{Type: tea.KeySpace}, m.th)
+	for range 2 {
+		m.dlg.update(tea.KeyMsg{Type: tea.KeyUp}, m.th)
+	}
+	m.dlg.update(tea.KeyMsg{Type: tea.KeySpace}, m.th)
 
 	if view := m.dlg.view(80, m.th); !strings.Contains(view, "[x]") {
 		t.Fatalf("a marked option must show its mark:\n%s", view)
@@ -96,6 +140,7 @@ func TestQuestionDialogMultiEnterWithNoMarksPicksTheHighlighted(t *testing.T) {
 	m, respond := openQuestion(t, true)
 
 	m.dlg.update(tea.KeyMsg{Type: tea.KeyDown}, m.th)
+	m.dlg.update(tea.KeyMsg{Type: tea.KeyDown}, m.th)
 	done, _ := m.dlg.update(tea.KeyMsg{Type: tea.KeyEnter}, m.th)
 	if !done {
 		t.Fatal("enter did not close the dialog")
@@ -109,7 +154,7 @@ func TestQuestionDialogTypedAnswer(t *testing.T) {
 	m, respond := openQuestion(t, false)
 
 	// Down past the options lands on the type-your-own row.
-	for range 3 {
+	for range 4 {
 		m.dlg.update(tea.KeyMsg{Type: tea.KeyDown}, m.th)
 	}
 	if done, _ := m.dlg.update(tea.KeyMsg{Type: tea.KeyEnter}, m.th); done {
@@ -137,10 +182,34 @@ func TestQuestionDialogEscapeDeclines(t *testing.T) {
 	}
 }
 
+func TestQuestionDialogEscapesModelAuthoredTerminalControls(t *testing.T) {
+	respond := make(chan tools.Answer, 1)
+	d := newQuestionDialog(tools.Question{
+		Question: "choose\x1b]2;forged\a",
+		Options: []tools.QuestionOption{{
+			Label: "safe\x1b[2J", Detail: "detail\r\u202e spoof",
+		}},
+	}, respond)
+	view := d.view(80, darkTheme())
+	plain := stripANSI(view)
+	for _, unsafe := range []string{"\x1b", "\a", "\r", "\u202e"} {
+		if strings.Contains(plain, unsafe) {
+			t.Fatalf("question retained terminal control %q: %q", unsafe, plain)
+		}
+	}
+	// Rendering is escaped, but answering keeps the exact offered label; UI
+	// hardening must not mutate the protocol between the user and the model.
+	d.update(tea.KeyMsg{Type: tea.KeyDown}, darkTheme())
+	d.update(tea.KeyMsg{Type: tea.KeyEnter}, darkTheme())
+	if answer := answered(t, respond); len(answer.Picked) != 1 || answer.Picked[0] != "safe\x1b[2J" {
+		t.Fatalf("answer mutated by display escaping: %+v", answer)
+	}
+}
+
 func TestQuestionDialogEscapeWhileTypingReturnsToTheList(t *testing.T) {
 	m, respond := openQuestion(t, false)
 
-	for range 3 {
+	for range 4 {
 		m.dlg.update(tea.KeyMsg{Type: tea.KeyDown}, m.th)
 	}
 	m.dlg.update(tea.KeyMsg{Type: tea.KeyEnter}, m.th)
@@ -181,11 +250,10 @@ func TestParseQuestionPicks(t *testing.T) {
 	}
 }
 
-// An MCP server may elicit at any moment, including while a permission prompt
-// is on screen. Replacing that dialog would strand the answer the loop is
-// blocked on, so the question is refused instead — and refused is not the same
-// fact as the user declining.
-func TestAQuestionArrivingOverAnOpenDialogIsRefusedRatherThanShown(t *testing.T) {
+// An MCP server may elicit at any moment, including while another picker is
+// on screen. The broker keeps both: the visible picker finishes first, then
+// the waiting question is shown and can resolve its blocked caller.
+func TestAQuestionArrivingOverAnOpenDialogIsQueued(t *testing.T) {
 	m := testModel(t)
 	m.dlg = &pickerDialog{title: "already open", items: []pickerItem{{id: "a", label: "a"}}}
 
@@ -193,12 +261,23 @@ func TestAQuestionArrivingOverAnOpenDialogIsRefusedRatherThanShown(t *testing.T)
 	m.Update(questionMsg{q: tools.Question{Question: "may I?"}, respond: respond})
 
 	if _, ok := m.dlg.(*questionDialog); ok {
-		t.Fatal("the open dialog was replaced by the question")
+		t.Fatal("the open dialog was replaced instead of queued")
 	}
-	if _, shown := <-respond; shown {
-		t.Error("an answer was produced for a question nobody was shown")
+	if len(m.dialogQueue) != 1 {
+		t.Fatalf("queued dialogs = %d, want 1", len(m.dialogQueue))
 	}
-	if m.pendingQuestion != nil {
-		t.Error("a question nobody saw was recorded as pending")
+	select {
+	case answer := <-respond:
+		t.Fatalf("queued question resolved before it was shown: %+v", answer)
+	default:
+	}
+
+	m.key(tea.KeyMsg{Type: tea.KeyEsc})
+	if _, ok := m.dlg.(*questionDialog); !ok {
+		t.Fatalf("next dialog is %T, want question", m.dlg)
+	}
+	m.key(tea.KeyMsg{Type: tea.KeyEsc})
+	if answer := <-respond; !answer.Declined {
+		t.Fatalf("dismissed question = %+v, want declined", answer)
 	}
 }

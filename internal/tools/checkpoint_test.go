@@ -4,8 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/switchboard-code/switchboard/internal/checkpoint"
 )
 
 // The registry's side of the undo contract: write and edit capture prior
@@ -13,7 +11,7 @@ import (
 // next mutation because ForgetVersions dropped its recorded version.
 func TestWriteAndEditCaptureIntoTheCheckpoint(t *testing.T) {
 	r, root := newRegistry(t)
-	rec := checkpoint.NewRecorder()
+	rec := newCheckpointRecorder(t, root)
 	r.SetCheckpoints(rec)
 
 	existing := filepath.Join(root, "existing.txt")

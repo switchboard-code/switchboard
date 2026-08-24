@@ -39,7 +39,7 @@ func TestThinkChangesEffortForTheSession(t *testing.T) {
 
 func TestSetupChecklistCoversTheMachine(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateTestHome(t, home)
 
 	m := modelsTestModel(t) // real catalog, unreachable local server
 
@@ -82,6 +82,7 @@ func TestSetupChecklistCoversTheMachine(t *testing.T) {
 
 func TestWireCodexHelperPersists(t *testing.T) {
 	m := testModel(t)
+	m.app.workspace = t.TempDir()
 	m.app.config.Path = filepath.Join(t.TempDir(), config.FileName)
 
 	msg := wireCodexHelper(m)()
@@ -94,12 +95,36 @@ func TestWireCodexHelperPersists(t *testing.T) {
 		t.Fatal(err)
 	}
 	helper := saved.AuthFor("openai").Helper
-	if len(helper) == 0 || !strings.Contains(strings.Join(helper, " "), ".codex/auth.json") {
+	if len(helper) != 3 || !filepath.IsAbs(helper[0]) || helper[1] != codexCredentialHelperCommand || helper[2] != codexCredentialHelperKind {
 		t.Fatalf("the helper did not persist: %v", helper)
+	}
+	joined := strings.ToLower(strings.Join(helper, " "))
+	if strings.Contains(joined, "python") || strings.Contains(joined, "sh -c") || strings.Contains(joined, "auth.json") {
+		t.Fatalf("the persisted helper contains an interpreter or credential path: %v", helper)
 	}
 
 	// Once wired, setup stops offering it.
 	if codexLoginAvailable(m.app.config) {
 		t.Fatal("a wired login should not be offered again")
+	}
+}
+
+func TestFailedCodexHelperSaveLeavesLiveAuthAndProvidersUnchanged(t *testing.T) {
+	m := testModel(t)
+	m.app.workspace = t.TempDir()
+	m.app.config.Path = t.TempDir() // a directory cannot be replaced by the config file
+	m.app.providers = newProviders("http://127.0.0.1:1", m.app.config)
+	beforeGeneration := m.app.providers.generation
+
+	msg := wireCodexHelper(m)()
+	notice, ok := msg.(noticeMsg)
+	if !ok || notice.level != "error" || !strings.Contains(notice.text, "wiring the codex login failed") {
+		t.Fatalf("failed helper save = %#v, want error notice", msg)
+	}
+	if helper := m.app.config.AuthFor("openai").Helper; len(helper) != 0 {
+		t.Fatalf("failed save left a live helper: %v", helper)
+	}
+	if m.app.providers.generation != beforeGeneration {
+		t.Fatal("failed helper save reset cached providers")
 	}
 }

@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/switchboard-code/switchboard/internal/terminaltext"
 )
 
 // sgr strips ANSI style sequences, so matching runs over what the reader
@@ -109,7 +111,7 @@ func (m *tuiModel) jumpToMatch() {
 }
 
 func (m *tuiModel) transcriptSearchView() string {
-	line := "(search) " + m.trQuery
+	line := "(search) " + terminaltext.Escape(m.trQuery)
 	switch {
 	case len(m.trMatches) > 0:
 		line += m.th.dim.Render(fmt.Sprintf("  %d/%d", m.trMatch+1, len(m.trMatches)))

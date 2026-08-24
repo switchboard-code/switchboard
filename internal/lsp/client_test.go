@@ -32,7 +32,7 @@ func newScriptedServer(t *testing.T) (*Client, *scriptedServer, string) {
 	s := &scriptedServer{in: serverIn, out: serverOut, r: bufio.NewReader(serverIn)}
 	c := newClient(clientOut, clientIn, root)
 	t.Cleanup(func() { serverOut.Close() })
-	return c, s, root
+	return c, s, c.root
 }
 
 func (s *scriptedServer) recv(t *testing.T) map[string]any {
@@ -111,7 +111,7 @@ func TestCallRoutesResponsesById(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the call never completed")
 	}
-	if len(got) != 1 || got[0].Path != "/ws/b.go" || got[0].Line != 10 {
+	if len(got) != 1 || got[0].Path != filepath.FromSlash("/ws/b.go") || got[0].Line != 10 {
 		t.Fatalf("locations = %+v, want b.go:10 back in 1-based terms", got)
 	}
 }

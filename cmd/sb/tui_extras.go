@@ -5,17 +5,22 @@ package main
 // Each is small; their absence is what reads as unfinished.
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/switchboard-code/switchboard/internal/config"
+	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 	"github.com/switchboard-code/switchboard/internal/prefix"
 	"github.com/switchboard-code/switchboard/internal/provider"
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 	"github.com/switchboard-code/switchboard/internal/session"
 )
 
@@ -67,9 +72,8 @@ func setContextWindowCmd(m *tuiModel, raw string) tea.Cmd {
 	}
 	target := m.app.loop.Binding().Target
 	key := config.ProviderSurfaceKey(target.Provider, target.Surface)
-	m.app.config.SetProviderContextWindow(key, tokens)
-	if err := m.app.config.Save(); err != nil {
-		return noticeCmd("error", "saving the context window failed: "+err.Error())
+	if err := m.app.config.SetProviderContextWindowAndSave(key, tokens); err != nil {
+		return noticeCmd("error", "saving the context window failed, nothing changed: "+err.Error())
 	}
 	m.refreshCtxWindow()
 	if tokens == 0 {
@@ -146,65 +150,322 @@ func (m *tuiModel) openPalette() tea.Cmd {
 	for _, c := range commands() {
 		items = append(items, pickerItem{id: c.name, label: "/" + c.name, desc: c.desc})
 	}
+	for _, c := range m.custom {
+		selector := customSelector(m, c)
+		items = append(items, pickerItem{
+			id: selector, label: "/" + selector, desc: customCommandDescription(c),
+		})
+	}
 	for _, t := range m.app.config.Tiers {
 		items = append(items, pickerItem{id: t.ID, label: "/" + t.ID, desc: "switch to " + t.ID, current: t.ID == m.app.tier.ID})
 	}
-	m.dlg = &pickerDialog{
+	m.openDialog(&pickerDialog{
 		title:  "commands",
 		items:  items,
 		onPick: func(id string) tea.Cmd { return m.runSlash("/" + id) },
-	}
+	})
 	return nil
 }
 
 // --- external editor ---------------------------------------------------------
 
 type editorDoneMsg struct {
-	path string
-	err  error
+	content string
+	err     error
+}
+
+const (
+	editorPromptName     = "prompt.md"
+	maxEditorPromptBytes = int64(4 << 20)
+)
+
+// editorDraft holds the directory capability open across the external editor.
+// Editors commonly save by atomically replacing a file, so the leaf identity
+// may change; the private physical directory and the replacement's own
+// owner-private regular-file contract may not.
+type editorDraft struct {
+	dir     string
+	root    *os.Root
+	dirInfo os.FileInfo
+}
+
+func newEditorDraft(content string) (*editorDraft, error) {
+	if int64(len(content)) > maxEditorPromptBytes {
+		return nil, fmt.Errorf("prompt exceeds the %d-byte external-editor limit", maxEditorPromptBytes)
+	}
+	dir, err := os.MkdirTemp("", "sb-prompt-*")
+	if err != nil {
+		return nil, err
+	}
+	removeDir := true
+	defer func() {
+		if removeDir {
+			_ = os.Remove(dir)
+		}
+	}()
+	if err := fileprivacy.EnsurePrivateDir(dir); err != nil {
+		return nil, fmt.Errorf("securing the external-editor directory: %w", err)
+	}
+	root, err := rootedfs.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	draft := &editorDraft{dir: dir, root: root}
+	fail := func(cause error) (*editorDraft, error) {
+		_ = root.Close()
+		return nil, cause
+	}
+	draft.dirInfo, err = root.Stat(".")
+	if err != nil {
+		return fail(err)
+	}
+	if err := draft.verifyDirectory(); err != nil {
+		return fail(err)
+	}
+
+	// fileprivacy.Create applies the native owner-only contract atomically.
+	// Compare it to the rooted name before writing the user's draft so even a
+	// parent-path race cannot redirect those bytes.
+	file, err := fileprivacy.Create(filepath.Join(dir, editorPromptName))
+	if err != nil {
+		return fail(err)
+	}
+	opened, statErr := file.Stat()
+	linked, linkErr := root.Lstat(editorPromptName)
+	if statErr != nil || linkErr != nil || !linked.Mode().IsRegular() || !os.SameFile(opened, linked) {
+		_ = file.Close()
+		_ = root.Remove(editorPromptName)
+		return fail(errors.Join(statErr, linkErr, errors.New("external-editor prompt changed while it was created")))
+	}
+	if _, err := io.WriteString(file, content); err != nil {
+		_ = file.Close()
+		_ = root.Remove(editorPromptName)
+		return fail(err)
+	}
+	if err := file.Close(); err != nil {
+		_ = root.Remove(editorPromptName)
+		return fail(err)
+	}
+	removeDir = false
+	return draft, nil
+}
+
+func (d *editorDraft) path() string {
+	if d == nil {
+		return ""
+	}
+	return filepath.Join(d.dir, editorPromptName)
+}
+
+func (d *editorDraft) verifyDirectory() error {
+	return d.verifyDirectoryWithHook(nil)
+}
+
+func (d *editorDraft) verifyDirectoryWithHook(beforeRetainedOpen func()) error {
+	if d == nil || d.root == nil || d.dirInfo == nil {
+		return errors.New("external-editor directory capability is unavailable")
+	}
+	opened, err := d.root.Stat(".")
+	if err != nil {
+		return err
+	}
+	linked, linkErr := os.Lstat(d.dir)
+	if linkErr != nil || linked.Mode()&os.ModeSymlink != 0 || !linked.IsDir() ||
+		!os.SameFile(d.dirInfo, opened) || !os.SameFile(opened, linked) {
+		return errors.Join(linkErr, errors.New("external-editor directory changed identity"))
+	}
+	if beforeRetainedOpen != nil {
+		beforeRetainedOpen()
+	}
+	// Open through the retained root, not the pathname just inspected. A
+	// regular-directory-to-FIFO swap in that check/open gap must neither block
+	// this read nor redirect the privacy check.
+	directory, err := d.root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	pathOpened, err := directory.Stat()
+	if err != nil || !os.SameFile(opened, pathOpened) {
+		return errors.Join(err, errors.New("external-editor directory changed while its privacy was checked"))
+	}
+	private, err := fileprivacy.DirectoryIsOwnerOnly(directory)
+	if err != nil {
+		return fmt.Errorf("checking external-editor directory privacy: %w", err)
+	}
+	if !private {
+		return errors.New("external-editor directory is no longer owner-private")
+	}
+	linkedAfter, linkErr := os.Lstat(d.dir)
+	if linkErr != nil || linkedAfter.Mode()&os.ModeSymlink != 0 || !linkedAfter.IsDir() ||
+		!os.SameFile(opened, linkedAfter) {
+		return errors.Join(linkErr, errors.New("external-editor directory changed while its privacy was checked"))
+	}
+	return nil
+}
+
+func (d *editorDraft) read() ([]byte, error) {
+	return d.readWithHook(nil)
+}
+
+func (d *editorDraft) readWithHook(beforeOpen func()) ([]byte, error) {
+	if err := d.verifyDirectory(); err != nil {
+		return nil, err
+	}
+	before, err := d.root.Lstat(editorPromptName)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() {
+		return nil, errors.New("external-editor prompt is not a regular file")
+	}
+	if before.Size() < 0 || before.Size() > maxEditorPromptBytes {
+		return nil, fmt.Errorf("external-editor prompt exceeds the %d-byte limit", maxEditorPromptBytes)
+	}
+	if beforeOpen != nil {
+		beforeOpen()
+	}
+	file, err := openEditorPromptRead(d.root, editorPromptName)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
+		return nil, errors.Join(err, errors.New("external-editor prompt changed identity while it was opened"))
+	}
+	private, err := fileprivacy.IsOwnerOnly(file)
+	if err != nil {
+		return nil, fmt.Errorf("checking external-editor prompt privacy: %w", err)
+	}
+	if !private {
+		return nil, errors.New("external-editor prompt is not an owner-private single-link file")
+	}
+	owned, err := fileprivacy.IsCurrentUserOwner(file)
+	if err != nil {
+		return nil, fmt.Errorf("checking external-editor prompt owner: %w", err)
+	}
+	if !owned {
+		return nil, errors.New("external-editor prompt is not owned by the current user")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxEditorPromptBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxEditorPromptBytes {
+		return nil, fmt.Errorf("external-editor prompt exceeds the %d-byte limit", maxEditorPromptBytes)
+	}
+	finished, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	linked, linkErr := d.root.Lstat(editorPromptName)
+	privateAfter, privateErr := fileprivacy.IsOwnerOnly(file)
+	ownedAfter, ownerErr := fileprivacy.IsCurrentUserOwner(file)
+	if linkErr != nil || privateErr != nil || ownerErr != nil || !privateAfter || !ownedAfter || !linked.Mode().IsRegular() ||
+		!os.SameFile(opened, finished) || !os.SameFile(finished, linked) ||
+		opened.Size() != finished.Size() || finished.Size() != int64(len(data)) ||
+		!opened.ModTime().Equal(finished.ModTime()) || opened.Mode().Perm() != finished.Mode().Perm() {
+		return nil, errors.Join(linkErr, privateErr, ownerErr, errors.New("external-editor prompt changed while it was read"))
+	}
+	if err := d.verifyDirectory(); err != nil {
+		return nil, err
+	}
+	if !utf8.Valid(data) {
+		return nil, errors.New("external-editor prompt is not valid UTF-8 text")
+	}
+	return data, nil
+}
+
+func (d *editorDraft) cleanup() error {
+	if d == nil || d.root == nil {
+		return nil
+	}
+	// Remove through the retained directory capability. If the pathname was
+	// swapped, this still cleans only the original private directory.
+	removeErr := d.root.Remove(editorPromptName)
+	if errors.Is(removeErr, os.ErrNotExist) {
+		removeErr = nil
+	}
+	closeErr := d.root.Close()
+	d.root = nil
+	var dirErr error
+	if linked, err := os.Lstat(d.dir); err == nil && linked.IsDir() && linked.Mode()&os.ModeSymlink == 0 &&
+		d.dirInfo != nil && os.SameFile(d.dirInfo, linked) {
+		dirErr = os.Remove(d.dir)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		dirErr = err
+	}
+	return errors.Join(removeErr, closeErr, dirErr)
+}
+
+func finishEditorDraft(draft *editorDraft, editorErr error) editorDoneMsg {
+	if draft == nil {
+		return editorDoneMsg{err: errors.Join(editorErr, errors.New("external-editor draft is unavailable"))}
+	}
+	if editorErr != nil {
+		return editorDoneMsg{err: errors.Join(editorErr, draft.cleanup())}
+	}
+	data, readErr := draft.read()
+	cleanupErr := draft.cleanup()
+	if readErr != nil || cleanupErr != nil {
+		return editorDoneMsg{err: errors.Join(readErr, cleanupErr)}
+	}
+	return editorDoneMsg{content: strings.TrimRight(string(data), "\n")}
 }
 
 // openEditor is ctrl+g: the prompt in $VISUAL or $EDITOR. Bubble Tea suspends
 // the TUI for the child process and resumes when it exits, which is the whole
 // trick; everything else is a temp file.
 func (m *tuiModel) openEditor() tea.Cmd {
-	editor := os.Getenv("VISUAL")
-	if editor == "" {
-		editor = os.Getenv("EDITOR")
-	}
-	if editor == "" {
-		return noticeCmd("error", "set $EDITOR or $VISUAL to use the external editor")
+	// ExecProcess suspends Bubble Tea. Letting the model, a probe, or an
+	// operation continue while approvals and cancellation are invisible would
+	// turn an editor convenience into a control-plane outage.
+	if m.busy || m.turnPlanning || m.operationActive || m.race != nil || m.bisect != nil {
+		return noticeCmd("warn", "the external editor cannot suspend the TUI while work is running; wait for it to finish or esc to interrupt it")
 	}
 
-	tmp, err := os.CreateTemp("", "sb-prompt-*.md")
+	parts, err := promptEditorArgv()
 	if err != nil {
 		return noticeCmd("error", err.Error())
 	}
-	if _, err := tmp.WriteString(m.ta.Value()); err != nil {
-		tmp.Close()
+
+	draft, err := newEditorDraft(m.ta.Value())
+	if err != nil {
 		return noticeCmd("error", err.Error())
 	}
-	tmp.Close()
 
-	parts := strings.Fields(editor) // "code --wait" is a legitimate $EDITOR
-	cmd := sanitizedCommand(parts[0], append(parts[1:], tmp.Name())...)
+	cmd := sanitizedCommand(parts[0], append(parts[1:], draft.path())...)
 	return tea.ExecProcess(cmd, func(err error) tea.Msg {
-		return editorDoneMsg{path: tmp.Name(), err: err}
+		return finishEditorDraft(draft, err)
 	})
 }
 
+// promptEditorArgv parses the editor as argv, never as shell source. Quoted
+// application paths and flags are common in $VISUAL; variable expansion,
+// command substitution, and globbing are intentionally absent.
+func promptEditorArgv() ([]string, error) {
+	editor := strings.TrimSpace(os.Getenv("VISUAL"))
+	if editor == "" {
+		editor = strings.TrimSpace(os.Getenv("EDITOR"))
+	}
+	if editor == "" {
+		return nil, errors.New("set $EDITOR or $VISUAL to use the external editor")
+	}
+	parts, err := workspaceSplitArgv(editor)
+	if err != nil {
+		return nil, fmt.Errorf("editor: %w", err)
+	}
+	return parts, nil
+}
+
 func (m *tuiModel) onEditorDone(msg editorDoneMsg) {
-	defer os.Remove(msg.path)
 	if msg.err != nil {
 		m.addNotice("error", "editor: "+msg.err.Error())
 		return
 	}
-	data, err := os.ReadFile(msg.path)
-	if err != nil {
-		m.addNotice("error", "reading the edited prompt: "+err.Error())
-		return
-	}
-	m.ta.SetValue(strings.TrimRight(string(data), "\n"))
+	m.ta.SetValue(msg.content)
 	m.ta.CursorEnd()
+	m.resetHistoryNavigation()
 	m.growInput()
 }

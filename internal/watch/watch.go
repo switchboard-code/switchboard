@@ -82,6 +82,16 @@ type Report struct {
 	Err  error
 }
 
+// Observation is one verifier execution before it changes the watch's delta
+// baseline. Keeping execution and commitment separate lets callers discard a
+// run whose owning session disappeared while the command was still running.
+// Its fields stay private: an observation is produced only by Observe and is
+// meaningful only to Commit on the same Watch.
+type Observation struct {
+	result execution.Result
+	err    error
+}
+
 // Changed reports whether this run moved the record at all: a new failure,
 // or red turning green. Everything else is a repeat, and repeats are silence.
 func (r Report) Changed() bool {
@@ -101,10 +111,10 @@ func (w *Watch) Red() bool {
 	return w.ran && w.red
 }
 
-// Run executes the verifier and computes the delta against every earlier run.
-// The command runs unconfined through the user's shell in the workspace, the
-// same authority as typing it into the terminal next door.
-func (w *Watch) Run(ctx context.Context) Report {
+// Observe executes the verifier without changing the delta baseline. The
+// command runs unconfined through the user's shell in the workspace, the same
+// authority as typing it into the terminal next door.
+func (w *Watch) Observe(ctx context.Context) Observation {
 	res, err := execution.Run(ctx, execution.Command{
 		Argv:      []string{w.command},
 		Shell:     true,
@@ -112,9 +122,15 @@ func (w *Watch) Run(ctx context.Context) Report {
 		Timeout:   DefaultTimeout,
 		MaxOutput: maxOutput,
 	})
+	return Observation{result: res, err: err}
+}
 
+// Commit computes the delta and advances the baseline for an observation.
+// A caller that no longer owns the run must discard the observation instead.
+func (w *Watch) Commit(observation Observation) Report {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	res, err := observation.result, observation.err
 	rep := Report{FirstRun: !w.ran, Took: res.Duration}
 	if err != nil {
 		rep.Err = err
@@ -134,7 +150,16 @@ func (w *Watch) Run(ctx context.Context) Report {
 		return rep
 	}
 
-	failures := route.ExtractFailures(res.Output)
+	var failures []route.Failure
+	if res.Truncated {
+		// The capture retained only a head and tail. Do not inspect or forward
+		// either: a credential can cross the omitted region and no scan of the
+		// fragments can prove the returned text safe.
+		line := fmt.Sprintf("verifier output exceeded the %d-byte capture and was withheld", maxOutput)
+		failures = []route.Failure{{Signature: route.SignatureOf(line), Line: line}}
+	} else {
+		failures = route.ExtractFailures(res.Output)
+	}
 	if len(failures) == 0 {
 		// A verifier can fail without printing anything the failure pattern
 		// recognizes. The first non-empty line stands in, and with no output
@@ -162,6 +187,22 @@ func (w *Watch) Run(ctx context.Context) Report {
 		rep.New = append(rep.New, f)
 	}
 	return rep
+}
+
+// ResetBaseline starts the declaration's delta accounting over. The command
+// itself is unchanged; this is used when the application keeps a standing
+// watch declaration while replacing the conversation it reports into.
+func (w *Watch) ResetBaseline() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.ran = false
+	w.red = false
+	w.seen = map[string]bool{}
+}
+
+// Run is the ordinary synchronous form: execute and immediately commit.
+func (w *Watch) Run(ctx context.Context) Report {
+	return w.Commit(w.Observe(ctx))
 }
 
 func firstNonEmptyLine(s string) string {

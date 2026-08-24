@@ -144,8 +144,7 @@ func connectMCP(ctx context.Context, workspace string, ts *trust.Store, registry
 
 	var specs []mcp.Spec
 	if home, err := os.UserHomeDir(); err == nil {
-		userPath := filepath.Join(home, ".switchboard", mcp.SpecFileName)
-		userSpecs, err := mcp.LoadSpecs(userPath)
+		userSpecs, err := mcp.LoadSpecsRooted(home, filepath.Join(".switchboard", mcp.SpecFileName))
 		if err != nil {
 			// Parsing is all-or-nothing, so an error makes it impossible to know
 			// whether a required declaration was present. Continuing would turn a
@@ -158,7 +157,7 @@ func connectMCP(ctx context.Context, workspace string, ts *trust.Store, registry
 	repoPath := filepath.Join(workspace, ".switchboard", mcp.SpecFileName)
 	if _, err := os.Stat(repoPath); err == nil {
 		if ts != nil && ts.Trusted(workspace) {
-			repoSpecs, err := mcp.LoadSpecs(repoPath)
+			repoSpecs, err := mcp.LoadSpecsRooted(workspace, filepath.Join(".switchboard", mcp.SpecFileName))
 			if err != nil {
 				return state, nil, fmt.Errorf("trusted repository MCP configuration is invalid: %w", err)
 			}

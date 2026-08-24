@@ -34,7 +34,7 @@ func (m *tuiModel) startExtensionAction(name, kind string, run func(context.Cont
 	if err != nil {
 		return noticeCmd("warn", err.Error())
 	}
-	return func() tea.Msg {
+	return m.ownOperationCmd(generation, func() tea.Msg {
 		result := extensionActionMsg{kind: kind, operation: generation, sourceID: sourceID}
 		if err := ctx.Err(); err != nil {
 			result.err = err
@@ -48,7 +48,7 @@ func (m *tuiModel) startExtensionAction(name, kind string, run func(context.Cont
 		}
 		result.output = strings.TrimRight(output.String(), "\n")
 		return result
-	}
+	})
 }
 
 func (m *tuiModel) onExtensionAction(msg extensionActionMsg) tea.Cmd {

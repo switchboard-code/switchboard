@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 )
 
 const (
@@ -63,19 +65,11 @@ func InstallContext(ctx context.Context, plugin Plugin, cacheRoot string) (Plugi
 		return Plugin{}, err
 	}
 	defer cache.Close()
-	cacheDirectory, err := os.Open(cachePath)
+	cacheDirectory, err := openPinnedInstallCacheDirectory(cache)
 	if err != nil {
-		return Plugin{}, fmt.Errorf("opening plugin cache directory: %w", err)
+		return Plugin{}, err
 	}
 	defer cacheDirectory.Close()
-	if directoryInfo, statErr := cacheDirectory.Stat(); statErr != nil {
-		return Plugin{}, fmt.Errorf("reading plugin cache directory: %w", statErr)
-	} else if rootInfo, rootErr := cache.Stat("."); rootErr != nil || !os.SameFile(directoryInfo, rootInfo) {
-		if rootErr != nil {
-			return Plugin{}, fmt.Errorf("reading pinned plugin cache: %w", rootErr)
-		}
-		return Plugin{}, errors.New("plugin cache directory was replaced while opening")
-	}
 
 	objectRel := installDestination(plugin)
 	lock := installMutex(plugin, cachePath, objectRel)
@@ -122,16 +116,16 @@ func InstallContext(ctx context.Context, plugin Plugin, cacheRoot string) (Plugi
 		}
 	}()
 
-	stageObject, err := cache.OpenRoot(filepath.FromSlash(stageRel))
+	stageObject, err := openInstallSubdirectory(cache, filepath.FromSlash(stageRel))
 	if err != nil {
 		return Plugin{}, fmt.Errorf("opening staged plugin object: %w", err)
 	}
 	pluginLeaf := installPluginLeaf(plugin)
-	if err := stageObject.Mkdir(pluginLeaf, 0o700); err != nil {
+	if err := createPrivateInstallDirectory(stageObject, pluginLeaf); err != nil {
 		stageObject.Close()
 		return Plugin{}, fmt.Errorf("creating staged plugin root: %w", err)
 	}
-	stage, err := stageObject.OpenRoot(pluginLeaf)
+	stage, err := openInstallSubdirectory(stageObject, pluginLeaf)
 	if err != nil {
 		stageObject.Close()
 		return Plugin{}, fmt.Errorf("opening staged plugin root: %w", err)
@@ -157,7 +151,7 @@ func InstallContext(ctx context.Context, plugin Plugin, cacheRoot string) (Plugi
 	}
 	stagePluginRel := path.Join(stageRel, pluginLeaf)
 	stagePath := filepath.Join(cachePath, filepath.FromSlash(stagePluginRel))
-	stageCheck, err := cache.OpenRoot(filepath.FromSlash(stagePluginRel))
+	stageCheck, err := openInstallSubdirectory(cache, filepath.FromSlash(stagePluginRel))
 	if err != nil {
 		return Plugin{}, fmt.Errorf("reopening staged plugin root: %w", err)
 	}
@@ -197,6 +191,26 @@ func InstallContext(ctx context.Context, plugin Plugin, cacheRoot string) (Plugi
 		return Plugin{}, fmt.Errorf("installed plugin %s disappeared after publication", plugin.ID)
 	}
 	return installed, nil
+}
+
+func openPinnedInstallCacheDirectory(cache *os.Root) (*os.File, error) {
+	// Open through the already pinned root. Reopening cachePath by name after
+	// validation lets another process replace it with a FIFO and block here.
+	cacheDirectory, err := cache.Open(".")
+	if err != nil {
+		return nil, fmt.Errorf("opening pinned plugin cache directory: %w", err)
+	}
+	if directoryInfo, statErr := cacheDirectory.Stat(); statErr != nil {
+		cacheDirectory.Close()
+		return nil, fmt.Errorf("reading plugin cache directory: %w", statErr)
+	} else if rootInfo, rootErr := cache.Stat("."); rootErr != nil || !os.SameFile(directoryInfo, rootInfo) {
+		cacheDirectory.Close()
+		if rootErr != nil {
+			return nil, fmt.Errorf("reading pinned plugin cache: %w", rootErr)
+		}
+		return nil, errors.New("plugin cache directory identity changed while opening")
+	}
+	return cacheDirectory, nil
 }
 
 // InstallActivation is the public activation-capability boundary. It installs
@@ -261,7 +275,7 @@ func openInstallCache(cacheRoot string) (*os.Root, string, error) {
 		return nil, "", fmt.Errorf("resolving plugin cache root: %w", err)
 	}
 	abs = filepath.Clean(abs)
-	if err := os.MkdirAll(abs, 0o700); err != nil {
+	if err := prepareInstallCacheDirectory(abs); err != nil {
 		return nil, "", fmt.Errorf("creating plugin cache root: %w", err)
 	}
 	pathInfo, err := os.Lstat(abs)
@@ -286,10 +300,10 @@ func openInstallCache(cacheRoot string) (*os.Root, string, error) {
 	if !info.IsDir() {
 		return nil, "", errors.New("plugin cache root is not a directory")
 	}
-	if info.Mode().Perm()&0o022 != 0 {
-		return nil, "", errors.New("plugin cache root must not be group- or world-writable")
+	if err := validateInstallCacheDirectory(realPath, info); err != nil {
+		return nil, "", err
 	}
-	root, err := os.OpenRoot(realPath)
+	root, err := openInstallDirectory(realPath)
 	if err != nil {
 		return nil, "", fmt.Errorf("opening plugin cache root: %w", err)
 	}
@@ -310,7 +324,7 @@ func ensureInstallNamespace(root *os.Root, rel string) error {
 		prefix := strings.Join(parts[:index+1], "/")
 		info, err := root.Lstat(filepath.FromSlash(prefix))
 		if os.IsNotExist(err) {
-			if err := root.Mkdir(filepath.FromSlash(prefix), 0o700); err != nil && !os.IsExist(err) {
+			if err := createPrivateInstallDirectory(root, prefix); err != nil && !os.IsExist(err) {
 				return fmt.Errorf("creating plugin cache namespace %q: %w", prefix, err)
 			}
 			info, err = root.Lstat(filepath.FromSlash(prefix))
@@ -321,9 +335,24 @@ func ensureInstallNamespace(root *os.Root, rel string) error {
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 			return fmt.Errorf("plugin cache namespace %q is not a physical directory", prefix)
 		}
-		if info.Mode().Perm() != 0o700 {
-			return fmt.Errorf("plugin cache namespace %q mode is %04o, want 0700", prefix, info.Mode().Perm())
+		if err := validatePrivateInstallDirectory(root, prefix, info); err != nil {
+			return fmt.Errorf("plugin cache namespace %q is not private: %w", prefix, err)
 		}
+	}
+	return nil
+}
+
+func createPrivateInstallDirectory(root *os.Root, rel string) error {
+	osPath := filepath.FromSlash(rel)
+	if err := root.Mkdir(osPath, 0o700); err != nil {
+		return err
+	}
+	if err := securePrivateInstallDirectory(root, rel); err != nil {
+		removeErr := root.Remove(osPath)
+		if removeErr != nil && !os.IsNotExist(removeErr) {
+			return errors.Join(err, fmt.Errorf("removing incompletely secured plugin directory: %w", removeErr))
+		}
+		return err
 	}
 	return nil
 }
@@ -347,7 +376,7 @@ func openInstallSource(plugin Plugin) (*os.Root, error) {
 	if filepath.Clean(realPath) != filepath.Clean(plugin.RealPath) {
 		return nil, errors.New("plugin real path was replaced or retargeted after discovery")
 	}
-	root, err := os.OpenRoot(plugin.RealPath)
+	root, err := openInstallDirectory(plugin.RealPath)
 	if err != nil {
 		return nil, fmt.Errorf("opening plugin source: %w", err)
 	}
@@ -378,7 +407,7 @@ func installMutex(plugin Plugin, cachePath, destinationRel string) *sync.Mutex {
 func acquireInstallLock(ctx context.Context, root *os.Root, rel string) error {
 	deadline := time.Now().Add(installLockWait)
 	for {
-		err := root.Mkdir(filepath.FromSlash(rel), 0o700)
+		err := createPrivateInstallDirectory(root, rel)
 		if err == nil {
 			return nil
 		}
@@ -394,6 +423,9 @@ func acquireInstallLock(ctx context.Context, root *os.Root, rel string) error {
 		}
 		if !info.IsDir() {
 			return errors.New("plugin install lock is not a directory")
+		}
+		if err := validatePrivateInstallDirectory(root, rel, info); err != nil {
+			return fmt.Errorf("plugin install lock is not private: %w", err)
 		}
 		if time.Now().After(deadline) {
 			return errors.New("timed out waiting for another plugin installation")
@@ -415,7 +447,7 @@ func makeInstallStage(root *os.Root, parentRel string) (string, error) {
 			return "", fmt.Errorf("creating staged plugin name: %w", err)
 		}
 		rel := path.Join(parentRel, ".install-"+hex.EncodeToString(nonce[:]))
-		if err := root.Mkdir(filepath.FromSlash(rel), 0o700); err == nil {
+		if err := createPrivateInstallDirectory(root, rel); err == nil {
 			return rel, nil
 		} else if !os.IsExist(err) {
 			return "", fmt.Errorf("creating staged plugin root: %w", err)
@@ -473,10 +505,10 @@ func copyInstallDirectoryContext(ctx context.Context, source, destination *os.Ro
 			}
 			budget.bytes += written
 		case info.IsDir():
-			if err := destination.Mkdir(name, 0o700); err != nil {
+			if err := createPrivateInstallDirectory(destination, name); err != nil {
 				return err
 			}
-			sourceChild, err := source.OpenRoot(name)
+			sourceChild, err := openInstallSubdirectory(source, name)
 			if err != nil {
 				return err
 			}
@@ -488,7 +520,7 @@ func copyInstallDirectoryContext(ctx context.Context, source, destination *os.Ro
 				}
 				return fmt.Errorf("plugin directory changed during copy: %q", rel)
 			}
-			destinationChild, err := destination.OpenRoot(name)
+			destinationChild, err := openInstallSubdirectory(destination, name)
 			if err != nil {
 				sourceChild.Close()
 				return err
@@ -505,9 +537,6 @@ func copyInstallDirectoryContext(ctx context.Context, source, destination *os.Ro
 			if sourceCloseErr != nil {
 				return sourceCloseErr
 			}
-			if err := destination.Chmod(name, 0o700); err != nil {
-				return err
-			}
 		default:
 			return fmt.Errorf("special file %q is not allowed", rel)
 		}
@@ -520,10 +549,17 @@ func copyInstallFile(source, destination *os.Root, name, rel string, expected os
 }
 
 func copyInstallFileContext(ctx context.Context, source, destination *os.Root, name, rel string, expected os.FileInfo, remaining int64) (int64, error) {
+	return copyInstallFileContextWithHook(ctx, source, destination, name, rel, expected, remaining, nil)
+}
+
+func copyInstallFileContextWithHook(ctx context.Context, source, destination *os.Root, name, rel string, expected os.FileInfo, remaining int64, beforeOpen func()) (int64, error) {
 	if remaining < 0 || expected.Size() > remaining {
 		return 0, fmt.Errorf("plugin content exceeds %d-byte digest limit", maxDigestBytes)
 	}
-	input, err := source.Open(name)
+	if beforeOpen != nil {
+		beforeOpen()
+	}
+	input, err := openExtensionRootRead(source, name)
 	if err != nil {
 		return 0, err
 	}
@@ -536,12 +572,18 @@ func copyInstallFileContext(ctx context.Context, source, destination *os.Root, n
 		input.Close()
 		return 0, fmt.Errorf("plugin file changed during copy: %q", rel)
 	}
+	executable := installSourceExecutable(actual)
 	mode := os.FileMode(0o600)
-	if actual.Mode().Perm()&0o111 != 0 {
+	if executable {
 		mode = 0o700
 	}
 	output, err := destination.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
+		input.Close()
+		return 0, err
+	}
+	if err := securePrivateInstallFile(destination, name, output, executable); err != nil {
+		output.Close()
 		input.Close()
 		return 0, err
 	}
@@ -550,10 +592,19 @@ func copyInstallFileContext(ctx context.Context, source, destination *os.Root, n
 		copyErr = fmt.Errorf("plugin content exceeds %d-byte digest limit", maxDigestBytes)
 	}
 	if copyErr == nil {
-		copyErr = output.Chmod(mode)
+		copyErr = securePrivateInstallFile(destination, name, output, executable)
 	}
 	if copyErr == nil {
 		copyErr = output.Sync()
+	}
+	finished, finishedErr := input.Stat()
+	linked, linkedErr := safeInfo(source, name)
+	if copyErr == nil && (finishedErr != nil || linkedErr != nil || linked == nil ||
+		!finished.Mode().IsRegular() || !linked.Mode().IsRegular() ||
+		!os.SameFile(actual, finished) || !os.SameFile(finished, linked) ||
+		actual.Size() != finished.Size() || finished.Size() != written ||
+		!actual.ModTime().Equal(finished.ModTime())) {
+		copyErr = errors.Join(finishedErr, linkedErr, fmt.Errorf("plugin file changed during copy: %q", rel))
 	}
 	outputCloseErr := output.Close()
 	inputCloseErr := input.Close()
@@ -592,10 +643,10 @@ func inspectInstalled(root *os.Root, cachePath, objectRel string, expected Plugi
 	if !info.IsDir() {
 		return Plugin{}, true, errors.New("existing install destination is not a directory")
 	}
-	if info.Mode().Perm() != 0o700 {
-		return Plugin{}, true, fmt.Errorf("existing install destination mode is %04o, want 0700", info.Mode().Perm())
+	if err := validatePrivateInstallDirectory(root, objectRel, info); err != nil {
+		return Plugin{}, true, fmt.Errorf("existing install destination is not private: %w", err)
 	}
-	objectRoot, err := root.OpenRoot(filepath.FromSlash(objectRel))
+	objectRoot, err := openInstallSubdirectory(root, filepath.FromSlash(objectRel))
 	if err != nil {
 		return Plugin{}, true, fmt.Errorf("opening existing install destination: %w", err)
 	}
@@ -612,15 +663,18 @@ func inspectInstalled(root *os.Root, cachePath, objectRel string, expected Plugi
 	if err != nil {
 		return Plugin{}, true, fmt.Errorf("unsafe installed plugin root: %w", err)
 	}
-	if leafInfo == nil || !leafInfo.IsDir() || leafInfo.Mode().Perm() != 0o700 {
-		return Plugin{}, true, errors.New("installed plugin root is not a mode-0700 directory")
+	if leafInfo == nil || !leafInfo.IsDir() {
+		return Plugin{}, true, errors.New("installed plugin root is not a directory")
 	}
-	installedRoot, err := objectRoot.OpenRoot(leaf)
+	if err := validatePrivateInstallDirectory(objectRoot, leaf, leafInfo); err != nil {
+		return Plugin{}, true, fmt.Errorf("installed plugin root is not private: %w", err)
+	}
+	installedRoot, err := openInstallSubdirectory(objectRoot, leaf)
 	if err != nil {
 		return Plugin{}, true, fmt.Errorf("opening installed plugin root: %w", err)
 	}
 	defer installedRoot.Close()
-	if err := validateInstalledModes(installedRoot, "", 0, &digestBudget{}); err != nil {
+	if err := validateInstalledProtection(installedRoot, "", 0, &digestBudget{}); err != nil {
 		return Plugin{}, true, fmt.Errorf("invalid installed plugin tree: %w", err)
 	}
 	pluginRel := path.Join(objectRel, leaf)
@@ -632,7 +686,7 @@ func inspectInstalled(root *os.Root, cachePath, objectRel string, expected Plugi
 	return plugin, true, nil
 }
 
-func validateInstalledModes(root *os.Root, prefix string, depth int, budget *digestBudget) error {
+func validateInstalledProtection(root *os.Root, prefix string, depth int, budget *digestBudget) error {
 	entries, err := readDigestDirectory(root, ".", maxDigestEntries-budget.entries)
 	if err != nil {
 		return err
@@ -665,18 +719,14 @@ func validateInstalledModes(root *os.Root, prefix string, depth int, budget *dig
 		}
 		switch {
 		case info.Mode().IsRegular():
-			want := os.FileMode(0o600)
-			if info.Mode().Perm()&0o111 != 0 {
-				want = 0o700
-			}
-			if info.Mode().Perm() != want {
-				return fmt.Errorf("installed file %q mode is %04o, want %04o", rel, info.Mode().Perm(), want)
+			if err := validatePrivateInstallFile(root, name, info, installSourceExecutable(info)); err != nil {
+				return fmt.Errorf("installed file %q is not private: %w", rel, err)
 			}
 		case info.IsDir():
-			if info.Mode().Perm() != 0o700 {
-				return fmt.Errorf("installed directory %q mode is %04o, want 0700", rel, info.Mode().Perm())
+			if err := validatePrivateInstallDirectory(root, name, info); err != nil {
+				return fmt.Errorf("installed directory %q is not private: %w", rel, err)
 			}
-			child, err := root.OpenRoot(name)
+			child, err := openInstallSubdirectory(root, name)
 			if err != nil {
 				return err
 			}
@@ -688,7 +738,7 @@ func validateInstalledModes(root *os.Root, prefix string, depth int, budget *dig
 				}
 				return fmt.Errorf("installed directory changed during validation: %q", rel)
 			}
-			validateErr := validateInstalledModes(child, rel, depth+1, budget)
+			validateErr := validateInstalledProtection(child, rel, depth+1, budget)
 			closeErr := child.Close()
 			if validateErr != nil {
 				return validateErr
@@ -806,4 +856,17 @@ func ensureRootPath(root *os.Root, rootPath string) error {
 		return errors.New("root path was replaced or retargeted")
 	}
 	return nil
+}
+
+// os.OpenRoot and Root.OpenRoot open their final path component before they
+// verify that it is a directory. On Unix, opening a FIFO that way can block.
+// Appending a literal directory-self component makes the caller-controlled
+// component an intermediate directory lookup, so the kernel rejects a FIFO
+// (or another non-directory) without opening it.
+func openInstallDirectory(name string) (*os.Root, error) {
+	return rootedfs.OpenRoot(name)
+}
+
+func openInstallSubdirectory(root *os.Root, name string) (*os.Root, error) {
+	return rootedfs.OpenRootAt(root, name)
 }

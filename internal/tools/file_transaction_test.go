@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,7 +19,7 @@ import (
 
 func TestFailedAndNoopEditsCreateNoCheckpoint(t *testing.T) {
 	r, root := newRegistry(t)
-	rec := checkpoint.NewRecorder()
+	rec := newCheckpointRecorder(t, root)
 	r.SetCheckpoints(rec)
 	path := filepath.Join(root, "target.txt")
 	writeFile(t, path, "same\nsame\n")
@@ -92,8 +93,8 @@ func TestTransactionalWritePreservesExistingMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o751 {
-		t.Fatalf("mode=%o, want 751", info.Mode().Perm())
+	if want := restorableFileMode(0o751); info.Mode().Perm() != want.Perm() {
+		t.Fatalf("mode=%o, want %o", info.Mode().Perm(), want.Perm())
 	}
 }
 
@@ -121,9 +122,125 @@ func TestTransactionalCreationPublishesExactBytesWithoutTempLeak(t *testing.T) {
 	}
 }
 
+func TestMutationWithoutAtomicRecorderFailsBeforeFilesystemChange(t *testing.T) {
+	root := t.TempDir()
+	r, err := NewRegistry(root, execution.Capability{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := run(t, r, "write", map[string]any{
+		"path": "nested/new.txt", "content": "must not publish",
+	})
+	if !result.IsError || !strings.Contains(result.Content, "checkpoint recorder") {
+		t.Fatalf("unprotected mutation = %+v, want atomic-recorder refusal", result)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "nested")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused mutation created its parent or target: %v", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("refused mutation left filesystem artifacts: %v", entries)
+	}
+}
+
+func TestTransactionalMutationPostImageBound(t *testing.T) {
+	assertNoMutationArtifacts := func(t *testing.T, dirs ...string) {
+		t.Helper()
+		for _, dir := range dirs {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), ".switchboard-write-") {
+					t.Fatalf("mutation temporary leaked in %s: %s", dir, entry.Name())
+				}
+			}
+		}
+	}
+	assertOutsideUnchanged := func(t *testing.T, path string) {
+		t.Helper()
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != "outside sentinel" {
+			t.Fatalf("outside sentinel changed: bytes=%q err=%v", got, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		tool  string
+		size  int
+		exact bool
+	}{
+		{name: "write exact limit", tool: "write", size: int(maxWorkspaceFileBytes), exact: true},
+		{name: "write one over", tool: "write", size: int(maxWorkspaceFileBytes) + 1},
+		{name: "edit exact limit", tool: "edit", size: int(maxWorkspaceFileBytes), exact: true},
+		{name: "edit one over", tool: "edit", size: int(maxWorkspaceFileBytes) + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, root := newRegistry(t)
+			recorder := newCheckpointRecorder(t, root)
+			r.SetCheckpoints(recorder)
+			outside := t.TempDir()
+			outsideSentinel := filepath.Join(outside, "sentinel")
+			writeFile(t, outsideSentinel, "outside sentinel")
+
+			target := filepath.Join(root, "target.txt")
+			input := map[string]any{
+				"path":    "target.txt",
+				"content": strings.Repeat("w", tc.size),
+			}
+			if tc.tool == "edit" {
+				writeFile(t, target, "x")
+				if result := run(t, r, "read", map[string]any{"path": "target.txt"}); result.IsError {
+					t.Fatalf("arming edit read: %s", result.Content)
+				}
+				input = map[string]any{
+					"path": "target.txt", "old_string": "x",
+					"new_string": strings.Repeat("e", tc.size),
+				}
+			}
+
+			recorder.Begin(tc.name)
+			result := run(t, r, tc.tool, input)
+			if tc.exact {
+				if result.IsError {
+					t.Fatalf("exact-limit %s failed: %s", tc.tool, result.Content)
+				}
+				info, err := os.Stat(target)
+				if err != nil || info.Size() != maxWorkspaceFileBytes {
+					t.Fatalf("exact-limit post-image size=%v err=%v, want %d", info, err, maxWorkspaceFileBytes)
+				}
+				if turns := recorder.Turns(); len(turns) != 1 || turns[0].Files != 1 || turns[0].Partial {
+					t.Fatalf("exact-limit checkpoint = %+v", turns)
+				}
+			} else {
+				if !result.IsError || !strings.Contains(result.Content, "mutation file limit") {
+					t.Fatalf("oversized %s result = %+v", tc.tool, result)
+				}
+				if tc.tool == "write" {
+					if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("oversized write created a partial target: %v", err)
+					}
+				} else if got, err := os.ReadFile(target); err != nil || string(got) != "x" {
+					t.Fatalf("oversized edit changed its source: bytes=%q err=%v", got, err)
+				}
+				if turns := recorder.Turns(); len(turns) != 0 {
+					t.Fatalf("oversized %s prepared a checkpoint: %+v", tc.tool, turns)
+				}
+			}
+			assertNoMutationArtifacts(t, root, outside)
+			assertOutsideUnchanged(t, outsideSentinel)
+		})
+	}
+}
+
 func TestInjectedPrecommitRaceRefusesAndAbortsCheckpoint(t *testing.T) {
 	r, root := newRegistry(t)
-	rec := checkpoint.NewRecorder()
+	rec := newCheckpointRecorder(t, root)
 	r.SetCheckpoints(rec)
 	path := filepath.Join(root, "target.txt")
 	writeFile(t, path, "source")
@@ -140,7 +257,7 @@ func TestInjectedPrecommitRaceRefusesAndAbortsCheckpoint(t *testing.T) {
 			t.Fatalf("injecting race: %v", writeErr)
 		}
 	})
-	if err == nil || !strings.Contains(err.Error(), "changed before commit") {
+	if err == nil || !errors.Is(err, checkpoint.ErrStale) {
 		t.Fatalf("publish error=%v, want source CAS refusal", err)
 	}
 	if got, _ := os.ReadFile(path); string(got) != "external" {
@@ -206,7 +323,7 @@ func TestConcurrentDelegateRegistriesSerializeAndFailStale(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recorder := checkpoint.NewRecorder()
+	recorder := newCheckpointRecorder(t, root)
 	first.SetCheckpoints(recorder)
 	second.SetCheckpoints(recorder)
 	path := filepath.Join(root, "shared.txt")
@@ -268,7 +385,7 @@ func TestCaseOnlyAliasesShareMutationLeaseAcrossRegistries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recorder := checkpoint.NewRecorder()
+	recorder := newCheckpointRecorder(t, root)
 	first.SetCheckpoints(recorder)
 	second.SetCheckpoints(recorder)
 

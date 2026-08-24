@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 )
 
 const (
@@ -196,7 +198,7 @@ func discoverClaudeCommandCandidates(src *claudeCommandSource) ([]claudeCommandC
 	}
 	src.resolvedRoot = resolvedRoot
 
-	root, err := os.OpenRoot(resolvedRoot)
+	root, err := rootedfs.OpenRoot(resolvedRoot)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -307,7 +309,7 @@ func (w *claudeCommandWalker) walk(logicalDir, resolvedDir string, depth int) er
 // lexical prefix. os.File.ReadDir's underlying order is unspecified, so an
 // over-limit tree is rejected in full; successful trees are sorted here.
 func readCommandDir(root *os.Root, rel string, remaining *int) ([]os.DirEntry, error) {
-	dir, err := root.Open(rel)
+	dir, err := openRootedRead(root, rel)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +353,11 @@ func readCommandDir(root *os.Root, rel string, remaining *int) ([]os.DirEntry, e
 // filesystem object. os.Root keeps both checks and the read confined if a
 // writable repository races discovery by replacing a symlink or directory.
 func readClaudeCommandDefinition(src claudeCommandSource, candidate claudeCommandCandidate) ([]byte, error) {
-	root, err := os.OpenRoot(src.resolvedRoot)
+	return readClaudeCommandDefinitionWithHook(src, candidate, nil)
+}
+
+func readClaudeCommandDefinitionWithHook(src claudeCommandSource, candidate claudeCommandCandidate, beforeOpen func()) ([]byte, error) {
+	root, err := rootedfs.OpenRoot(src.resolvedRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -367,7 +373,10 @@ func readClaudeCommandDefinition(src claudeCommandSource, candidate claudeComman
 	if err != nil {
 		return nil, err
 	}
-	file, err := root.Open(rel)
+	if beforeOpen != nil {
+		beforeOpen()
+	}
+	file, err := openRootedRead(root, rel)
 	if err != nil {
 		return nil, err
 	}
@@ -391,6 +400,19 @@ func readClaudeCommandDefinition(src claudeCommandSource, candidate claudeComman
 	}
 	if int64(len(data)) > maxDefinitionBytes {
 		return nil, fmt.Errorf("%s exceeds the %d-byte limit", rel, maxDefinitionBytes)
+	}
+	afterFD, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !afterFD.Mode().IsRegular() || !os.SameFile(info, afterFD) ||
+		info.Size() != afterFD.Size() || !info.ModTime().Equal(afterFD.ModTime()) ||
+		int64(len(data)) != afterFD.Size() {
+		return nil, fmt.Errorf("definition changed while it was read")
+	}
+	afterPath, err := root.Stat(rel)
+	if err != nil || !afterPath.Mode().IsRegular() || !os.SameFile(afterFD, afterPath) {
+		return nil, fmt.Errorf("definition changed while it was read")
 	}
 	return data, nil
 }

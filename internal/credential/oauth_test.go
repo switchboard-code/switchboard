@@ -254,6 +254,84 @@ func TestTokenErrorsDoNotQuoteTheRequest(t *testing.T) {
 	}
 }
 
+func TestOAuthTokenResponseIsCompleteBoundedJSON(t *testing.T) {
+	prefix := `{"access_token":"ok","padding":"`
+	suffix := `"}`
+	exact := prefix + strings.Repeat("x", maxOAuthTokenResponseBytes-len(prefix)-len(suffix)) + suffix
+
+	for name, response := range map[string][]byte{
+		"exact boundary": []byte(exact),
+		"one byte over":  []byte(exact + " "),
+		"trailing value": []byte(`{"access_token":"ok"}{"access_token":"other"}`),
+		"invalid utf8":   append([]byte(`{"access_token":"`), []byte{0xff, '"', '}'}...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write(response)
+			}))
+			defer srv.Close()
+			s := &OAuthStore{Settings: OAuthSettings{TokenURL: srv.URL}}
+			tokens, err := s.token(context.Background(), url.Values{})
+			if name == "exact boundary" {
+				if err != nil || tokens.AccessToken != "ok" {
+					t.Fatalf("exact boundary: tokens=%v err=%v", tokens, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("unsafe response was accepted: %+v", tokens)
+			}
+		})
+	}
+}
+
+func TestOAuthEndpointDiagnosticsNeverExposeTokensOrTerminalControls(t *testing.T) {
+	const (
+		access   = "short-access-secret"
+		returned = "short-refresh-secret"
+		outbound = "outbound-refresh-secret"
+	)
+	credentialToken := "ghp_" + strings.Repeat("A", 40)
+	response, err := json.Marshal(map[string]string{
+		"access_token":      access,
+		"refresh_token":     returned,
+		"error":             "invalid_grant\x1b]2;forged\a",
+		"error_description": "echo " + access + " " + returned + " " + outbound + " " + credentialToken + "\n\u202e",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write(response)
+	}))
+	defer srv.Close()
+	s := &OAuthStore{Settings: OAuthSettings{TokenURL: srv.URL}}
+	_, err = s.token(context.Background(), url.Values{"refresh_token": {outbound}})
+	if err == nil {
+		t.Fatal("endpoint refusal was accepted")
+	}
+	message := err.Error()
+	for _, secret := range []string{access, returned, outbound, credentialToken, "ghp_"} {
+		if strings.Contains(message, secret) {
+			t.Fatalf("OAuth error exposed %q: %q", secret, message)
+		}
+	}
+	for _, control := range []string{"\x1b", "\a", "\n", "\u202e"} {
+		if strings.Contains(message, control) {
+			t.Fatalf("OAuth error retained terminal control %q: %q", control, message)
+		}
+	}
+	for _, escaped := range []string{`\x1b`, `\x07`, `\x0a`, `\u202e`} {
+		if !strings.Contains(message, escaped) {
+			t.Errorf("OAuth error did not visibly escape %q: %q", escaped, message)
+		}
+	}
+	if !strings.Contains(message, "invalid_grant") {
+		t.Fatalf("OAuth error lost its useful nonsecret diagnostic: %q", message)
+	}
+}
+
 // An unconfigured provider is a miss, not a failure: the resolver has to be able
 // to carry on to the platform store, which is where most users' keys live.
 func TestUnconfiguredOAuthIsAMiss(t *testing.T) {

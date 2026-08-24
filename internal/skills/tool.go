@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/switchboard-code/switchboard/internal/permission"
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 	"github.com/switchboard-code/switchboard/internal/tools"
 )
 
@@ -33,17 +34,31 @@ type skillTool struct {
 func NewTool(list []Skill) tools.Tool {
 	t := &skillTool{byName: map[string][]Skill{}}
 	for _, sk := range ModelVisible(list) {
+		// Work on the value copy produced by the range. The complete description
+		// and body must be scanned before the description enters the frozen tool
+		// schema or the body can become a tool result, while the caller's source
+		// inventory remains an exact account of what discovery read.
 		if sk.rootDir == "" {
 			if resolved, err := filepath.EvalSymlinks(sk.Dir); err == nil {
 				sk.rootDir = resolved
 			}
 		}
 		if sk.rootInfo == nil && sk.rootDir != "" {
-			if root, err := os.OpenRoot(sk.rootDir); err == nil {
+			if root, err := rootedfs.OpenRoot(sk.rootDir); err == nil {
 				sk.rootInfo, _ = root.Stat(".")
 				root.Close()
 			}
 		}
+		// Identity and provenance are provider-visible too: Key and Name are
+		// rendered into the frozen tool description, while Dir is returned with a
+		// loaded body. Resolve the real resource root above, then redact only this
+		// value copy so serving retains its filesystem identity and the caller's
+		// discovery inventory remains exact.
+		sk.Name = redactSkillEgress(sk.Name)
+		sk.Selector = redactSkillSelector(sk.Selector)
+		sk.Description = redactSkillEgress(sk.Description)
+		sk.Body = redactSkillEgress(sk.Body)
+		sk.Dir = redactSkillEgress(sk.Dir)
 		key := sk.Key()
 		if len(t.byName[key]) == 0 {
 			t.names = append(t.names, key)
@@ -70,9 +85,9 @@ func (t *skillTool) Description() string {
 		if name != sk.Name {
 			label += " (" + sk.Name + ")"
 		}
-		b.WriteString("- " + label + ": " + description + "\n")
+		b.WriteString("- " + redactSkillEgress(label) + ": " + redactSkillEgress(description) + "\n")
 	}
-	return strings.TrimRight(b.String(), "\n")
+	return redactSkillEgress(strings.TrimRight(b.String(), "\n"))
 }
 
 // ParallelSafe: serving is memory and read-only files, no shared state.
@@ -97,14 +112,14 @@ type skillInput struct {
 func (t *skillTool) Plan(input json.RawMessage) (tools.Plan, error) {
 	var in skillInput
 	if err := json.Unmarshal(input, &in); err != nil {
-		return tools.Plan{}, fmt.Errorf("skill: %w", err)
+		return tools.Plan{}, fmt.Errorf("skill: %s", redactSkillEgress(err.Error()))
 	}
 	matches := t.byName[in.Name]
 	if len(matches) == 0 {
-		return tools.Plan{}, fmt.Errorf("skill: no skill named %q; the available ones are listed in this tool's description", in.Name)
+		return tools.Plan{}, fmt.Errorf("skill: no skill named %q; the available ones are listed in this tool's description", redactSkillEgress(in.Name))
 	}
 	if len(matches) != 1 {
-		return tools.Plan{}, fmt.Errorf("skill: selector %q is ambiguous across %d definitions", in.Name, len(matches))
+		return tools.Plan{}, fmt.Errorf("skill: selector %q is ambiguous across %d definitions", redactSkillEgress(in.Name), len(matches))
 	}
 	sk := matches[0]
 
@@ -112,15 +127,24 @@ func (t *skillTool) Plan(input json.RawMessage) (tools.Plan, error) {
 	if in.File != "" {
 		detail += " " + in.File
 	}
+	detail = redactSkillEgress(detail)
 	return tools.Plan{
 		Request: permission.Request{Tool: t.Name(), Effect: permission.EffectRead, Detail: detail},
 		Run: func(ctx context.Context) (tools.Result, error) {
 			if in.File != "" {
 				return serveFile(sk, in.File)
 			}
-			return tools.Result{Content: fmt.Sprintf("Skill %s, from %s:\n\n%s", sk.Name, sk.Dir, sk.Body)}, nil
+			return skillResult(fmt.Sprintf("Skill %s, from %s:\n\n%s", sk.Name, sk.Dir, sk.Body), false), nil
 		},
 	}, nil
+}
+
+// skillResult is the final provider-result boundary. Components are redacted
+// before composition above so punctuation cannot hide their credential word
+// boundaries; scanning the completed value again closes combinations that
+// become recognizable only after composition.
+func skillResult(content string, isError bool) tools.Result {
+	return tools.Result{Content: redactSkillEgress(content), IsError: isError}
 }
 
 // serveFile answers with a file from the skill's directory and refuses
@@ -129,37 +153,41 @@ func (t *skillTool) Plan(input json.RawMessage) (tools.Plan, error) {
 // cannot carry the operation outside the directory after a separate check.
 func serveFile(sk Skill, rel string) (tools.Result, error) {
 	if filepath.IsAbs(rel) {
-		return tools.Result{Content: "skill files are relative to the skill's directory; " + rel + " is absolute", IsError: true}, nil
+		return skillResult("skill files are relative to the skill's directory; "+redactSkillEgress(rel)+" is absolute", true), nil
 	}
 	clean := filepath.Clean(rel)
 	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return tools.Result{Content: rel + " leaves skill " + sk.Name + "'s directory, which this tool does not serve", IsError: true}, nil
+		return skillResult(redactSkillEgress(rel)+" leaves skill "+sk.Name+"'s directory, which this tool does not serve", true), nil
 	}
 	rootDir := sk.rootDir
 	if rootDir == "" {
 		rootDir = sk.Dir
 	}
-	root, err := os.OpenRoot(rootDir)
+	root, err := rootedfs.OpenRoot(rootDir)
 	if err != nil {
-		return tools.Result{Content: err.Error(), IsError: true}, nil
+		return skillResult(err.Error(), true), nil
 	}
 	defer root.Close()
 	openedInfo, err := root.Stat(".")
 	if err != nil {
-		return tools.Result{Content: err.Error(), IsError: true}, nil
+		return skillResult(err.Error(), true), nil
 	}
 	if sk.rootInfo == nil || !os.SameFile(sk.rootInfo, openedInfo) {
-		return tools.Result{Content: "skill " + sk.Name + "'s directory changed after discovery; refusing to serve supporting files", IsError: true}, nil
+		return skillResult("skill "+sk.Name+"'s directory changed after discovery; refusing to serve supporting files", true), nil
 	}
 	data, err := readFileFromRoot(root, rel, maxSupportingBytes)
 	if err != nil {
+		displayRel := redactSkillEgress(rel)
 		if os.IsNotExist(err) {
-			return tools.Result{Content: rel + " does not exist in skill " + sk.Name + "'s directory", IsError: true}, nil
+			return skillResult(displayRel+" does not exist in skill "+sk.Name+"'s directory", true), nil
 		}
 		if strings.Contains(err.Error(), "path escapes from parent") {
-			return tools.Result{Content: rel + " leaves skill " + sk.Name + "'s directory, which this tool does not serve", IsError: true}, nil
+			return skillResult(displayRel+" leaves skill "+sk.Name+"'s directory, which this tool does not serve", true), nil
 		}
-		return tools.Result{Content: rel + " cannot be read within skill " + sk.Name + "'s directory: " + err.Error(), IsError: true}, nil
+		return skillResult(displayRel+" cannot be read within skill "+sk.Name+"'s directory: "+redactSkillEgress(err.Error()), true), nil
 	}
-	return tools.Result{Content: string(data)}, nil
+	// Scan the complete bounded resource before constructing the tool result.
+	// In particular, do not truncate first: a key that begins near a display or
+	// read boundary still has to meet the scanner's full length floor.
+	return skillResult(redactSkillEgress(string(data)), false), nil
 }

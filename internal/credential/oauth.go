@@ -8,13 +8,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
-	"os/exec"
-	"runtime"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/switchboard-code/switchboard/internal/terminaltext"
 )
 
 // OAuthSettings configures an authorization-code flow with PKCE.
@@ -88,6 +91,11 @@ func (t tokenSet) GoString() string { return redacted }
 // request arrives at the server already dead, and the turn fails for a reason
 // that has nothing to do with what the user asked.
 const expiryMargin = 60 * time.Second
+
+const (
+	maxOAuthTokenResponseBytes = 1 << 20
+	maxOAuthErrorRunes         = 1024
+)
 
 func (t tokenSet) expired(now time.Time) bool {
 	if t.ExpiresAt.IsZero() {
@@ -247,7 +255,9 @@ func (s *OAuthStore) Login(ctx context.Context, ref Ref, prompt func(url string)
 		q := r.URL.Query()
 		if desc := q.Get("error"); desc != "" {
 			http.Error(w, "authorization failed", http.StatusBadRequest)
-			failures <- fmt.Errorf("the authorization server refused: %s %s", desc, q.Get("error_description"))
+			failures <- fmt.Errorf("the authorization server refused: %s %s",
+				sanitizeOAuthEndpointComponent(desc, nil),
+				sanitizeOAuthEndpointComponent(q.Get("error_description"), nil))
 			return
 		}
 		// The state check is what makes this flow safe to run on a loopback
@@ -368,16 +378,29 @@ func (s *OAuthStore) refresh(ctx context.Context, refreshToken string) (tokenSet
 func (s *OAuthStore) token(ctx context.Context, form url.Values) (tokenSet, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.Settings.TokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return tokenSet{}, err
+		return tokenSet{}, errors.New("the token endpoint request could not be built")
 	}
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
 	req.Header.Set("accept", "application/json")
 
 	resp, err := s.client().Do(req)
 	if err != nil {
-		return tokenSet{}, err
+		if ctx.Err() != nil {
+			return tokenSet{}, ctx.Err()
+		}
+		return tokenSet{}, errors.New("the token endpoint request failed")
 	}
 	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxOAuthTokenResponseBytes+1))
+	if err != nil {
+		return tokenSet{}, errors.New("the token endpoint response could not be read")
+	}
+	if len(raw) > maxOAuthTokenResponseBytes {
+		return tokenSet{}, fmt.Errorf("the token endpoint response exceeded the %d-byte limit", maxOAuthTokenResponseBytes)
+	}
+	if !utf8.Valid(raw) {
+		return tokenSet{}, errors.New("the token endpoint returned invalid UTF-8")
+	}
 
 	var body struct {
 		AccessToken  string `json:"access_token"`
@@ -388,13 +411,22 @@ func (s *OAuthStore) token(ctx context.Context, form url.Values) (tokenSet, erro
 		Error            string `json:"error"`
 		ErrorDescription string `json:"error_description"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	// json.Unmarshal, rather than Decoder.Decode, proves this is one complete
+	// document and rejects a second trailing value.
+	if err := json.Unmarshal(raw, &body); err != nil {
 		return tokenSet{}, fmt.Errorf("the token endpoint returned something that is not JSON (http %d)", resp.StatusCode)
 	}
 	if body.Error != "" {
-		// The server's own words, never the request: the form carries a code or
-		// a refresh token and neither belongs in an error message.
-		return tokenSet{}, fmt.Errorf("the token endpoint refused: %s %s", body.Error, body.ErrorDescription)
+		// Endpoint text is external input. Scrub both returned credentials and
+		// request-side grants before it can become an error, session note, or
+		// terminal line.
+		sensitive := []string{body.AccessToken, body.RefreshToken}
+		for _, key := range []string{"refresh_token", "code", "code_verifier"} {
+			sensitive = append(sensitive, form[key]...)
+		}
+		return tokenSet{}, fmt.Errorf("the token endpoint refused: %s %s",
+			sanitizeOAuthEndpointComponent(body.Error, sensitive),
+			sanitizeOAuthEndpointComponent(body.ErrorDescription, sensitive))
 	}
 	if resp.StatusCode >= 300 {
 		return tokenSet{}, fmt.Errorf("the token endpoint returned http %d", resp.StatusCode)
@@ -412,6 +444,33 @@ func (s *OAuthStore) token(ctx context.Context, form url.Values) (tokenSet, erro
 		tokens.ExpiresAt = s.now().Add(time.Duration(body.ExpiresIn) * time.Second)
 	}
 	return tokens, nil
+}
+
+func sanitizeOAuthEndpointComponent(text string, sensitive []string) string {
+	sensitive = append([]string(nil), sensitive...)
+	// Replace longer exact secrets first so one value that is a prefix of
+	// another cannot leave the latter's suffix behind.
+	sort.Slice(sensitive, func(i, j int) bool { return len(sensitive[i]) > len(sensitive[j]) })
+	seen := make(map[string]struct{}, len(sensitive))
+	for _, secret := range sensitive {
+		if secret == "" {
+			continue
+		}
+		if _, ok := seen[secret]; ok {
+			continue
+		}
+		seen[secret] = struct{}{}
+		text = strings.ReplaceAll(text, secret, "[redacted: OAuth secret]")
+	}
+	if leaks := ScanPrompt(text); len(leaks) > 0 {
+		text = Redact(text, leaks)
+	}
+	text = terminaltext.Escape(text)
+	runes := []rune(text)
+	if len(runes) > maxOAuthErrorRunes {
+		text = string(runes[:maxOAuthErrorRunes]) + "…"
+	}
+	return text
 }
 
 // pkce returns a verifier and its S256 challenge.
@@ -437,14 +496,5 @@ func randomString(n int) (string, error) {
 // browser to open and the flow still has to be completable by pasting it
 // somewhere that does.
 func OpenInBrowser(target string) {
-	var cmd string
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = "open"
-	case "linux":
-		cmd = "xdg-open"
-	default:
-		return
-	}
-	_ = exec.Command(cmd, target).Start()
+	openBrowser(target)
 }

@@ -12,6 +12,7 @@
 package eval
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -75,7 +76,9 @@ type Task struct {
 	Setup func(dir string) error
 
 	// Verify decides whether the task was solved, and says why when it was not.
-	Verify func(dir string) (solved bool, detail string, err error)
+	// It shares the attempt deadline: a verifier is part of the measurement,
+	// not unbounded cleanup after the measured turn.
+	Verify func(ctx context.Context, dir string) (solved bool, detail string, err error)
 }
 
 // Run is one attempt.

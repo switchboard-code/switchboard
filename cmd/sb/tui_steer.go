@@ -18,13 +18,44 @@ import (
 	"github.com/switchboard-code/switchboard/internal/provider"
 )
 
+// pendingSteer keeps the exact user-visible correction beside the expanded
+// provider text. Compaction needs that durable authored projection to grant
+// scope-changing authority to the user's words without granting it to an
+// @mentioned file that rode in with them.
+type pendingSteer struct {
+	prompt   string
+	authored string
+}
+
 func (a *tuiApp) queueSteer(text string) {
+	a.queueSteerAuthored(text, text)
+}
+
+func (a *tuiApp) queueSteerAuthored(prompt, authored string) {
 	a.steerMu.Lock()
 	defer a.steerMu.Unlock()
-	a.steers = append(a.steers, text)
+	a.steers = append(a.steers, pendingSteer{prompt: prompt, authored: authored})
 }
 
 func (a *tuiApp) takeSteers() []string {
+	pending := a.takePendingSteers()
+	out := make([]string, len(pending))
+	for i := range pending {
+		out[i] = pending[i].prompt
+	}
+	return out
+}
+
+func (a *tuiApp) takeSteerAuthored() []string {
+	pending := a.takePendingSteers()
+	out := make([]string, len(pending))
+	for i := range pending {
+		out[i] = pending[i].authored
+	}
+	return out
+}
+
+func (a *tuiApp) takePendingSteers() []pendingSteer {
 	a.steerMu.Lock()
 	defer a.steerMu.Unlock()
 	out := a.steers
@@ -38,10 +69,13 @@ func (a *tuiApp) takeSteers() []string {
 // /retry's opening detection reads one as what it is — something that rode in
 // mid-turn, never a turn's opening.
 func (a *tuiApp) steerRound() []provider.Message {
-	steers := a.takeSteers()
+	steers := a.takePendingSteers()
 	out := make([]provider.Message, 0, len(steers))
-	for _, text := range steers {
-		out = append(out, provider.UserText("[steer] "+text))
+	for _, steer := range steers {
+		message := provider.UserText("[steer] " + steer.prompt).
+			WithAuthoredText("[steer] " + steer.authored)
+		message.UserSteer = true
+		out = append(out, message)
 	}
 	return out
 }
@@ -67,20 +101,23 @@ func (m *tuiModel) steerKey() tea.Cmd {
 	m.sugClosed = false
 	m.sugSel = 0
 	// Same history as a send: a correction recalled with up-arrow is a
-	// correction you can steer again without retyping.
-	if len(m.history) == 0 || m.history[len(m.history)-1] != text {
-		m.history = append(m.history, text)
-		appendHistory(m.app.workspace, text)
-	}
-	m.histIdx = len(m.history)
+	// correction you can steer again without retyping. The history seam
+	// redacts recognized credentials before either copy is written.
+	m.rememberPrompt(text)
 	if m.operationActive {
-		// An operation is not a turn: no round boundary is coming. The words
-		// are a prompt, so they queue as one.
-		m.queue = append(m.queue, text)
-		m.addNotice("", "queued; it runs when the current operation finishes")
-		return nil
+		return m.queuePromptAfterOperation(text)
 	}
 	return m.steer(text)
+}
+
+// queuePromptAfterOperation keeps both steer entry points honest while a
+// session operation owns the loop. Compacting, resuming, learning, and the
+// other exclusive operations have no model-round boundary to receive a
+// steer, so the user's words become the next ordinary prompt instead.
+func (m *tuiModel) queuePromptAfterOperation(text string) tea.Cmd {
+	m.queue = append(m.queue, text)
+	m.addNotice("", "queued; it runs when the current operation finishes")
+	return nil
 }
 
 // steer hands text to the running turn. Mentions expand the way they would
@@ -90,9 +127,27 @@ func (m *tuiModel) steerKey() tea.Cmd {
 // than silently dropped.
 func (m *tuiModel) steer(text string) tea.Cmd {
 	expanded, images := m.expandMentions(text)
+	leaks := credential.ScanPrompt(expanded)
+	// A secret decision is asynchronous user input. Bind it to the exact turn
+	// and session whose next round could receive the steer; if that boundary
+	// disappears while the dialog is open, the correction must not surface in
+	// a later, unrelated turn. Direct unit callers with no active turn retain
+	// the small unbound seam used to exercise redaction itself.
+	boundToTurn := !m.operationActive && (m.busy || m.turnPlanning)
+	turnGeneration := m.turnGeneration
+	sessionID := currentSessionID(m)
 	send := func(p string) tea.Cmd {
-		m.app.queueSteer(p)
-		m.addUser(text)
+		if boundToTurn && (m.operationActive || (!m.busy && !m.turnPlanning) ||
+			m.turnGeneration != turnGeneration || currentSessionID(m) != sessionID) {
+			m.addNotice("warn", "not steered: that turn ended while the credential decision was open; submit the correction as a new prompt if it is still needed")
+			return nil
+		}
+		display := text
+		if len(leaks) > 0 && p != expanded {
+			display = credential.Redact(display, leaks)
+		}
+		m.app.queueSteerAuthored(p, display)
+		m.addUser(display)
 		note := "steers the running turn; it lands at the next round boundary"
 		if len(images) > 0 {
 			note = "steers the running turn as text at the next round boundary; the attached image(s) cannot ride it"
@@ -100,7 +155,7 @@ func (m *tuiModel) steer(text string) tea.Cmd {
 		m.addNotice("", note)
 		return nil
 	}
-	if leaks := credential.ScanPrompt(expanded); len(leaks) > 0 {
+	if len(leaks) > 0 {
 		return m.openSecretGate(leaks, expanded, send)
 	}
 	return send(expanded)
@@ -113,6 +168,9 @@ func cmdSteer(m *tuiModel, args string) tea.Cmd {
 	}
 	if m.race != nil {
 		return noticeCmd("warn", "a race's arms cannot hear you; the session that continues can be steered after the verdict")
+	}
+	if m.operationActive {
+		return m.queuePromptAfterOperation(text)
 	}
 	if m.busy || m.turnPlanning {
 		return m.steer(text)

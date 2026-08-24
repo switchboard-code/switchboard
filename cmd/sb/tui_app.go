@@ -19,7 +19,6 @@ import (
 	"github.com/switchboard-code/switchboard/internal/delegate"
 	"github.com/switchboard-code/switchboard/internal/execution"
 	"github.com/switchboard-code/switchboard/internal/permission"
-	"github.com/switchboard-code/switchboard/internal/prefix"
 	"github.com/switchboard-code/switchboard/internal/provider"
 	route "github.com/switchboard-code/switchboard/internal/router"
 	"github.com/switchboard-code/switchboard/internal/schedule"
@@ -59,7 +58,7 @@ type tuiApp struct {
 	// round boundary drains them. Written from the UI goroutine, read from
 	// the loop's; the mutex is the whole protocol.
 	steerMu sync.Mutex
-	steers  []string
+	steers  []pendingSteer
 
 	// trust is the standing record of which checkouts may run what they
 	// declare. Nil when the store could not open; trustErr says why.
@@ -85,6 +84,17 @@ type tuiApp struct {
 
 	// undo is the per-turn file checkpoint recorder, for /undo.
 	undo *checkpoint.Recorder
+
+	// Retry dependencies are replaceable only by deterministic fault-injection
+	// tests. Production leaves them nil and uses the ordinary advisor barrier
+	// and live-source fork.
+	retryPause func(context.Context, *tuiApp) (func(), error)
+	retryFork  func(*session.Store, *session.Session, int) (*session.Session, error)
+
+	// reliefAfterProbe is a deterministic generation-race seam. Production
+	// leaves it nil; tests use it to prove a provider reset cannot commit a
+	// fallback note or binding prepared by the retired generation.
+	reliefAfterProbe func()
 
 	// agents are the named subagent definitions the session discovered, and
 	// agentNotes what their loading had to say; both for /agents.
@@ -138,6 +148,35 @@ type tuiApp struct {
 
 	obs *tuiObserver
 	p   *tea.Program
+
+	// lifetime is independent of Bubble Tea's private program context. Send
+	// intentionally becomes a no-op after a Program stops, so a permission or
+	// question message can be dropped before the UI ever owns a dialog to drain.
+	// Closing this signal after Run returns releases those otherwise invisible
+	// waiters as well as future asks through a stale relay.
+	lifetime *tuiLifetime
+}
+
+type tuiLifetime struct {
+	done chan struct{}
+	once sync.Once
+}
+
+func newTUILifetime() *tuiLifetime {
+	return &tuiLifetime{done: make(chan struct{})}
+}
+
+func (l *tuiLifetime) stop() {
+	if l != nil {
+		l.once.Do(func() { close(l.done) })
+	}
+}
+
+func (l *tuiLifetime) Done() <-chan struct{} {
+	if l == nil {
+		return nil
+	}
+	return l.done
 }
 
 // displayPath renders an absolute path workspace-relative, the way the
@@ -178,19 +217,57 @@ func invalidatesWorkspace(req permission.Request) bool {
 	return req.Effect == permission.EffectWrite || req.Effect == permission.EffectExecute
 }
 
+type tuiMessageSender interface {
+	Send(tea.Msg)
+}
+
+func tuiLifetimeStopped(done <-chan struct{}) bool {
+	if done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
+func tuiWaitCancellation(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return context.Canceled
+}
+
 // tuiAsker resolves a permission Ask against a dialog in the TUI. The loop
 // blocks here until the user answers or the turn is cancelled; a program that
 // has already quit leaves no one to answer, so nothing is approved.
-type tuiAsker struct{ p *tea.Program }
+type tuiAsker struct {
+	p            tuiMessageSender
+	lifetimeDone <-chan struct{}
+}
 
 func (a *tuiAsker) Ask(ctx context.Context, req permission.Request, out permission.Outcome) (permission.Response, error) {
+	if tuiLifetimeStopped(a.lifetimeDone) {
+		return permission.Response{}, tuiWaitCancellation(ctx)
+	}
 	respond := make(chan permission.Response, 1)
-	a.p.Send(askMsg{req: req, out: out, respond: respond})
+	token := &dialogToken{}
+	a.p.Send(askMsg{req: req, out: out, respond: respond, token: token})
 	select {
 	case resp := <-respond:
+		// Cancellation is the owner's last word when an answer and shutdown race.
+		// In particular, a buffered approval must not win after the UI disappeared.
+		if tuiLifetimeStopped(a.lifetimeDone) || ctx.Err() != nil {
+			return permission.Response{}, tuiWaitCancellation(ctx)
+		}
 		return resp, nil
 	case <-ctx.Done():
+		a.p.Send(cancelDialogMsg{token: token})
 		return permission.Response{}, ctx.Err()
+	case <-a.lifetimeDone:
+		return permission.Response{}, tuiWaitCancellation(ctx)
 	}
 }
 
@@ -269,7 +346,11 @@ func (a *tuiApp) moveTo(ctx context.Context, rank int, why string) (func() bool,
 		abandoned = abandonedCacheNote(current.Cache, a.catalog, time.Now())
 	}
 	bind := func() bool {
-		if err := persistRuntimeBinding(a.loop.Session, probed, false); err != nil {
+		if !a.providers.preparedClientCurrent(client) {
+			a.p.Send(noticeMsg{level: "warn", text: "provider settings changed while preparing the automatic tier move; the move was discarded and will be planned again from current evidence"})
+			return false
+		}
+		if err := persistRuntimeBindingFallback(a.loop.Session, probed, false, note); err != nil {
 			a.p.Send(noticeMsg{level: "warn", text: "the automatic tier move was not saved: " + err.Error()})
 			return false
 		}
@@ -280,7 +361,6 @@ func (a *tuiApp) moveTo(ctx context.Context, rank int, why string) (func() bool,
 	after := func() {
 		if note != "" {
 			a.p.Send(noticeMsg{level: "warn", text: note})
-			a.loop.Session.AppendNote("warn", note)
 		}
 		if abandoned != "" {
 			// The note is a fact about this session's economics, so it goes in
@@ -354,10 +434,17 @@ func (m *tuiModel) switchTier(id string) tea.Cmd {
 	if err != nil {
 		return noticeCmd("warn", err.Error())
 	}
+	return m.ownOperationCmd(operation, m.probeTierSwitch(ctx, operation, sourceID, tier, false, 0))
+}
+
+func (m *tuiModel) probeTierSwitch(ctx context.Context, operation uint64, sourceID string,
+	tier config.Tier, silent bool, retries int,
+) tea.Cmd {
+	a := m.app
 	return func() tea.Msg {
 		probed, client, note, err := a.providers.probeTierFallback(ctx, tier)
-		return tierSwitchMsg{tier: probed, client: client, note: note, err: err,
-			operation: operation, sourceID: sourceID}
+		return tierSwitchMsg{tier: probed, requested: tier, client: client, providerRetries: retries,
+			silent: silent, note: note, err: err, operation: operation, sourceID: sourceID}
 	}
 }
 
@@ -372,7 +459,7 @@ func (a *tuiApp) reopen(ctx context.Context, operation uint64, sourceID, id stri
 		if err != nil {
 			return sessionSwapMsg{err: fmt.Errorf("waiting for the advisor ledger before resume: %w", err), operation: operation, sourceID: sourceID}
 		}
-		sess, err := a.store.Open(id)
+		sess, err := a.store.OpenInWorkspace(id, a.workspace)
 		if err != nil {
 			return sessionSwapMsg{err: err, release: release, operation: operation, sourceID: sourceID}
 		}
@@ -382,44 +469,17 @@ func (a *tuiApp) reopen(ctx context.Context, operation uint64, sourceID, id stri
 			sess.Close()
 			return sessionSwapMsg{err: matchErr, release: release, operation: operation, sourceID: sourceID}
 		}
-		var probed config.Tier
-		var client provider.Provider
-		var note string
-		if configured {
-			rank := a.rankOf(tier)
-			probed, client, note, err = a.providers.probeTierFallbackFeasible(ctx, tier, func(candidate config.Tier) error {
-				return checkResumeFeasible(sess, a.loop, a.catalog, a.providers, a.budget, a.config.Destinations, candidate, rank)
-			})
-		} else {
-			probed, client, err = a.providers.probeTier(ctx, tier)
-		}
+		probed, client, note, err := probeResumeTarget(ctx, sess, a.loop, a.catalog, a.providers, a.budget,
+			a.config.Destinations, tier, configured, a.rankOf(tier))
 		if err != nil {
 			sess.Close()
 			return sessionSwapMsg{err: err, release: release, operation: operation, sourceID: sourceID}
 		}
 		pinned := state.RuntimeBinding.Target != "" && state.RuntimeBinding.Pinned
 		return sessionSwapMsg{sess: sess, tier: probed, client: client, note: note, warnNote: note != "", pinned: pinned,
-			release: release, operation: operation, sourceID: sourceID}
+			reprobeFallbacks: configured,
+			release:          release, operation: operation, sourceID: sourceID}
 	}
-}
-
-func checkResumeFeasible(sess *session.Session, loop *agent.Loop, cat *catalog.Catalog, probes *providers, budget *budgetState, destinations []string, tier config.Tier, rank int) error {
-	state := sess.State()
-	request := provider.Request{System: loop.System, Tools: loop.Tools.Definitions(), Messages: state.Messages}
-	promptTokens := prefix.RequestTokens(request)
-	contextTokens := prefix.RequestTokenCeiling(request)
-	remaining, limited := remainingBudget(budget, state.ID,
-		catalog.Money(state.RetryReserveMicroUSD), catalog.Money(state.AccountedCostMicroUSD()))
-	_, err := (route.Heuristic{}).Route(route.Input{
-		Candidates: []route.Candidate{withLiveVision(candidateForTierContext(tier, rank, cat, promptTokens, contextTokens, 0), probes)},
-		Requirements: route.Requirements{
-			NeedsTools:        true,
-			NeedsVision:       messagesNeedVision(state.Messages),
-			ApprovedProviders: destinations,
-		},
-		Budgets: route.Budgets{MaxCost: remaining, MaxCostSet: limited}, Pin: tier.ID,
-	})
-	return err
 }
 
 // forkSession branches the current session at a message boundary into a new
@@ -437,7 +497,7 @@ func (a *tuiApp) forkSession(ctx context.Context, operation uint64, sourceID, id
 		if err != nil {
 			return sessionSwapMsg{err: fmt.Errorf("waiting for the advisor ledger before fork: %w", err), operation: operation, sourceID: sourceID}
 		}
-		sess, err := a.store.ForkSession(source, keepMessages)
+		sess, err := a.store.ForkSessionStaged(source, keepMessages)
 		if err != nil {
 			return sessionSwapMsg{err: err, release: release, operation: operation, sourceID: sourceID}
 		}
@@ -462,7 +522,7 @@ func (a *tuiApp) clearSession(ctx context.Context, operation uint64, sourceID st
 		if err != nil {
 			return sessionSwapMsg{err: fmt.Errorf("waiting for the advisor ledger before clear: %w", err), operation: operation, sourceID: sourceID}
 		}
-		sess, err := a.store.Create(a.workspace, tier.Target.ID(), a.catalog.Revision)
+		sess, err := a.store.CreateStaged(a.workspace, tier.Target.ID(), a.catalog.Revision)
 		if err != nil {
 			return sessionSwapMsg{err: err, release: release, operation: operation, sourceID: sourceID}
 		}
@@ -476,7 +536,7 @@ func (m *tuiModel) reopen(id string) tea.Cmd {
 	if err != nil {
 		return noticeCmd("warn", err.Error())
 	}
-	return m.app.reopen(ctx, generation, sourceID, id)
+	return m.ownOperationCmd(generation, m.app.reopen(ctx, generation, sourceID, id))
 }
 
 func (m *tuiModel) forkSession(id string, keepMessages, dropped int) tea.Cmd {
@@ -484,7 +544,7 @@ func (m *tuiModel) forkSession(id string, keepMessages, dropped int) tea.Cmd {
 	if err != nil {
 		return noticeCmd("warn", err.Error())
 	}
-	return m.app.forkSession(ctx, generation, sourceID, id, keepMessages, dropped)
+	return m.ownOperationCmd(generation, m.app.forkSession(ctx, generation, sourceID, id, keepMessages, dropped))
 }
 
 func (m *tuiModel) clearSession() tea.Cmd {
@@ -492,5 +552,5 @@ func (m *tuiModel) clearSession() tea.Cmd {
 	if err != nil {
 		return noticeCmd("warn", err.Error())
 	}
-	return m.app.clearSession(ctx, generation, sourceID)
+	return m.ownOperationCmd(generation, m.app.clearSession(ctx, generation, sourceID))
 }

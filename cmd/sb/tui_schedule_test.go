@@ -249,10 +249,7 @@ func TestArmScheduleHoldsAKeyBehindTheGate(t *testing.T) {
 	if len(s.List()) != 0 {
 		t.Fatal("the entry armed before the gate answered")
 	}
-	done, cmd := m.dlg.update(tea.KeyMsg{Type: tea.KeyEnter}, m.th) // first item: redact
-	if !done {
-		t.Fatal("the gate did not resolve on enter")
-	}
+	cmd := chooseRedact(m)
 	if cmd != nil {
 		m.Update(cmd())
 	}
@@ -286,5 +283,17 @@ func TestScheduleLineRendersKindAndFire(t *testing.T) {
 	}
 	if strings.Contains(scheduleLine(every, now), "Aug 22") {
 		t.Errorf("a same-day fire named its day: %q", scheduleLine(every, now))
+	}
+}
+
+func TestScheduleLineRedactsCredentialBeforeTruncatingLegacyPrompt(t *testing.T) {
+	now := time.Date(2026, 8, 22, 10, 0, 0, 0, time.Local)
+	entry := schedule.Entry{
+		ID: "s1", At: "10:30", NextFire: now.Add(30 * time.Minute),
+		Prompt: strings.Repeat("x", 38) + testGitHubToken,
+	}
+	line := scheduleLine(entry, now)
+	if strings.Contains(line, "ghp_") || strings.Contains(line, testGitHubToken) {
+		t.Fatalf("schedule row exposed a credential fragment: %q", line)
 	}
 }

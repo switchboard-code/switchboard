@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/switchboard-code/switchboard/internal/credential"
 	"github.com/switchboard-code/switchboard/internal/tools"
@@ -127,7 +128,7 @@ func (c *Client) answerElicitation(ctx context.Context, params json.RawMessage) 
 	content := make(map[string]any, len(names))
 	for _, name := range names {
 		field := schema.Properties[name]
-		question, err := elicitQuestion(c.spec.Name, req.Message, name, field)
+		question, choices, err := elicitQuestion(c.spec.Name, req.Message, name, field)
 		if err != nil {
 			return elicitResult{}, err
 		}
@@ -139,7 +140,7 @@ func (c *Client) answerElicitation(ctx context.Context, params json.RawMessage) 
 			return elicitResult{Action: elicitCancel}, nil
 		}
 
-		value, ok := elicitValue(field, answer)
+		value, ok := elicitValue(field, choices, answer)
 		if !ok {
 			if answer.Text != "" {
 				// The one place an unusable answer is not a lie to report as a
@@ -160,19 +161,33 @@ func (c *Client) answerElicitation(ctx context.Context, params json.RawMessage) 
 // The server's name leads, because the user is being asked by something that
 // is not Switchboard and not the model, and no other part of the dialog says
 // so.
-func elicitQuestion(server, message, name string, field elicitField) (tools.Question, error) {
+func elicitQuestion(server, message, name string, field elicitField) (tools.Question, map[string]string, error) {
+	// Property names and enum values are protocol semantics: accepting the
+	// question would put them back into the MCP reply. Redacting either would
+	// answer a different schema, while echoing one would violate the outbound
+	// credential boundary. Metadata used only for display can be redacted below;
+	// semantic credential-shaped values make this elicitation unsupported.
+	if len(credential.ScanPrompt(name)) > 0 {
+		return tools.Question{}, nil, &unsupportedElicit{"requestedSchema contains a credential-shaped property name"}
+	}
+	for _, value := range field.Enum {
+		if len(credential.ScanPrompt(value)) > 0 {
+			return tools.Question{}, nil, &unsupportedElicit{"requestedSchema contains a credential-shaped enum value"}
+		}
+	}
+
 	label := field.Title
 	if label == "" {
 		label = name
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "MCP server %s asks: ", server)
+	fmt.Fprintf(&b, "MCP server %s asks: ", truncateElicit(server))
 	if message != "" {
 		b.WriteString(truncateElicit(message))
 		b.WriteString("\n\n")
 	}
-	b.WriteString(label)
+	b.WriteString(truncateElicit(label))
 	if field.Description != "" {
 		b.WriteString(" — ")
 		b.WriteString(truncateElicit(field.Description))
@@ -184,47 +199,95 @@ func elicitQuestion(server, message, name string, field elicitField) (tools.Ques
 		if len(field.Enum) == 0 {
 			// No options is the free-text dialog: the type-your-own row and
 			// esc, which is exactly what an unconstrained string wants.
-			return question, nil
+			return question, nil, nil
 		}
 		if len(field.Enum) > maxElicitOptions {
-			return tools.Question{}, &unsupportedElicit{fmt.Sprintf(
+			return tools.Question{}, nil, &unsupportedElicit{fmt.Sprintf(
 				"property %q offers %d enum values; this client shows at most %d",
-				name, len(field.Enum), maxElicitOptions)}
+				truncateElicit(name), len(field.Enum), maxElicitOptions)}
 		}
+		labels := uniqueElicitOptionLabels(field.Enum)
+		choices := make(map[string]string, len(labels))
 		for i, value := range field.Enum {
-			option := tools.QuestionOption{Label: value}
+			option := tools.QuestionOption{Label: labels[i]}
 			if i < len(field.EnumNames) && field.EnumNames[i] != "" {
 				// enumNames is the display text and enum is the wire value.
 				// Showing the value and answering with it keeps the two from
 				// drifting; the name rides as the detail so the user reads
 				// what the server meant.
-				option.Detail = field.EnumNames[i]
+				option.Detail = truncateElicit(field.EnumNames[i])
 			}
 			question.Options = append(question.Options, option)
+			choices[option.Label] = value
 		}
-		return question, nil
+		return question, choices, nil
 
 	case "boolean":
 		question.Options = []tools.QuestionOption{{Label: "yes"}, {Label: "no"}}
-		return question, nil
+		return question, nil, nil
 
 	case "number", "integer":
-		return question, nil
+		return question, nil, nil
 
 	default:
 		// An empty type included: a property with no declared type is not a
 		// string by default here, because guessing one would put an arbitrary
 		// value into a field the server will act on.
-		return tools.Question{}, &unsupportedElicit{fmt.Sprintf(
-			"property %q has type %q, which this client does not ask for", name, field.Type)}
+		return tools.Question{}, nil, &unsupportedElicit{fmt.Sprintf(
+			"property %q has type %q, which this client does not ask for",
+			truncateElicit(name), truncateElicit(field.Type))}
 	}
+}
+
+// uniqueElicitOptionLabels gives the question surface only bounded display
+// values while retaining a one-to-one key for the protocol value. Credential-
+// shaped semantic values were refused above, but two long ordinary values can
+// truncate to the same label and an ordinary value can collide with a
+// generated suffix. Resolve both cases deterministically so selecting a safe
+// label never guesses which server value it represented.
+func uniqueElicitOptionLabels(values []string) []string {
+	bases := make([]string, len(values))
+	counts := make(map[string]int, len(values))
+	for i, value := range values {
+		base := truncateElicit(value)
+		if base == "" {
+			base = "(empty value)"
+		}
+		bases[i] = base
+		counts[base]++
+	}
+
+	labels := make([]string, len(values))
+	used := make(map[string]struct{}, len(values))
+	for i, base := range bases {
+		label := base
+		if counts[base] > 1 {
+			label = elicitLabelWithSuffix(base, fmt.Sprintf(" (option %d)", i+1))
+		}
+		for attempt := 2; ; attempt++ {
+			if _, exists := used[label]; !exists {
+				break
+			}
+			label = elicitLabelWithSuffix(base, fmt.Sprintf(" (option %d.%d)", i+1, attempt))
+		}
+		labels[i] = label
+		used[label] = struct{}{}
+	}
+	return labels
+}
+
+func elicitLabelWithSuffix(base, suffix string) string {
+	if len(suffix) >= maxElicitMessage {
+		return truncateUTF8(suffix, maxElicitMessage)
+	}
+	return truncateUTF8(base, maxElicitMessage-len(suffix)) + suffix
 }
 
 // elicitValue maps what the user did onto the type the server declared. The
 // false return is "no usable answer", which covers declining and covers an
 // answer that does not fit; the caller separates them for the log, not for the
 // server, because the server gets the same word either way.
-func elicitValue(field elicitField, answer tools.Answer) (any, bool) {
+func elicitValue(field elicitField, choices map[string]string, answer tools.Answer) (any, bool) {
 	if answer.Declined {
 		return nil, false
 	}
@@ -232,6 +295,20 @@ func elicitValue(field elicitField, answer tools.Answer) (any, bool) {
 	text := answer.Text
 	if len(answer.Picked) > 0 {
 		text = answer.Picked[0]
+		if len(field.Enum) > 0 {
+			value, ok := choices[text]
+			if !ok {
+				return nil, false
+			}
+			text = value
+		}
+	} else if len(field.Enum) > 0 {
+		// A person may type the safe label instead of selecting it. Treat that
+		// exactly like the corresponding pick; a raw enum value remains accepted
+		// below for compatibility with non-dialog Questioner implementations.
+		if value, ok := choices[text]; ok {
+			text = value
+		}
 	}
 	if text == "" {
 		return nil, false
@@ -316,11 +393,47 @@ func propertyOrder(raw json.RawMessage) ([]string, error) {
 }
 
 func truncateElicit(text string) string {
+	// Scan the whole semantic component before any cap can turn a recognized
+	// credential into an unrecognized prefix. The question surface performs
+	// terminal escaping later; this layer preserves the original semantic value
+	// only in the private enum mapping above, never in what it renders.
+	if leaks := credential.ScanPrompt(text); len(leaks) > 0 {
+		text = credential.Redact(text, leaks)
+	}
 	text = strings.TrimSpace(text)
 	if len(text) <= maxElicitMessage {
 		return text
 	}
-	return text[:maxElicitMessage] + "…"
+	const suffix = "…"
+	cut := maxElicitMessage - len(suffix)
+	// Keep a generated redaction marker whole when it lands on the cap. A
+	// half marker is safe in the narrow sense but reads like corrupt output and
+	// hides why the server's prose changed. Sacrifice earlier prose instead.
+	if markerStart := strings.LastIndex(text[:cut], "[redacted:"); markerStart >= 0 {
+		if markerTail := strings.IndexByte(text[markerStart:], ']'); markerTail >= 0 {
+			markerEnd := markerStart + markerTail + 1
+			if markerEnd > cut {
+				marker := text[markerStart:markerEnd]
+				prefixLimit := maxElicitMessage - len(suffix) - len(marker)
+				return truncateUTF8(text[:markerStart], prefixLimit) + marker + suffix
+			}
+		}
+	}
+	return truncateUTF8(text, cut) + suffix
+}
+
+func truncateUTF8(text string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(text) <= limit {
+		return text
+	}
+	cut := limit
+	for cut > 0 && !utf8.ValidString(text[:cut]) {
+		cut--
+	}
+	return text[:cut]
 }
 
 func containsString(values []string, want string) bool {

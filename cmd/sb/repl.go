@@ -68,6 +68,14 @@ type repl struct {
 	// to run low.
 	callTokens int
 	ctxWindow  int
+
+	// restartRequired is set only after a staged session became visible without
+	// a proven persistence barrier. The REPL must leave instead of accepting a
+	// command on that adopted-but-uncertain log.
+	restartRequired error
+	// publishDurably is a deterministic fault seam for compaction adoption
+	// tests. Runtime REPLs leave it nil and call Session.PublishDurably.
+	publishDurably durableSessionPublisher
 }
 
 // moveTo rebinds the loop after the escalation policy changed the primary.
@@ -98,7 +106,7 @@ func (r *repl) moveTo(ctx context.Context, rank int, why string) (func() bool, f
 	}
 	cache := r.caches.For(probed.Target, r.catalog)
 	bind := func() bool {
-		if err := persistRuntimeBinding(r.loop.Session, probed, false); err != nil {
+		if err := persistRuntimeBindingFallback(r.loop.Session, probed, false, note); err != nil {
 			r.out.Notice("warn", "the automatic tier move was not saved: "+err.Error())
 			return false
 		}
@@ -109,11 +117,10 @@ func (r *repl) moveTo(ctx context.Context, rank int, why string) (func() bool, f
 	after := func() {
 		if note != "" {
 			r.out.Notice("warn", note)
-			r.loop.Session.AppendNote("warn", note)
 		}
 		r.out.line(r.out.style(dim, "  now on "+r.tierLine()))
 		if abandoned != "" {
-			r.out.line(r.out.style(dim, "  "+abandoned))
+			r.out.line(r.out.style(dim, "  "+cliText(abandoned)))
 			_ = r.loop.Session.AppendNote("info", abandoned)
 		}
 	}
@@ -124,13 +131,13 @@ func (r *repl) banner(sess *session.Session, resumed bool) {
 	state := sess.State()
 
 	r.out.line(r.out.style(bold, "switchboard") + " " + r.out.style(dim, r.tierLine()))
-	r.out.line(r.out.style(dim, "  workspace  "+r.workspace))
+	r.out.line(r.out.style(dim, "  workspace  "+cliText(r.workspace)))
 	r.out.line(r.out.style(dim, "  mode       "+string(r.loop.Perms.Mode())))
-	r.out.line(r.out.style(dim, "  execution  "+r.loop.Perms.Execution().Summary()))
-	r.out.line(r.out.style(dim, "  catalog    "+r.catalog.Revision+" ("+r.catalog.Source+")"))
+	r.out.line(r.out.style(dim, "  execution  "+cliText(r.loop.Perms.Execution().Summary())))
+	r.out.line(r.out.style(dim, "  catalog    "+cliText(r.catalog.Revision)+" ("+cliText(r.catalog.Source)+")"))
 	if r.route != nil {
 		for _, line := range describeRoute(*r.route) {
-			r.out.line(r.out.style(dim, line))
+			r.out.line(r.out.style(dim, cliText(line)))
 		}
 	}
 
@@ -155,15 +162,25 @@ func (r *repl) banner(sess *session.Session, resumed bool) {
 func (r *repl) tierLine() string {
 	target := r.loop.Binding().Target.Display()
 	if r.tier.Label != "" {
-		return fmt.Sprintf("%s %s  %s", r.tier.ID, r.tier.Label, target)
+		return cliText(fmt.Sprintf("%s %s  %s", r.tier.ID, r.tier.Label, target))
 	}
-	return fmt.Sprintf("%s  %s", r.tier.ID, target)
+	return cliText(fmt.Sprintf("%s  %s", r.tier.ID, target))
 }
 
 // once runs a single prompt. It is what makes the phase-0 exit gate scriptable:
 // a turn can be started, interrupted, and resumed without a terminal.
 func (r *repl) once(ctx context.Context, prompt string) error {
-	err := r.turn(ctx, prompt)
+	return r.onceAuthored(ctx, prompt, prompt)
+}
+
+func (r *repl) onceAuthored(ctx context.Context, prompt, authored string) error {
+	opening, err := stampTurnOpening(r.loop.Session, turnOpeningAuthored(prompt, authored, nil))
+	if err == nil {
+		// -p promises one completed prompt. It may take the ordinary tool-use
+		// rounds needed to answer that prompt, but must not append compaction and
+		// an automatic continuation after the result the caller asked for.
+		err = r.turnPreparedMessageMode(ctx, opening, false, false)
+	}
 	r.summary()
 	return err
 }
@@ -173,6 +190,9 @@ func (r *repl) interactive(ctx context.Context) error {
 		// Due reminders fire here: the loop top is both "before each read"
 		// and "after each completed turn", the only seams a line reader has.
 		r.fireDueSchedules(ctx)
+		if r.restartRequired != nil {
+			return r.restartRequired
+		}
 
 		r.out.w.WriteString(r.out.style(bold, "› "))
 		r.out.atLineTop = false
@@ -193,16 +213,26 @@ func (r *repl) interactive(ctx context.Context) error {
 		}
 		if strings.HasPrefix(input, "/") {
 			if done := r.command(ctx, input); done {
+				if r.restartRequired != nil {
+					return r.restartRequired
+				}
 				return nil
+			}
+			if r.restartRequired != nil {
+				return r.restartRequired
 			}
 			continue
 		}
 
-		prompt, images, ok := r.prepareInteractivePrompt(input)
+		prompt, authored, images, ok := r.prepareInteractivePromptAuthored(input)
 		if !ok {
 			continue
 		}
-		if err := r.turnPrepared(ctx, prompt, images, false); err != nil {
+		if err := r.turnPreparedAuthored(ctx, prompt, authored, images, false); err != nil {
+			var restart *publicationRestartRequiredError
+			if errors.As(err, &restart) {
+				return err
+			}
 			if errors.Is(err, context.Canceled) {
 				r.out.Notice("warn", "turn cancelled; the session is intact and can continue")
 				continue
@@ -218,14 +248,28 @@ func (r *repl) interactive(ctx context.Context) error {
 // prepareInteractivePrompt performs the assembly before the outbound secret
 // gate, so credentials inside an @mentioned file are guarded too.
 func (r *repl) prepareInteractivePrompt(input string) (string, []provider.Image, bool) {
+	prompt, _, images, ok := r.prepareInteractivePromptAuthored(input)
+	return prompt, images, ok
+}
+
+// prepareInteractivePromptAuthored keeps the exact typed projection beside
+// the provider-visible expansion. A later TUI replay must never attribute
+// attached file contents or harness context to the user merely because both
+// were persisted in the same opening message.
+func (r *repl) prepareInteractivePromptAuthored(input string) (string, string, []provider.Image, bool) {
+	authored := input
 	prompt, images := expandPromptMentions(r.workspace, input)
 	if leaks := credential.ScanPrompt(prompt); len(leaks) > 0 {
-		prompt = r.secretGate(prompt, leaks)
-		if prompt == "" {
-			return "", nil, false
+		gated := r.secretGate(prompt, leaks)
+		if gated == "" {
+			return "", "", nil, false
 		}
+		if gated != prompt {
+			authored = credential.Redact(authored, leaks)
+		}
+		prompt = gated
 	}
-	return prompt, images, true
+	return prompt, authored, images, true
 }
 
 // secretGate holds a key-shaped prompt behind a one-line question, the
@@ -266,17 +310,41 @@ func (r *repl) turn(ctx context.Context, input string) error {
 }
 
 func (r *repl) turnPrepared(ctx context.Context, input string, images []provider.Image, fixedTier bool) error {
-	opening, err := stampTurnOpening(r.loop.Session, turnOpening(input, images))
+	return r.turnPreparedAuthored(ctx, input, input, images, fixedTier)
+}
+
+func (r *repl) turnPreparedAuthored(ctx context.Context, input, authored string, images []provider.Image, fixedTier bool) error {
+	opening, err := stampTurnOpening(r.loop.Session, turnOpeningAuthored(input, authored, images))
 	if err != nil {
 		return err
 	}
 	return r.turnPreparedMessage(ctx, opening, fixedTier)
 }
 
+func (r *repl) turnPreparedSynthetic(ctx context.Context, input string, images []provider.Image, fixedTier bool) error {
+	return r.turnPreparedSyntheticMode(ctx, input, images, fixedTier, false)
+}
+
+// turnPreparedSyntheticMode carries the one-shot post-compaction policy on the
+// launch itself. It is deliberately not inferred from input: an identical
+// prompt typed by the user is an ordinary turn, and a failed launch must not
+// leave a broad bypass armed for some later turn.
+func (r *repl) turnPreparedSyntheticMode(ctx context.Context, input string, images []provider.Image, fixedTier, suppressAutoCompact bool) error {
+	opening, err := stampTurnOpening(r.loop.Session, syntheticTurnOpening(input, images))
+	if err != nil {
+		return err
+	}
+	return r.turnPreparedMessageMode(ctx, opening, fixedTier, !suppressAutoCompact)
+}
+
 // turnPreparedMessage runs an already-stamped opening. The exact message that
 // routing and feasibility inspect is the one later appended and sent; in
 // particular, image blocks and continuity metadata are never reconstructed.
 func (r *repl) turnPreparedMessage(ctx context.Context, opening provider.Message, fixedTier bool) error {
+	return r.turnPreparedMessageMode(ctx, opening, fixedTier, true)
+}
+
+func (r *repl) turnPreparedMessageMode(ctx context.Context, opening provider.Message, fixedTier, autoCompact bool) error {
 	turnCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -346,25 +414,31 @@ func (r *repl) turnPreparedMessage(ctx context.Context, opening provider.Message
 	// replaced without cutting a turn in half.
 	r.refreshCtxWindow()
 	r.noteOccupancy()
-	if err == nil {
+	if err == nil && autoCompact {
 		r.autoCompactIfFull(ctx)
+		if r.restartRequired != nil {
+			return r.restartRequired
+		}
 	}
 	return err
 }
 
-// noteOccupancy reads the last request's size from the session's own record,
-// falling back to the local estimator when the provider reported nothing —
-// the same fallback the TUI makes, and for the same reason: occupancy stuck at
-// zero reads as an empty window and turns auto-compaction off silently.
+// noteOccupancy reads the final provider receipt from the current turn rather
+// than the session's cumulative usage ledger. Summing every historical call
+// and comparing it to one request's context window would compact earlier on
+// every turn. A completed endpoint may still report zero usage, so that exact
+// event (and a locally refused turn with no event) falls back to the assembled
+// request's local token estimate.
 func (r *repl) noteOccupancy() {
 	state := r.loop.Session.State()
-	r.callTokens = state.Usage.InputTokens + state.Usage.CacheReadTokens + state.Usage.CacheWriteTokens
+	r.callTokens = 0
+	if r.watcher != nil {
+		if latest, ok := r.watcher.LastUsage(); ok {
+			r.callTokens = latest.Usage.InputTokens + latest.Usage.CacheReadTokens + latest.Usage.CacheWriteTokens
+		}
+	}
 	if r.callTokens == 0 {
-		r.callTokens = prefix.RequestTokens(provider.Request{
-			System:   r.loop.System,
-			Tools:    r.loop.Tools.Definitions(),
-			Messages: state.Messages,
-		})
+		r.callTokens = prefix.RequestTokens(r.loop.Request(state.Messages))
 	}
 }
 
@@ -376,29 +450,35 @@ func (r *repl) acceptTurnResolution(ctx context.Context, tier config.Tier, clien
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if tier.ID != r.tier.ID || tier.Target.ID() != r.tier.Target.ID() {
-		pinned := r.sticky != nil && r.sticky.Pinned()
+	changed := tier.ID != r.tier.ID || tier.Target.ID() != r.tier.Target.ID()
+	pinned := r.sticky != nil && r.sticky.Pinned()
+	if changed || note != "" {
 		oldBinding := r.loop.Binding()
 		targetChanged := oldBinding.Target.ID() != tier.Target.ID()
 		abandoned := ""
 		if targetChanged {
 			abandoned = abandonedCacheNote(oldBinding.Cache, r.catalog, time.Now())
 		}
-		if err := persistRuntimeBinding(r.loop.Session, tier, pinned); err != nil {
+		if err := persistRuntimeBindingFallback(r.loop.Session, tier, pinned, note); err != nil {
 			return fmt.Errorf("saving automatic tier selection: %w", err)
 		}
 		if note != "" {
 			r.out.Notice("warn", note)
-			_ = r.loop.Session.AppendNote("warn", note)
 		}
-		r.tier = tier
-		r.loop.Bind(agent.Binding{Provider: client, Target: tier.Target, Cache: r.caches.For(tier.Target, r.catalog)})
-		r.out.line(r.out.style(dim, "  now on "+r.tierLine()))
-		if abandoned != "" {
-			r.out.line(r.out.style(dim, "  "+abandoned))
-			_ = r.loop.Session.AppendNote("info", abandoned)
+		if changed {
+			r.tier = tier
+			r.out.line(r.out.style(dim, "  now on "+r.tierLine()))
+			if abandoned != "" {
+				r.out.line(r.out.style(dim, "  "+cliText(abandoned)))
+				_ = r.loop.Session.AppendNote("info", abandoned)
+			}
 		}
 	}
+	// A registry reset can rebuild the client for the same canonical target.
+	// The live probe returned the prepared client for this turn, so install it at
+	// the commit boundary even when no tier move (and therefore no durable target
+	// transition) occurred.
+	r.loop.Bind(agent.Binding{Provider: client, Target: tier.Target, Cache: r.caches.For(tier.Target, r.catalog)})
 	if r.sticky != nil {
 		r.sticky.Rebase(slices.IndexFunc(r.config.Tiers, func(candidate config.Tier) bool { return candidate.ID == r.tier.ID }))
 	}
@@ -533,8 +613,8 @@ func (r *repl) command(ctx context.Context, input string) bool {
 	if _, ok := r.config.Tier(name); ok {
 		if rest == "" {
 			r.switchTier(ctx, name)
-		} else if prompt, images, send := r.prepareInteractivePrompt(rest); send {
-			if err := r.turnOnTier(ctx, name, prompt, images); err != nil {
+		} else if prompt, authored, images, send := r.prepareInteractivePromptAuthored(rest); send {
+			if err := r.turnOnTierAuthored(ctx, name, prompt, authored, images); err != nil {
 				if errors.Is(err, context.Canceled) {
 					r.out.Notice("warn", "turn cancelled; the session is intact and can continue")
 				} else if !errors.Is(err, agent.ErrRoundLimit) {
@@ -559,8 +639,8 @@ func (r *repl) command(ctx context.Context, input string) bool {
 		r.out.line("  /mode [plan|default|acceptEdits|auto|yolo|bypass]  show or change permission mode")
 		r.out.line("  /cost                                     tokens and cost for this session")
 		r.out.line("  /session                                  session id, target, and message count")
-		r.out.line("  /sandbox [off|on|auto]                    show or change command confinement")
-		r.out.line("  /compact [instructions]                   summarize this session into a fresh one")
+		r.out.line("  /sandbox [off|on|auto|status]             show or change command confinement")
+		r.out.line("  /compact [current objective]              summarize this session; an objective safely anchors legacy history")
 		r.out.line("  /every <interval> <prompt>                fire a prompt on an interval while sb runs")
 		r.out.line("  /at <HH:MM> <prompt>                      fire a prompt once at a local clock time")
 		r.out.line("  /schedule [cancel <id>]                   the workspace's scheduled prompts")
@@ -569,6 +649,9 @@ func (r *repl) command(ctx context.Context, input string) bool {
 
 	case "compact":
 		r.compact(ctx, rest)
+		if r.restartRequired != nil {
+			return true
+		}
 
 	case "every":
 		r.scheduleEvery(rest)
@@ -593,7 +676,7 @@ func (r *repl) command(ctx context.Context, input string) bool {
 				r.sticky.Unpin()
 			}
 			if r.config.RouteAutoOn() {
-				r.out.line("  automatic per-turn routing resumed from " + r.tier.ID)
+				r.out.line("  automatic per-turn routing resumed from " + cliText(r.tier.ID))
 			} else {
 				r.out.line("  pin removed; routing is off, so the rung still changes only when you change it (/routing on resumes)")
 			}
@@ -605,13 +688,12 @@ func (r *repl) command(ctx context.Context, input string) bool {
 		switch strings.ToLower(rest) {
 		case "on", "off":
 			on := strings.ToLower(rest) == "on"
-			if r.watcher != nil {
-				r.watcher.setPaused(!on)
-			}
-			r.config.RouteAuto = &on
-			if err := r.config.Save(); err != nil {
+			if err := r.config.SetRouteAutoAndSave(on); err != nil {
 				r.out.Notice("error", "saving the routing setting failed: "+err.Error())
 				break
+			}
+			if r.watcher != nil {
+				r.watcher.setPaused(!on)
 			}
 			if on {
 				r.out.line("  routing on: the policy may move the primary on its own signals")
@@ -630,7 +712,7 @@ func (r *repl) command(ctx context.Context, input string) bool {
 
 	case "tiers":
 		if len(r.config.Tiers) == 0 {
-			r.out.line("  no tiers configured in " + r.config.Path)
+			r.out.line("  no tiers configured in " + cliText(r.config.Path))
 			break
 		}
 		for _, t := range r.config.Tiers {
@@ -638,7 +720,7 @@ func (r *repl) command(ctx context.Context, input string) bool {
 			if t.ID == r.tier.ID {
 				marker = "* "
 			}
-			r.out.line(marker + t.String())
+			r.out.line(marker + cliText(t.String()))
 		}
 
 	case "mode":
@@ -679,19 +761,21 @@ func (r *repl) command(ctx context.Context, input string) bool {
 
 	case "session":
 		state := r.loop.Session.State()
-		r.out.line("  " + state.ID)
-		r.out.line("  target   " + r.loop.Binding().Target.Display())
-		r.out.line("  catalog  " + state.CatalogRevision)
+		health := session.ResumeHealthForState(state, r.loop.Session.TruncatedBytes() > 0)
+		r.out.line("  " + cliText(state.ID))
+		r.out.line("  target   " + cliText(r.loop.Binding().Target.Display()))
+		r.out.line("  catalog  " + cliText(state.CatalogRevision))
 		r.out.line("  messages " + fmt.Sprint(len(state.Messages)))
-		r.out.line("  log      " + r.loop.Session.Path())
+		r.out.line("  health   " + cliText(resumeHealthChips(health, false)))
+		r.out.line("  log      " + cliText(r.loop.Session.Path()))
 
 	case "sandbox":
 		controller := r.loop.Perms.Execution()
 		if rest == "" || rest == "status" {
-			r.out.line("  platform  " + r.capability.Platform)
+			r.out.line("  platform  " + cliText(r.capability.Platform))
 			r.out.line("  mechanism " + string(r.capability.Mechanism))
 			r.out.line("  requested " + string(controller.SandboxMode()))
-			r.out.line("  " + controller.Summary())
+			r.out.line("  " + cliText(controller.Summary()))
 			break
 		}
 		mode, err := execution.ParseSandboxMode(rest)
@@ -708,7 +792,7 @@ func (r *repl) command(ctx context.Context, input string) bool {
 			break
 		}
 		r.config.Sandbox = mode
-		r.out.line("  " + controller.Summary())
+		r.out.line("  " + cliText(controller.Summary()))
 		if err := r.config.Save(); err != nil {
 			r.out.Notice("warn", "sandbox changed for this process, but the config was not saved: "+err.Error())
 		}
@@ -729,11 +813,15 @@ func (r *repl) command(ctx context.Context, input string) bool {
 }
 
 func (r *repl) turnOnTier(ctx context.Context, id, prompt string, images []provider.Image) error {
+	return r.turnOnTierAuthored(ctx, id, prompt, prompt, images)
+}
+
+func (r *repl) turnOnTierAuthored(ctx context.Context, id, prompt, authored string, images []provider.Image) error {
 	requested, ok := r.config.Tier(id)
 	if !ok {
 		return fmt.Errorf("no tier %s is configured; try /tiers", id)
 	}
-	opening, err := stampTurnOpening(r.loop.Session, turnOpening(prompt, images))
+	opening, err := stampTurnOpening(r.loop.Session, turnOpeningAuthored(prompt, authored, images))
 	if err != nil {
 		return err
 	}
@@ -749,6 +837,12 @@ func (r *repl) turnOnTier(ctx context.Context, id, prompt string, images []provi
 		return err
 	}
 	retargetTurnPlan(&plan, r.loop, r.catalog, r.caches, probed, rank, opening)
+	if note != "" {
+		if err := r.loop.Session.AppendNote("warn", note); err != nil {
+			return fmt.Errorf("the fallback substitution was not recorded, so the turn was not sent: %w", err)
+		}
+		r.out.Notice("warn", note)
+	}
 
 	priorTier := r.tier
 	priorBinding := r.loop.Binding()
@@ -767,10 +861,6 @@ func (r *repl) turnOnTier(ctx context.Context, id, prompt string, images []provi
 		}
 	}()
 
-	if note != "" {
-		r.out.Notice("warn", note)
-		_ = r.loop.Session.AppendNote("warn", note)
-	}
 	r.route = &route.Decision{
 		Tier: probed.ID, Target: probed.Target.ID(), Confidence: 1,
 		Source: route.SourceUserPin, Rationale: "one-turn tier override requested by you",
@@ -808,13 +898,12 @@ func (r *repl) switchTier(ctx context.Context, id string) {
 	}
 	// The runtime binding is the state transition; make it durable before
 	// publishing ancillary fallback notes or changing the live binding.
-	if err := persistRuntimeBinding(r.loop.Session, probed, true); err != nil {
+	if err := persistRuntimeBindingFallback(r.loop.Session, probed, true, note); err != nil {
 		r.out.Notice("error", "tier switch was not saved: "+err.Error())
 		return
 	}
 	if note != "" {
 		r.out.Notice("warn", note)
-		r.loop.Session.AppendNote("warn", note)
 	}
 
 	oldBinding := r.loop.Binding()
@@ -841,7 +930,7 @@ func (r *repl) switchTier(ctx context.Context, id string) {
 	// warm on the old one. When that warmth can be priced honestly the
 	// modeled number is the note; otherwise the fact is stated without one.
 	if abandoned != "" {
-		r.out.line(r.out.style(dim, "  "+abandoned))
+		r.out.line(r.out.style(dim, "  "+cliText(abandoned)))
 	} else if targetChanged {
 		if info, _, ok := r.catalog.Lookup(probed.Target); ok && !info.Free() {
 			r.out.line(r.out.style(dim, "  a target switch leaves the previous target's cache behind"))
@@ -854,7 +943,7 @@ func (r *repl) switchTier(ctx context.Context, id string) {
 // aid, never a substitute for the provider's invoice (§15).
 func (r *repl) summary() {
 	for _, line := range summaryLines(r.loop.Session.State(), r.catalog, r.loop.Binding().Target) {
-		r.out.line(r.out.style(dim, line))
+		r.out.line(r.out.style(dim, cliText(line)))
 	}
 	r.out.flush()
 }

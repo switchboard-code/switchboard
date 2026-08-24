@@ -34,13 +34,15 @@ func (m *tuiModel) openSecretGate(leaks []credential.Leak, prompt string, procee
 	for i, l := range leaks {
 		found[i] = l.String()
 	}
-	m.dlg = &pickerDialog{
-		title: "the prompt contains " + strings.Join(found, ", "),
+	m.openDialog(&pickerDialog{
+		title:          "the prompt contains " + strings.Join(found, ", "),
+		navigationOnly: true,
 		items: []pickerItem{
 			{id: "redact", label: "redact and send", desc: "each key becomes a placeholder naming what stood there"},
 			{id: "send", label: "send as typed", desc: "the key goes to the provider and into the session log"},
 			{id: "drop", label: "don't send", desc: "the prompt is dropped; nothing leaves this machine"},
 		},
+		sel: 2, // a stray Enter drops; arrows are required to authorize egress
 		onPick: func(id string) tea.Cmd {
 			switch id {
 			case "redact":
@@ -52,7 +54,7 @@ func (m *tuiModel) openSecretGate(leaks []credential.Leak, prompt string, procee
 			return drop()
 		},
 		onCancel: drop,
-	}
+	})
 	return nil
 }
 
@@ -66,12 +68,14 @@ func (m *tuiModel) openSecretGateForStorage(leaks []credential.Leak, prompt stri
 	for i, l := range leaks {
 		found[i] = l.String()
 	}
-	m.dlg = &pickerDialog{
-		title: "the prompt contains " + strings.Join(found, ", ") + ", and a schedule keeps it on disk",
+	m.openDialog(&pickerDialog{
+		title:          "the prompt contains " + strings.Join(found, ", ") + ", and a schedule keeps it on disk",
+		navigationOnly: true,
 		items: []pickerItem{
 			{id: "redact", label: "redact and arm", desc: "each key becomes a placeholder naming what stood there"},
 			{id: "drop", label: "don't arm", desc: "nothing is scheduled and nothing is stored"},
 		},
+		sel: 1, // a stray Enter stores nothing
 		onPick: func(id string) tea.Cmd {
 			if id == "redact" {
 				return proceed(credential.Redact(prompt, leaks))
@@ -79,6 +83,6 @@ func (m *tuiModel) openSecretGateForStorage(leaks []credential.Leak, prompt stri
 			m.addNotice("", "not scheduled; the prompt was dropped before anything was stored")
 			return nil
 		},
-	}
+	})
 	return nil
 }

@@ -27,6 +27,33 @@ send and routes that request. The inputs include:
 A tier that fails a capability, context, availability, destination-policy, or
 hard-budget check is not eligible. A user pin still passes these checks.
 
+These checks use the concrete serving target, not only a model name. Provider,
+surface, model, and parameters remain distinct through probing, caching,
+pricing, resume, and display. A live enforced context window outranks a user
+declaration; a declaration outranks metadata inferred from a model card; the
+catalog is the final fallback. The same resolver is used by routing, direct
+pins, resume, compaction, and the loop's last pre-send guard.
+
+Capability evidence is tri-state where silence matters. A server that
+explicitly reports text-only vision support overrides a broad catalog default;
+an API that says nothing does not invent a negative result. Output headroom is
+also the concrete adapter's wire allowance, not the catalog's largest possible
+generation. For example, Anthropic's adaptive effort dialect reserves the
+`max_tokens` it will actually send, while a token-budget dialect raises that
+allowance only when the API requires it. Context and hard-budget calculations
+consume that same value.
+
+A tier's positive `max_output` is its highest-precedence hard allowance and
+applies identically to the primary and every fallback. Ollama and
+OpenAI-compatible adapters put that exact cap on the request. Anthropic's
+token-budget dialect refuses an explicit cap that does not exceed
+`budget_tokens`; it raises only an omitted default, never a value the user
+bounded. Routing, moves, estimates, the budget gate, and the loop's final
+pre-send check all use the same concrete wire allowance. Without an override,
+a verified adapter allowance wins over the catalog. A custom or unlisted
+target with a known context window and no finite allowance is refused: an
+omitted server default is not evidence that a request fits.
+
 `/destinations ollama anthropic` restricts every turn in the workspace to those
 providers, and `/destinations any` removes the restriction. It is a hard
 requirement rather than a preference: the filter checks it before economics, so
@@ -103,7 +130,9 @@ run per turn.
 
 A tier can list fallback targets. If the primary server is unavailable or the
 model is missing, Switchboard probes the fallbacks in order and records the
-substitution before sending content.
+substitution before sending content. Context, vision, destination, or budget
+infeasibility does not unlock fallback; those are facts about the requested
+turn or standing policy rather than server availability.
 
 A fallback is an availability substitution. It does not change the tier's
 meaning or count as a router move. Each fallback must pass the same capability,

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/switchboard-code/switchboard/internal/provider"
+	"github.com/switchboard-code/switchboard/internal/provider/anthropic"
 )
 
 // Money is an amount in micro-USD, a millionth of a dollar.
@@ -407,6 +408,9 @@ func (c *Catalog) Lookup(target provider.RouteTarget) (ModelInfo, Confidence, bo
 	if info, ok := c.entries[key]; ok {
 		return info, Verified, true
 	}
+	if info, ok := c.snapshotLookup(target); ok {
+		return info, Verified, true
+	}
 
 	// A surface default carries the mechanics that hold for everything served
 	// there, which is what makes an unpulled or brand-new local model usable
@@ -419,29 +423,64 @@ func (c *Catalog) Lookup(target provider.RouteTarget) (ModelInfo, Confidence, bo
 	return ModelInfo{}, Prior, false
 }
 
-func (c *Catalog) Len() int { return len(c.entries) }
+// snapshotLookup carries an alias's verified evidence onto the exact dated
+// snapshot the provider listed. It never rewrites the target back to the alias:
+// pricing and capabilities may be shared, while serving identity, cache keys,
+// session records, and provider requests must continue to name the snapshot.
+func (c *Catalog) snapshotLookup(target provider.RouteTarget) (ModelInfo, bool) {
+	if c == nil {
+		return ModelInfo{}, false
+	}
 
-// Surfaces lists every provider/surface pair the catalog knows anything
-// about, from concrete entries and surface defaults alike. This is the list
-// "connect a provider" flows offer: a surface with only a default entry is
-// still a surface a key would unlock, and hiding it because no specific
-// model is cataloged yet would make setup unable to set it up.
-func (c *Catalog) Surfaces() []ModelInfo {
-	seen := map[string]bool{}
-	var out []ModelInfo
-	for _, info := range c.defaults {
-		key := info.Provider + "/" + info.Surface
-		if !seen[key] {
-			seen[key] = true
-			out = append(out, info)
+	// An explicitly recorded snapshot is the strongest relation. Search in a
+	// stable order so a malformed override containing duplicates cannot make a
+	// lookup depend on Go's randomized map iteration.
+	var explicit ModelInfo
+	for _, info := range c.entries {
+		if info.Provider != target.Provider || info.Surface != target.Surface || info.Snapshot != target.ModelID {
+			continue
+		}
+		if explicit.Provider == "" || info.ID() < explicit.ID() {
+			explicit = info
 		}
 	}
-	for _, info := range c.entries {
-		key := info.Provider + "/" + info.Surface
-		if !seen[key] {
-			seen[key] = true
-			out = append(out, info)
-		}
+	if explicit.Provider != "" {
+		return snapshotIdentity(explicit, target.ModelID), true
+	}
+
+	if target.Provider != anthropic.Name || target.Surface != anthropic.Surface {
+		return ModelInfo{}, false
+	}
+	alias, ok := anthropic.AdaptiveAlias(target.ModelID)
+	if !ok || alias == target.ModelID {
+		return ModelInfo{}, false
+	}
+	key := fmt.Sprintf("%s/%s/%s", target.Provider, target.Surface, alias)
+	info, ok := c.entries[key]
+	if !ok {
+		return ModelInfo{}, false
+	}
+	return snapshotIdentity(info, target.ModelID), true
+}
+
+func snapshotIdentity(info ModelInfo, modelID string) ModelInfo {
+	info.ProviderModelID = modelID
+	info.Snapshot = modelID
+	return info
+}
+
+func (c *Catalog) Len() int { return len(c.entries) }
+
+// Surfaces lists the explicit surface defaults. A concrete model is evidence
+// about that model, not a surface floor: returning an arbitrary concrete entry
+// here made per-model reasoning dialects and output limits depend on randomized
+// map iteration. Callers that merely need to enumerate every known provider /
+// surface pair can combine this list with Entries while keeping those concrete
+// capabilities attached to their models.
+func (c *Catalog) Surfaces() []ModelInfo {
+	out := make([]ModelInfo, 0, len(c.defaults))
+	for _, info := range c.defaults {
+		out = append(out, info)
 	}
 	sortByID(out)
 	return out

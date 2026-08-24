@@ -1,6 +1,8 @@
 package router
 
 import (
+	"math"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -134,6 +136,50 @@ func TestContextFilterIncludesReservedOutputEnvelope(t *testing.T) {
 	joined := strings.Join(got.Infeasible, " ")
 	if !strings.Contains(joined, "199000 input") || !strings.Contains(joined, "8192 reserved output") {
 		t.Fatalf("context exclusion omitted the envelope: %v", got.Infeasible)
+	}
+}
+
+func TestContextFilterExplainsUnknownOutputWithoutPrintingSentinel(t *testing.T) {
+	unknown := candidate("t1", 0)
+	unknown.Info.ContextWindow = 32_768
+	unknown.ContextTokens = 100
+	unknown.ReservedOutputTokens = math.MaxInt
+
+	decision, err := (Heuristic{}).Route(Input{Candidates: []Candidate{unknown}})
+	if err == nil {
+		t.Fatal("unknown output bound unexpectedly fit a finite context window")
+	}
+	text := err.Error() + " " + strings.Join(decision.Infeasible, " ")
+	for _, want := range []string{"no finite output bound", "positive tier max_output", "/models", "config"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("unknown-bound refusal omitted %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, strconv.Itoa(math.MaxInt)) {
+		t.Fatalf("unknown-bound refusal printed its implementation sentinel: %s", text)
+	}
+}
+
+func TestContextFilterExplainsExplicitCapReasoningConflict(t *testing.T) {
+	conflict := candidate("t1", 0)
+	conflict.Target.Params.MaxOutputTokens = 4096
+	conflict.Target.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "high"}
+	conflict.Info.ContextWindow = 200_000
+	conflict.ContextTokens = 100
+	conflict.ReservedOutputTokens = math.MaxInt
+
+	decision, err := (Heuristic{}).Route(Input{Candidates: []Candidate{conflict}})
+	if err == nil {
+		t.Fatal("invalid explicit cap unexpectedly fit")
+	}
+	text := err.Error() + " " + strings.Join(decision.Infeasible, " ")
+	for _, want := range []string{"no valid finite output allowance", "configured max_output 4096", "reasoning", "raise max_output", "lower or disable reasoning"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("explicit-cap refusal omitted %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "set a positive tier max_output") || strings.Contains(text, strconv.Itoa(math.MaxInt)) {
+		t.Fatalf("explicit-cap refusal gave omitted-cap/sentinel advice: %s", text)
 	}
 }
 

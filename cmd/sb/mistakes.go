@@ -177,9 +177,9 @@ func mistakesLines(store *session.Store, workspace string) []string {
 			runs = "run"
 		}
 		lines = append(lines,
-			"  "+truncate(m.line, 76),
+			"  "+redactCredentialTextBeforeTruncate(m.line, 76),
 			fmt.Sprintf("    %s  ·  %d failing %s across %d sessions  ·  first %s, last %s",
-				truncate(m.command, 40), m.count, runs, len(m.sessions),
+				redactCredentialTextBeforeTruncate(m.command, 40), m.count, runs, len(m.sessions),
 				m.first.Local().Format("Jan 2"), m.last.Local().Format("Jan 2 15:04")))
 		ids := slices.Clone(m.sessions)
 		slices.Reverse(ids)
@@ -212,7 +212,7 @@ func cmdMistakes(m *tuiModel, args string) tea.Cmd {
 func runMistakesCLI(w io.Writer, store *session.Store, workspace string) error {
 	fmt.Fprintln(w, "the failures more than one session met")
 	for _, line := range mistakesLines(store, workspace) {
-		fmt.Fprintln(w, strings.TrimRight(line, " "))
+		fmt.Fprintln(w, cliText(strings.TrimRight(line, " ")))
 	}
 	return nil
 }

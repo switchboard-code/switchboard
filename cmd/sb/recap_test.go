@@ -76,6 +76,31 @@ func TestRecapTellsTheLastSessionsStory(t *testing.T) {
 	}
 }
 
+func TestRecapWithholdsLegacyProviderExpandedOpening(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	sess, err := store.Create(workspace, "test/local/model", "rev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AppendMessage(provider.Message{Role: provider.RoleUser, Content: []provider.Block{
+		provider.Text{Text: "inspect @private.env\nLEGACY_FILE_AND_SHELL_BYTES"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out := strings.Join(recapLines(store, workspace, "", ""), "\n")
+	if strings.Contains(out, "@private.env") || strings.Contains(out, "LEGACY_FILE_AND_SHELL_BYTES") ||
+		!strings.Contains(out, "authored wording unavailable") {
+		t.Fatalf("legacy recap attributed expanded content to the user:\n%s", out)
+	}
+}
+
 // Bare recap from inside a session looks past the session it is typed
 // into: "where you left off" is the previous log, not this one.
 func TestRecapSkipsTheSessionItRunsIn(t *testing.T) {

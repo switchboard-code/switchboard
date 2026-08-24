@@ -279,6 +279,77 @@ func TestConfinedLoopbackEnvironmentCannotInheritOrReintroduceProxy(t *testing.T
 	}
 }
 
+func TestScrubbedChildEnvironmentDropsLoaderInjection(t *testing.T) {
+	for key, value := range map[string]string{
+		"LD_PRELOAD": "/workspace/evil.so", "DYLD_INSERT_LIBRARIES": "/workspace/evil.dylib",
+		"GCONV_PATH": "/workspace/gconv", "LOCPATH": "/workspace/locale", "NLSPATH": "/workspace/messages",
+		"BASH_ENV": "/workspace/bashrc", "ENV": "/workspace/shellrc",
+		"GIO_MODULE_DIR": "/workspace/gio", "GIO_EXTRA_MODULES": "/workspace/gio-extra",
+		"GI_TYPELIB_PATH": "/workspace/typelib", "GTK_PATH": "/workspace/gtk",
+		"GTK_MODULES": "/workspace/gtk-module.so", "GTK_IM_MODULE_FILE": "/workspace/gtk-im.cache",
+		"GDK_PIXBUF_MODULE_FILE": "/workspace/pixbuf.cache", "GDK_PIXBUF_MODULEDIR": "/workspace/pixbuf",
+		"QT_PLUGIN_PATH": "/workspace/qt", "QT_QPA_PLATFORM_PLUGIN_PATH": "/workspace/qt-platform",
+		"QML_IMPORT_PATH": "/workspace/qml", "QML2_IMPORT_PATH": "/workspace/qml2",
+		"GST_PLUGIN_PATH": "/workspace/gst", "GST_PLUGIN_PATH_1_0": "/workspace/gst1",
+		"GST_PLUGIN_SYSTEM_PATH": "/workspace/gst-system", "GST_PLUGIN_SYSTEM_PATH_1_0": "/workspace/gst-system1",
+		"LUA_PATH": "/workspace/lua", "LUA_CPATH": "/workspace/lua-native",
+		"TCLLIBPATH": "/workspace/tcl", "TCL_LIBRARY": "/workspace/tcl-lib", "TK_LIBRARY": "/workspace/tk-lib",
+		"PHPRC":            "/workspace/php.ini",
+		"PHP_INI_SCAN_DIR": "/workspace/php.d", "VLC_PLUGIN_PATH": "/workspace/vlc",
+		"OPENSSL_CONF": "/workspace/openssl.cnf", "OPENSSL_CONF_INCLUDE": "/workspace/openssl.d",
+		"OPENSSL_MODULES": "/workspace/openssl-modules", "OPENSSL_ENGINES": "/workspace/openssl-engines",
+		"NODE_OPTIONS": "--require=/workspace/evil.js", "NODE_PATH": "/workspace/node",
+		"PYTHONPATH": "/workspace/python", "PYTHONHOME": "/workspace/python-home", "PYTHONSTARTUP": "/workspace/startup.py",
+		"PYTHONUSERBASE": "/workspace/python-user-base",
+		"PERL5OPT":       "-M/workspace/evil.pm", "PERL5LIB": "/workspace/perl",
+		"RUBYOPT": "-r/workspace/evil.rb", "RUBYLIB": "/workspace/ruby",
+		"GEM_HOME": "/workspace/gems", "GEM_PATH": "/workspace/gem-path",
+		"JAVA_TOOL_OPTIONS": "-javaagent:/workspace/evil.jar", "JDK_JAVA_OPTIONS": "-javaagent:/workspace/evil.jar",
+		"_JAVA_OPTIONS": "-javaagent:/workspace/evil.jar", "CLASSPATH": "/workspace/java",
+		"DOTNET_STARTUP_HOOKS": "/workspace/evil.dll", "ZDOTDIR": "/workspace/zsh",
+	} {
+		t.Setenv(key, value)
+	}
+	got := make(map[string]bool)
+	for _, entry := range ScrubbedChildEnv() {
+		name, _, ok := strings.Cut(entry, "=")
+		if ok {
+			got[strings.ToUpper(name)] = true
+		}
+	}
+	for _, key := range []string{
+		"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "GCONV_PATH", "LOCPATH", "NLSPATH",
+		"BASH_ENV", "ENV", "ZDOTDIR",
+		"GIO_MODULE_DIR", "GIO_EXTRA_MODULES",
+		"GI_TYPELIB_PATH", "GTK_PATH", "GTK_MODULES", "GTK_IM_MODULE_FILE", "GDK_PIXBUF_MODULE_FILE", "GDK_PIXBUF_MODULEDIR",
+		"QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "QML_IMPORT_PATH", "QML2_IMPORT_PATH",
+		"GST_PLUGIN_PATH", "GST_PLUGIN_PATH_1_0", "GST_PLUGIN_SYSTEM_PATH", "GST_PLUGIN_SYSTEM_PATH_1_0",
+		"LUA_PATH", "LUA_CPATH", "TCLLIBPATH", "TCL_LIBRARY", "TK_LIBRARY",
+		"PHPRC", "PHP_INI_SCAN_DIR", "VLC_PLUGIN_PATH",
+		"OPENSSL_CONF", "OPENSSL_CONF_INCLUDE", "OPENSSL_MODULES", "OPENSSL_ENGINES",
+		"NODE_OPTIONS", "NODE_PATH", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE",
+		"PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB",
+		"GEM_HOME", "GEM_PATH",
+		"JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS", "CLASSPATH",
+		"DOTNET_STARTUP_HOOKS",
+	} {
+		if got[key] {
+			t.Fatalf("scrubbed child environment retained %s", key)
+		}
+	}
+}
+
+func TestCommandOutputUsesTheFixedChildEnvironment(t *testing.T) {
+	t.Setenv("DYLD_INSERT_LIBRARIES", "/workspace/evil.dylib")
+	t.Setenv("GIO_EXTRA_MODULES", "/workspace/gio")
+	out := commandOutput("/usr/bin/env")
+	for _, forbidden := range []string{"DYLD_INSERT_LIBRARIES=", "GIO_EXTRA_MODULES="} {
+		if strings.Contains(out, forbidden) {
+			t.Fatalf("informational fixed child retained %s", forbidden)
+		}
+	}
+}
+
 func TestRunInWorkspaceDirectory(t *testing.T) {
 	dir := t.TempDir()
 	res, err := Run(context.Background(), Command{Argv: []string{"pwd"}, Dir: dir})

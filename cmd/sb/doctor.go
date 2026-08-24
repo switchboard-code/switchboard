@@ -40,6 +40,11 @@ func printDoctorSection(w io.Writer, title string, rows []doctorRow) {
 	if len(rows) == 0 {
 		return
 	}
+	title = cliText(title)
+	for i := range rows {
+		rows[i].label = cliText(rows[i].label)
+		rows[i].detail = cliText(rows[i].detail)
+	}
 	fmt.Fprintln(w, title)
 	width := 0
 	for _, r := range rows {
@@ -200,7 +205,7 @@ func doctorToolRows(ctx context.Context, workspace string, ts *trust.Store) []do
 	defer cancel()
 	if err := tools.ProbeWeb(webCtx); err != nil {
 		rows = append(rows, doctorRow{label: "web", bad: true,
-			detail: "the search backend is unreachable: " + truncate(err.Error(), 80) + "; websearch and webfetch will error until the network answers"})
+			detail: "the search backend is unreachable: " + redactCredentialTextBeforeTruncate(err.Error(), 80) + "; websearch and webfetch will error until the network answers"})
 	} else {
 		rows = append(rows, doctorRow{label: "web", detail: "the search backend answers; websearch and webfetch are in the suite"})
 	}
@@ -226,7 +231,7 @@ func doctorToolRows(ctx context.Context, workspace string, ts *trust.Store) []do
 	}
 
 	if home, err := os.UserHomeDir(); err == nil {
-		set, _ := hooks.Load(filepath.Join(home, ".switchboard", hooks.FileName), workspace)
+		set, _ := hooks.LoadRooted(home, filepath.Join(".switchboard", hooks.FileName), workspace)
 		if !set.Empty() {
 			rows = append(rows, doctorRow{label: "hooks", detail: fmt.Sprintf("%d loaded from ~/.switchboard/%s", len(set.Hooks()), hooks.FileName)})
 		}
@@ -243,7 +248,11 @@ func doctorLSPRow(workspace string, ts *trust.Store) doctorRow {
 		if !ok {
 			return doctorRow{label: "lsp", detail: "this workspace's " + c.marker + " names an ecosystem, but its server is not on this machine"}
 		}
-		name := filepath.Base(argv[0])
+		candidate, err := resolveLSPCandidate(workspace, argv)
+		if err != nil {
+			return doctorRow{label: "lsp", detail: "this workspace's " + c.marker + " names an ecosystem, but its server is not available from a trusted installation path", bad: true}
+		}
+		name := filepath.Base(candidate.argv[0])
 		if ts == nil || !ts.Trusted(workspace) {
 			return doctorRow{label: "lsp", detail: name + " can serve this workspace; /trust grant lets it answer definition and references"}
 		}
@@ -260,7 +269,7 @@ func doctorMCPRows(ctx context.Context, workspace string, ts *trust.Store) []doc
 	var specs []mcp.Spec
 
 	if home, err := os.UserHomeDir(); err == nil {
-		userSpecs, err := mcp.LoadSpecs(filepath.Join(home, ".switchboard", mcp.SpecFileName))
+		userSpecs, err := mcp.LoadSpecsRooted(home, filepath.Join(".switchboard", mcp.SpecFileName))
 		if err != nil {
 			rows = append(rows, doctorRow{label: "config", detail: err.Error(), bad: true})
 		}
@@ -269,7 +278,7 @@ func doctorMCPRows(ctx context.Context, workspace string, ts *trust.Store) []doc
 	repoPath := filepath.Join(workspace, ".switchboard", mcp.SpecFileName)
 	if _, err := os.Stat(repoPath); err == nil {
 		if ts != nil && ts.Trusted(workspace) {
-			repoSpecs, err := mcp.LoadSpecs(repoPath)
+			repoSpecs, err := mcp.LoadSpecsRooted(workspace, filepath.Join(".switchboard", mcp.SpecFileName))
 			if err != nil {
 				rows = append(rows, doctorRow{label: "config", detail: err.Error(), bad: true})
 			}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -289,6 +290,15 @@ func TestRestrictedServerEnvUsesBaselineAndExplicitGrants(t *testing.T) {
 	}
 	if env["TMP_SECRET"] != "" {
 		t.Fatalf("secret-shaped baseline variable leaked: %q", env["TMP_SECRET"])
+	}
+	if runtime.GOOS == "windows" {
+		for _, name := range []string{"USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA"} {
+			value := "switchboard-" + strings.ToLower(name)
+			t.Setenv(name, value)
+			if got := environmentMap(serverEnv(Spec{RestrictedEnv: true}))[name]; got != value {
+				t.Fatalf("Windows baseline %s = %q, want %q", name, got, value)
+			}
+		}
 	}
 }
 
@@ -573,6 +583,25 @@ func TestFatalStdioReadClosesAndReapsProcess(t *testing.T) {
 	}
 	if tr.cmd.ProcessState.Success() {
 		t.Fatalf("oversized-output process unexpectedly exited successfully: %v", tr.cmd.ProcessState)
+	}
+}
+
+func TestStdioRecvEnforcesLimitWhenNewlineFitsReaderBuffer(t *testing.T) {
+	const limit = 16
+	transport := func(body string) *stdioTransport {
+		return &stdioTransport{
+			stdout:          bufio.NewReaderSize(strings.NewReader(body), 64<<10),
+			maxMessageBytes: limit,
+		}
+	}
+
+	exact := strings.Repeat("x", limit)
+	got, err := transport(exact + "\n").Recv()
+	if err != nil || string(got) != exact {
+		t.Fatalf("exact limit: got %q, err %v", got, err)
+	}
+	if _, err := transport(exact + "x\n").Recv(); err == nil || !strings.Contains(err.Error(), "exceeds 16 bytes") {
+		t.Fatalf("one byte over: err = %v, want bounded refusal", err)
 	}
 }
 

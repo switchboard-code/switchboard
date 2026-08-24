@@ -11,6 +11,7 @@ package eval
 // seeing results is how a comparison stops being one.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -83,7 +84,7 @@ func TestVerifyBench(t *testing.T) {
 		if _, err := os.Stat(dir); err != nil {
 			continue
 		}
-		solved, detail, err := task.Verify(dir)
+		solved, detail, err := task.Verify(context.Background(), dir)
 		if err != nil {
 			t.Fatalf("verifying %s: %v", task.ID, err)
 		}

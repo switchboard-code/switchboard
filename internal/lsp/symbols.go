@@ -155,7 +155,7 @@ func (c *Client) WorkspaceSymbols(ctx context.Context, query string, limit int) 
 	}
 	sort.Strings(paths)
 	for _, path := range paths {
-		data, err := readDocumentSnapshot(ctx, path)
+		data, err := c.readDocumentSnapshot(ctx, path)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				if closeErr := c.closeDocumentLocked(path, capabilities); closeErr != nil {
@@ -163,6 +163,15 @@ func (c *Client) WorkspaceSymbols(ctx context.Context, query string, limit int) 
 					return nil, false, errors.Join(err, closeErr)
 				}
 				continue
+			}
+			if documentAuthorityChanged(err) {
+				// A retained path is not authority. Remove both the client-side
+				// snapshot and (when supported) the server-side open document so
+				// a later workspace query cannot keep using bytes from a pathname
+				// whose ancestor escaped or whose root identity changed.
+				closeErr := c.closeDocumentLocked(path, capabilities)
+				c.documentsMu.Unlock()
+				return nil, false, errors.Join(err, closeErr)
 			}
 			c.documentsMu.Unlock()
 			return nil, false, err

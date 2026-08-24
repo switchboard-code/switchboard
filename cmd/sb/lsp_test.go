@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -15,13 +16,17 @@ import (
 
 func TestSetupLSPFreezesAllSemanticToolsBeforeLazyStart(t *testing.T) {
 	workspace := t.TempDir()
+	testExecutable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
 	marker := "fixture.project"
 	if err := os.WriteFile(filepath.Join(workspace, marker), []byte("fixture\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	oldCandidates := lspCandidates
 	lspCandidates = []lspCandidateSpec{{marker: marker, detect: func() ([]string, bool) {
-		return []string{filepath.Join(workspace, "fixture-ls"), "--stdio"}, true
+		return []string{testExecutable, "--stdio"}, true
 	}}}
 	t.Cleanup(func() { lspCandidates = oldCandidates })
 
@@ -133,7 +138,11 @@ func TestTypeScriptNativeIsVersionGated(t *testing.T) {
 	if !detected {
 		t.Fatal("tsc disappeared between LookPath calls")
 	}
-	ok := probeTypeScriptNative(argv)
+	candidate, err := resolveLSPCandidate(t.TempDir(), argv)
+	if err != nil {
+		t.Skipf("installed tsc is not a trusted fixed language server: %v", err)
+	}
+	ok := probeTypeScriptNative(candidate)
 	wantNative := strings.Contains(string(out), "Version 7.") ||
 		strings.Contains(string(out), "Version 8.")
 	if ok != wantNative {
@@ -146,6 +155,10 @@ func TestTypeScriptNativeIsVersionGated(t *testing.T) {
 
 func TestSetupLSPDefersExecutableProbeUntilAfterTrust(t *testing.T) {
 	workspace := t.TempDir()
+	testExecutable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
 	marker := "fixture.project"
 	if err := os.WriteFile(filepath.Join(workspace, marker), []byte("fixture\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -155,9 +168,9 @@ func TestSetupLSPDefersExecutableProbeUntilAfterTrust(t *testing.T) {
 	lspCandidates = []lspCandidateSpec{{
 		marker: marker,
 		detect: func() ([]string, bool) {
-			return []string{filepath.Join(workspace, "fixture-ls")}, true
+			return []string{testExecutable}, true
 		},
-		probe: func([]string) bool {
+		probe: func(lspResolvedCandidate) bool {
 			probes++
 			return true
 		},
@@ -192,4 +205,63 @@ func TestSetupLSPDefersExecutableProbeUntilAfterTrust(t *testing.T) {
 		t.Fatalf("trusted setup server=%v probes=%d, want one deferred probe", server, probes)
 	}
 	server.Close()
+}
+
+func TestSetupLSPRejectsLaunchWorkspacePATHShadowForDifferentTarget(t *testing.T) {
+	launchWorkspace := t.TempDir()
+	if err := os.Mkdir(filepath.Join(launchWorkspace, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(launchWorkspace, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	markerFile := filepath.Join(t.TempDir(), "executed")
+	serverName := "switchboard-lsp-path-shadow"
+	if runtime.GOOS == "windows" {
+		serverName += ".exe"
+	}
+	if err := os.WriteFile(filepath.Join(bin, serverName), []byte("#!/bin/sh\nprintf executed > \"$SB_LSP_SHADOW_MARKER\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SB_LSP_SHADOW_MARKER", markerFile)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Chdir(launchWorkspace)
+
+	target := t.TempDir()
+	marker := "fixture.project"
+	if err := os.WriteFile(filepath.Join(target, marker), []byte("fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldCandidates := lspCandidates
+	lspCandidates = []lspCandidateSpec{{marker: marker, detect: plainServer(serverName)}}
+	t.Cleanup(func() { lspCandidates = oldCandidates })
+	store, err := trust.OpenFile(filepath.Join(t.TempDir(), "trust.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := tools.NewRegistry(target, execution.Capability{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target = registry.Root()
+	if err := store.Grant(target); err != nil {
+		t.Fatal(err)
+	}
+
+	server, note := setupLSP(target, store, registry)
+	if server != nil || note != "" {
+		t.Fatalf("setupLSP accepted launch-workspace shadow: (%v, %q)", server, note)
+	}
+	if _, _, ok := lspCandidate(target); ok {
+		t.Fatal("trust preview advertised launch-workspace shadow")
+	}
+	if _, err := os.Stat(markerFile); !os.IsNotExist(err) {
+		t.Fatalf("launch-workspace language server executed: %v", err)
+	}
+	for _, name := range []string{"definition", "references", "outline", "symbols"} {
+		if _, ok := registry.Get(name); ok {
+			t.Fatalf("%s registered for rejected language server", name)
+		}
+	}
 }

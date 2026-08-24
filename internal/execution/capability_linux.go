@@ -199,6 +199,18 @@ func readTrustedExecutableIdentity(path string, trustedUID uint32, rejectCurrent
 		}
 	}
 	hash := sha256.New()
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return executableIdentity{}, fmt.Errorf("reading bubblewrap executable header: %w", err)
+	}
+	// The sandbox launcher runs before there is a sandbox. Accepting a trusted
+	// script here would still let an ambient workspace-first PATH select the
+	// interpreter for a #!/usr/bin/env shebang and execute workspace code on the
+	// host. Linux bubblewrap is a native ELF binary; anything else fails closed.
+	if string(header) != "\x7fELF" {
+		return executableIdentity{}, errors.New("bubblewrap executable is not a native ELF binary")
+	}
+	_, _ = hash.Write(header)
 	if _, err := io.Copy(hash, f); err != nil {
 		return executableIdentity{}, fmt.Errorf("hashing bubblewrap executable: %w", err)
 	}
@@ -492,5 +504,14 @@ func linuxProfileKey(bwrap bubblewrapExecutable) (string, error) {
 // linuxHostKey pins the verdict to this kernel. Namespace and seccomp behavior
 // is kernel-dependent, and a distribution upgrade should re-run the check.
 func linuxHostKey() string {
-	return commandOutput("uname", "-rm")
+	var name unix.Utsname
+	if err := unix.Uname(&name); err != nil {
+		return "unknown"
+	}
+	release := unix.ByteSliceToString(name.Release[:])
+	machine := unix.ByteSliceToString(name.Machine[:])
+	if release == "" || machine == "" {
+		return "unknown"
+	}
+	return release + " " + machine
 }

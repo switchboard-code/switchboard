@@ -109,6 +109,11 @@ type TaskManager struct {
 	approval chan struct{}
 	tasks    map[string]*taskState
 	order    []string
+
+	// beforeFinish is a deterministic test seam at the only boundary where a
+	// completed worker and task-local cancellation can race. Tests install it
+	// before starting any task; production leaves it nil.
+	beforeFinish func(TaskRef)
 }
 
 func NewTaskManager(maxParallel int) *TaskManager {
@@ -193,8 +198,23 @@ func (m *TaskManager) Execute(
 		return tools.Result{}, err
 	}
 	defer func() {
-		m.finish(ref.ID, res, err, runCtx.Err())
+		if m.beforeFinish != nil {
+			m.beforeFinish(ref)
+		}
+		canceled, ctxErr := m.finish(ref.ID, res, err, runCtx)
 		cancel()
+		if canceled {
+			// A successful result and a canceled task row must never describe the
+			// same execution. Workflow stages consume this return value directly;
+			// suppressing it here also prevents canceled evidence from being
+			// carried into a later stage.
+			res = tools.Result{}
+			if ctxErr != nil {
+				err = ctxErr
+			} else if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				err = context.Canceled
+			}
+		}
 	}()
 
 	select {
@@ -266,16 +286,18 @@ func (m *TaskManager) setRunning(id string) error {
 	return errors.New("delegate task disappeared before it started")
 }
 
-func (m *TaskManager) finish(id string, res tools.Result, runErr, ctxErr error) {
+func (m *TaskManager) finish(id string, res tools.Result, runErr error, runCtx context.Context) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	state := m.tasks[id]
 	if state == nil {
-		return
+		return false, nil
 	}
+	ctxErr := runCtx.Err()
+	canceled := ctxErr != nil || errors.Is(runErr, context.Canceled) || state.Status == TaskCanceling
 	state.FinishedAt = time.Now()
 	switch {
-	case ctxErr != nil || errors.Is(runErr, context.Canceled) || state.Status == TaskCanceling:
+	case canceled:
 		state.Status = TaskCanceled
 		switch {
 		case ctxErr != nil:
@@ -301,6 +323,7 @@ func (m *TaskManager) finish(id string, res tools.Result, runErr, ctxErr error) 
 		state.Status = TaskSucceeded
 	}
 	state.cancel = nil
+	return canceled, ctxErr
 }
 
 func firstTaskLine(value string) string {

@@ -44,6 +44,7 @@ func escalationHarness(t *testing.T, routed RoutedArmFor, messages ...provider.M
 		Catalog:  routed.Catalog,
 		System:   []provider.Block{provider.Text{Text: "evaluation system"}},
 	}
+	installEvalResolvers(loop, start, routed.Catalog)
 	escalation := &escalator{
 		sticky: router.NewSticky(router.Policy{
 			EscalateAfter: 0.5, MinimumDwell: 1,
@@ -64,9 +65,14 @@ func TestEscalationPreparesFallbackBeforeAtomicBind(t *testing.T) {
 	lowTarget := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "claude-haiku-4-5"}
 	primaryTarget := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "claude-opus-5"}
 	fallbackTarget := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "claude-opus-4-8"}
+	primaryTarget.Params.MaxOutputTokens = 100
+	fallbackTarget.Params.MaxOutputTokens = 100
 	low := &recordingProvider{probe: liveProbe()}
 	unreachable := &recordingProvider{probe: provider.ProbeResult{Detail: "offline"}}
-	fallback := &recordingProvider{probe: liveProbe()}
+	fallbackProbe := liveProbe()
+	fallbackProbe.ContextWindow = 50_000
+	fallbackProbe.WindowEnforced = true
+	fallback := &recordingProvider{probe: fallbackProbe}
 	routed := RoutedArmFor{Catalog: cat, Ladder: []Arm{
 		{Name: "low", Target: lowTarget, Provider: low},
 		{
@@ -86,6 +92,12 @@ func TestEscalationPreparesFallbackBeforeAtomicBind(t *testing.T) {
 	}
 	if escalation.sticky.Rank() != 1 || escalation.moves != 1 {
 		t.Fatalf("sticky rank/moves = %d/%d, want 1/1", escalation.sticky.Rank(), escalation.moves)
+	}
+	if got := loop.ContextWindow(fallbackTarget); got != 50_000 {
+		t.Fatalf("loop context window after move = %d, want probed 50000", got)
+	}
+	if got := loop.OutputAllowance(fallbackTarget, 0); got != 100 {
+		t.Fatalf("loop output allowance after move = %d, want explicit 100", got)
 	}
 }
 

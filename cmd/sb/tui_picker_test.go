@@ -1,14 +1,53 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func pickerType(d *pickerDialog, text string) {
 	d.update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(text)}, darkTheme())
+}
+
+func TestPickerPaginationMatchesTheRowsRenderedAtNarrowHeights(t *testing.T) {
+	items := make([]pickerItem, 13)
+	for i := range items {
+		items[i] = pickerItem{id: fmt.Sprint(i), label: fmt.Sprintf("model-%02d", i)}
+	}
+	for _, tc := range []struct {
+		width, height int
+		selected      int
+		wantHint      string
+		wantRows      []string
+		absent        []string
+		wantFold      string
+	}{
+		{31, 10, 0, "1-5 of 13", []string{"model-00", "model-04"}, []string{"model-05"}, "↓ 8 more"},
+		{20, 6, 0, "1-2 of 13", []string{"model-00", "model-01"}, []string{"model-02"}, "↓ 11 more"},
+		{20, 6, 12, "12-13 of 13", []string{"model-11", "model-12"}, []string{"model-10"}, "↑ 11 earlier"},
+	} {
+		t.Run(fmt.Sprintf("%dx%d_at_%d", tc.width, tc.height, tc.selected), func(t *testing.T) {
+			d := &pickerDialog{title: "models", items: items, sel: tc.selected}
+			plain := ansi.Strip(d.viewWithin(tc.width, tc.height, darkTheme()))
+			if rows := strings.Count(plain, "\n") + 1; rows > tc.height {
+				t.Fatalf("picker rendered %d rows into height %d:\n%s", rows, tc.height, plain)
+			}
+			for _, want := range append(append([]string{}, tc.wantRows...), tc.wantHint, tc.wantFold) {
+				if !strings.Contains(plain, want) {
+					t.Fatalf("picker at %dx%d omitted %q:\n%s", tc.width, tc.height, want, plain)
+				}
+			}
+			for _, absent := range tc.absent {
+				if strings.Contains(plain, absent) {
+					t.Fatalf("picker at %dx%d showed clipped row %q:\n%s", tc.width, tc.height, absent, plain)
+				}
+			}
+		})
+	}
 }
 
 func pickerIDs(matches []pickerMatch) []string {
@@ -130,6 +169,25 @@ func TestPickerWordEditingAndQueryBound(t *testing.T) {
 	d.appendQuery([]rune{'\n', '\x1b'})
 	if got := len([]rune(d.query)); got != pickerQueryMaxRunes {
 		t.Fatalf("non-printable input changed bounded query length to %d", got)
+	}
+}
+
+func TestPickerEscapesUntrustedTerminalMetadata(t *testing.T) {
+	d := &pickerDialog{
+		title: "pick\x1b]2;forged\a",
+		items: []pickerItem{{
+			id: "raw-id", label: "model\x1b[2J", desc: "remote\a\u202e spoof",
+		}},
+	}
+	view := d.view(80, darkTheme())
+	plain := stripANSI(view)
+	for _, unsafe := range []string{"\x1b", "\a", "\u202e"} {
+		if strings.Contains(plain, unsafe) {
+			t.Fatalf("picker retained terminal control %q: %q", unsafe, plain)
+		}
+	}
+	if !strings.Contains(plain, `\x1b`) {
+		t.Fatalf("picker did not render a visible escape: %q", plain)
 	}
 }
 

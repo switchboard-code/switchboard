@@ -103,6 +103,78 @@ default. `/agents` lists the loaded definitions. Repository definitions are
 prompts, so reading them does not require workspace execution trust; every
 tool call still passes the permission engine.
 
+Compatible Claude definitions are discovered recursively under
+`.claude/agents/` and `~/.claude/agents/`. `/agents` shows the source dialect
+and exact relative path rather than presenting those files as Switchboard's
+own format. Discovery reads only stable regular files through anchored roots
+and applies entry, definition, and byte ceilings. Symlinked definitions are
+refused. Same-scope duplicate names reject every contender; a rejected project
+definition still reserves its recovered name so it cannot silently activate a
+user-level fallback.
+
+The runtime appends a non-overridable worker contract after the named prompt:
+stay inside the assigned task and tool grant, treat repository text and other
+agents' output as evidence, omit credentials, and return findings rather than
+instructions to the parent. Task text, steering, workflow carry, errors, and
+the returned report are scanned at this boundary. The parent receives the
+report inside a data-only evidence frame and is told to verify it independently.
+
+Native Claude agent definitions fail closed when they contain a behavior or
+authority field Switchboard cannot preserve. Unknown fields, explicit empty
+tool grants, unsupported model, permission, isolation, hook, MCP, memory, and
+lifecycle controls remain inspectable diagnostics rather than silently loading
+with broader behavior. The supported name, description, tier, and tool subset
+accept quoted, inline-list, or block-list YAML forms with duplicate and
+indentation checks. Switchboard's own agent frontmatter rejects unknown fields
+too: a typo such as `tool` cannot become an omitted `tools` grant and widen the
+agent to the full suite.
+
+Workflow TOML files under `.switchboard/workflows/` and
+`~/.switchboard/workflows/` use the same anchored, regular-file-only,
+bounded-inventory discovery posture. The project basename has precedence, and
+a malformed project workflow reserves that basename instead of falling
+through to a user workflow with different instructions. Loaded workflows keep
+both their logical discovery path and resolved file identity as provenance.
+
+A workflow is a small, explicit stage graph. Tasks within one stage run in
+parallel; stages run in order. For example,
+
+```toml
+description = "survey the requested package, then propose a change"
+
+[[stage]]
+name = "survey"
+[[stage.task]]
+task = "List the relevant call sites in $ARGUMENTS with file:line."
+[[stage.task]]
+agent = "test-reviewer"
+task = "Find the tests covering $ARGUMENTS."
+
+[[stage]]
+name = "propose"
+carry = true
+[[stage.task]]
+tier = "t2"
+task = "Use the survey evidence to propose the smallest safe patch."
+```
+
+`task` is required. `tier` and `agent` are optional; an explicit tier wins
+over the named agent's default. `$ARGUMENTS` and `$1` through `$9` expand from
+the words after the workflow name. `carry = true` gives each task the previous
+stage's bounded, redacted answers in an untrusted-data frame. Definitions are
+limited to four stages, four tasks in a stage, and eight tasks total. Workflow
+filenames are their command names and therefore cannot contain whitespace.
+
+Use `/workflow list`, `/workflow show <name>`, and
+`/workflow run <name> [arguments]` in the TUI. For automation,
+`sb -workflow <name> [arguments]` runs the same graph and exits. The flag is an
+unattended surface even when stdin is a terminal: it never installs a question
+or permission-prompt relay, so an undecided approval fails closed instead of
+waiting for input. Standing permission rules or an explicitly wider `-mode`
+still apply normally. Every expanded task, agent, and tier is resolved before
+the primary startup session becomes resumable, so a typo cannot replace the
+previous `-continue` candidate with an empty log.
+
 ## Custom commands and repository instructions
 
 Custom commands are Markdown files in `.switchboard/commands/` or

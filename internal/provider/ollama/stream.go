@@ -1,6 +1,8 @@
 package ollama
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,13 +12,16 @@ import (
 	"github.com/switchboard-code/switchboard/internal/provider"
 )
 
-// stream decodes Ollama's newline-delimited chat response. json.Decoder reads
-// concatenated JSON values directly, which avoids imposing any line-length
-// ceiling on a chunk carrying large tool arguments.
+const maxStreamFrameBytes = 8 << 20
+
+// stream decodes Ollama's newline-delimited chat response. Each complete
+// frame is bounded independently: a response may contain arbitrarily many
+// legitimate chunks, while one missing delimiter cannot grow an allocation
+// without limit.
 type stream struct {
-	ctx  context.Context
-	body io.ReadCloser
-	dec  *json.Decoder
+	ctx    context.Context
+	body   io.ReadCloser
+	reader *bufio.Reader
 
 	pending []provider.Event
 
@@ -32,7 +37,7 @@ type stream struct {
 }
 
 func newStream(ctx context.Context, body io.ReadCloser) *stream {
-	return &stream{ctx: ctx, body: body, dec: json.NewDecoder(body)}
+	return &stream{ctx: ctx, body: body, reader: bufio.NewReader(body)}
 }
 
 func (s *stream) Next() (provider.Event, error) {
@@ -54,21 +59,29 @@ func (s *stream) Next() (provider.Event, error) {
 func (s *stream) Close() error { return s.body.Close() }
 
 func (s *stream) readChunk() error {
-	var chunk chatChunk
-	if err := s.dec.Decode(&chunk); err != nil {
+	frame, atEOF, err := readStreamFrame(s.reader)
+	if err != nil {
 		if ctxErr := s.ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			// The connection dropped before the terminal chunk. Whatever the
-			// caller already consumed is real output and must not be discarded.
+		if errors.Is(err, io.EOF) {
+			return provider.ErrStreamIncomplete
+		}
+		return &provider.ProtocolError{Provider: Name, Detail: "reading chat chunk", Err: err}
+	}
+
+	var chunk chatChunk
+	if err := json.Unmarshal(frame, &chunk); err != nil {
+		if atEOF {
+			// A final unterminated frame may be valid JSON, but malformed JSON at
+			// EOF is a dropped connection rather than a provider-format claim.
 			return provider.ErrStreamIncomplete
 		}
 		return &provider.ProtocolError{Provider: Name, Detail: "decoding chat chunk", Err: err}
 	}
 
 	if chunk.Error != "" {
-		return &provider.APIError{Provider: Name, StatusCode: 0, Body: chunk.Error}
+		return &provider.APIError{Provider: Name, StatusCode: 0, Body: provider.SanitizeAPIErrorText(chunk.Error)}
 	}
 
 	if t := chunk.Message.Thinking; t != "" {
@@ -110,6 +123,36 @@ func (s *stream) readChunk() error {
 		})
 	}
 	return nil
+}
+
+func readStreamFrame(r *bufio.Reader) ([]byte, bool, error) {
+	frame := make([]byte, 0, 64<<10)
+	for {
+		fragment, err := r.ReadSlice('\n')
+		if len(frame)+len(fragment) > maxStreamFrameBytes {
+			return nil, false, fmt.Errorf("chat chunk exceeded the %d-byte frame limit", maxStreamFrameBytes)
+		}
+		frame = append(frame, fragment...)
+		switch {
+		case err == nil:
+			frame = bytes.TrimSuffix(frame, []byte{'\n'})
+			frame = bytes.TrimSuffix(frame, []byte{'\r'})
+			if len(bytes.TrimSpace(frame)) == 0 {
+				frame = frame[:0]
+				continue
+			}
+			return frame, false, nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case errors.Is(err, io.EOF):
+			if len(frame) == 0 {
+				return nil, true, io.EOF
+			}
+			return frame, true, nil
+		default:
+			return nil, false, err
+		}
+	}
 }
 
 func (s *stream) toolUse(call wireToolCall) (*provider.ToolUse, error) {

@@ -85,7 +85,7 @@ func (r *Registry) DriftedReads() []DriftedRead {
 
 	var out []DriftedRead
 	for _, abs := range tracked {
-		drift, changed := r.versions.driftOf(abs)
+		drift, changed := r.driftOf(abs)
 		if !changed {
 			continue
 		}
@@ -97,7 +97,12 @@ func (r *Registry) DriftedReads() []DriftedRead {
 
 // driftOf decides one file, and records what it decided so the same change is
 // not reported twice.
-func (v *fileVersions) driftOf(abs string) (DriftedRead, bool) {
+func (r *Registry) driftOf(abs string) (DriftedRead, bool) {
+	return r.driftOfWithHook(abs, nil)
+}
+
+func (r *Registry) driftOfWithHook(abs string, beforeOpen func()) (DriftedRead, bool) {
+	v := r.versions
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -106,7 +111,12 @@ func (v *fileVersions) driftOf(abs string) (DriftedRead, bool) {
 		return DriftedRead{}, false
 	}
 
-	info, err := os.Stat(abs)
+	root, relative, err := r.openResolvedWorkspace(abs)
+	if err != nil {
+		return DriftedRead{}, false
+	}
+	defer root.Close()
+	info, err := root.Lstat(relative)
 	if err != nil {
 		if v.reported[abs] == goneMarker {
 			return DriftedRead{}, false
@@ -114,7 +124,10 @@ func (v *fileVersions) driftOf(abs string) (DriftedRead, bool) {
 		v.reported[abs] = goneMarker
 		return DriftedRead{Gone: true}, true
 	}
-	if info.IsDir() {
+	if !info.Mode().IsRegular() {
+		return DriftedRead{}, false
+	}
+	if err := r.verifyWorkspaceRoot(root); err != nil {
 		return DriftedRead{}, false
 	}
 
@@ -133,8 +146,11 @@ func (v *fileVersions) driftOf(abs string) (DriftedRead, bool) {
 		return DriftedRead{Unverified: true}, true
 	}
 
-	data, err := os.ReadFile(abs)
+	data, _, err := readRegularWorkspaceFile(root, relative, r.display(abs), maxDriftHashBytes, beforeOpen)
 	if err != nil {
+		return DriftedRead{}, false
+	}
+	if err := r.verifyWorkspaceRoot(root); err != nil {
 		return DriftedRead{}, false
 	}
 	current := hashContent(data)

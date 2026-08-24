@@ -344,3 +344,47 @@ func TestRenderIsDeterministicBoundedAndAdvisory(t *testing.T) {
 		t.Fatalf("render omitted advisory or identity: %q", first)
 	}
 }
+
+func TestRenderKeepsTheExecutionFrontierAheadOfCompletedHistory(t *testing.T) {
+	tasks := make([]Task, 0, 32)
+	for i := 0; i < 30; i++ {
+		tasks = append(tasks, Task{Text: fmt.Sprintf("old completed step %02d %s", i, strings.Repeat("x", 180)), Status: TaskDone})
+	}
+	tasks = append(tasks,
+		Task{Text: "repair the resume boundary", Status: TaskActive},
+		Task{Text: "run the crash recovery matrix", Status: TaskPending},
+	)
+	stored, err := Prepare(Capsule{
+		Source:        SourceManual,
+		Objective:     "make resumed sessions trustworthy",
+		NextAction:    "repair the resume boundary",
+		StopCondition: "the recovery matrix passes",
+		Tasks:         tasks,
+		Facts:         []string{"the interrupted call outcome is unknown"},
+		Decisions:     []Decision{{Text: "never replay an unresolved effect", Reason: "it may already have completed"}},
+		Files:         []File{{Path: "internal/session/session.go", State: "present"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := Render(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Objective: make resumed sessions trustworthy",
+		"Next: repair the resume boundary",
+		"[>] repair the resume boundary",
+		"[ ] run the crash recovery matrix",
+		"the interrupted call outcome is unknown",
+		"internal/session/session.go (present)",
+		"Completed tasks omitted while rendering:",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("render omitted frontier evidence %q:\n%s", want, rendered)
+		}
+	}
+	if len(rendered) > MaxRenderBytes {
+		t.Fatalf("render = %d bytes, limit = %d", len(rendered), MaxRenderBytes)
+	}
+}

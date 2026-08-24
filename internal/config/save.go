@@ -9,7 +9,9 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/switchboard-code/switchboard/internal/credential"
 	"github.com/switchboard-code/switchboard/internal/execution"
+	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 	"github.com/switchboard-code/switchboard/internal/provider"
 )
 
@@ -42,7 +44,7 @@ func (c *Config) Save() error {
 		c.Path = path
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := fileprivacy.EnsurePrivateDir(filepath.Dir(path)); err != nil {
 		return fmt.Errorf("creating %s: %w", filepath.Dir(path), err)
 	}
 
@@ -51,15 +53,11 @@ func (c *Config) Save() error {
 		return err
 	}
 
-	tmp, err := os.CreateTemp(filepath.Dir(path), FileName+".*")
+	tmp, err := fileprivacy.CreateTemp(filepath.Dir(path), FileName+".*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
 	if _, err := tmp.Write(body); err != nil {
 		tmp.Close()
 		return err
@@ -150,9 +148,9 @@ func (c *Config) render() ([]byte, error) {
 		off := false
 		updates.Check = &off
 	}
-	if !c.UpdateAuto {
-		off := false
-		updates.Auto = &off
+	if c.UpdateAuto {
+		on := true
+		updates.Auto = &on
 	}
 	if c.UpdateChannel != "" && c.UpdateChannel != "stable" {
 		updates.Channel = c.UpdateChannel
@@ -272,10 +270,11 @@ func writeTierSection(buf *bytes.Buffer, heading string, t Tier) error {
 	}
 	fmt.Fprintf(buf, "[%s]\n", heading)
 	entry := tierEntry{
-		Label:   t.Label,
-		Model:   t.Target.Provider + "/" + t.Target.ModelID,
-		Surface: surfaceToWrite(t.Target.Provider, t.Target.Surface),
-		Effort:  effortOf(t.Target),
+		Label:     t.Label,
+		Model:     t.Target.Provider + "/" + t.Target.ModelID,
+		Surface:   surfaceToWrite(t.Target.Provider, t.Target.Surface),
+		Effort:    effortOf(t.Target),
+		MaxOutput: positiveInt(t.Target.Params.MaxOutputTokens),
 	}
 	for _, fb := range t.Fallbacks {
 		entry.Fallback = append(entry.Fallback, fb.Provider+"/"+fb.ModelID)
@@ -289,18 +288,28 @@ func writeTierSection(buf *bytes.Buffer, heading string, t Tier) error {
 
 // validateTierRoundTrip prevents Save from silently changing a target's wire,
 // cache, or pricing identity. The current human-editable TOML schema can
-// represent an explicit primary surface and reasoning effort, but it has no
-// fields for max output, temperature, explicit reasoning-off, or fallback
-// surfaces/parameters. Refusing those typed values before writing is safer
-// than producing a file that loads as a different target on the next run.
+// represent an explicit primary surface, reasoning effort, and one positive
+// rung-wide max output, but it has no fields for temperature, explicit
+// reasoning-off, fallback surfaces, or fallback-specific parameters. Refusing
+// those typed values before writing is safer than producing a file that loads
+// as a different target on the next run.
 func validateTierRoundTrip(t Tier) error {
+	if t.Target.Params.MaxOutputTokens < 0 {
+		return fmt.Errorf("tier %s target %s has negative max_output", t.ID, t.Target.Display())
+	}
 	primary, err := ParseTarget(t.Target.Provider+"/"+t.Target.ModelID,
 		surfaceToWrite(t.Target.Provider, t.Target.Surface), effortOf(t.Target))
+	primary.Params.MaxOutputTokens = t.Target.Params.MaxOutputTokens
 	if err != nil || primary.ID() != t.Target.ID() {
 		return fmt.Errorf("tier %s target %s cannot be represented without changing its identity", t.ID, t.Target.Display())
 	}
 	for index, target := range t.Fallbacks {
+		if target.Params.MaxOutputTokens != t.Target.Params.MaxOutputTokens {
+			return fmt.Errorf("tier %s fallback %d (%s) has max_output %d, different from the rung's %d, and cannot be represented",
+				t.ID, index+1, target.Display(), target.Params.MaxOutputTokens, t.Target.Params.MaxOutputTokens)
+		}
 		fallback, fallbackErr := ParseTarget(target.Provider+"/"+target.ModelID, "", "")
+		fallback.Params.MaxOutputTokens = t.Target.Params.MaxOutputTokens
 		if fallbackErr != nil || fallback.ID() != target.ID() {
 			return fmt.Errorf("tier %s fallback %d (%s) cannot be represented without changing its identity",
 				t.ID, index+1, target.Display())
@@ -346,23 +355,46 @@ func effortOf(t provider.RouteTarget) string {
 	return t.Params.Reasoning.Effort
 }
 
+func positiveInt(value int) *int {
+	if value <= 0 {
+		return nil
+	}
+	return &value
+}
+
 // BindTier creates or replaces a rung. The reference is validated the same
 // way loading validates it, so a binding that saves is a binding that loads.
 func (c *Config) BindTier(id, label, ref, surface, effort string) error {
+	return c.BindTierWithMaxOutput(id, label, ref, surface, effort, 0)
+}
+
+// BindTierWithMaxOutput creates or replaces a rung with an explicit output
+// cap shared by its primary and every fallback. Zero leaves the provider's
+// output allowance unspecified; a negative cap cannot be represented by the
+// configuration schema.
+func (c *Config) BindTierWithMaxOutput(id, label, ref, surface, effort string, maxOutput int) error {
 	if _, err := tierNumber(id); err != nil {
 		return err
+	}
+	if maxOutput < 0 {
+		return fmt.Errorf("tier %s max_output %d cannot be negative", id, maxOutput)
 	}
 	target, err := ParseTarget(ref, surface, effort)
 	if err != nil {
 		return err
 	}
+	target.Params.MaxOutputTokens = maxOutput
 	tier := Tier{ID: id, Label: label, Target: target}
 	for i, t := range c.Tiers {
 		if t.ID == id {
 			// Binding changes the rung's active model, not its outage policy.
 			// Keep an independent copy so a UI model change cannot silently erase
-			// hand-configured fallbacks or alias a caller-owned slice.
+			// hand-configured fallbacks or alias a caller-owned slice. max_output is
+			// rung policy, so rebinding updates every retained target together.
 			tier.Fallbacks = append([]provider.RouteTarget(nil), t.Fallbacks...)
+			for i := range tier.Fallbacks {
+				tier.Fallbacks[i].Params.MaxOutputTokens = maxOutput
+			}
 			c.Tiers[i] = tier
 			return nil
 		}
@@ -374,6 +406,183 @@ func (c *Config) BindTier(id, label, ref, surface, effort string) error {
 		return a < b
 	})
 	return nil
+}
+
+// BindTierAndSave stages a rung replacement, writes the complete configuration,
+// and publishes the staged ladder to the live Config only after the atomic file
+// replacement succeeds. A TUI save failure must not leave a binding that exists
+// only in memory: later commands would route through a target the file never
+// approved, and a subsequent unrelated save could persist it unexpectedly.
+func (c *Config) BindTierAndSave(id, label, ref, surface, effort string, maxOutput int) error {
+	staged := *c
+	staged.Tiers = cloneTiers(c.Tiers)
+	if err := staged.BindTierWithMaxOutput(id, label, ref, surface, effort, maxOutput); err != nil {
+		return err
+	}
+	if err := staged.Save(); err != nil {
+		return fmt.Errorf("saving configuration: %w", err)
+	}
+	c.Tiers = staged.Tiers
+	c.Path = staged.Path
+	return nil
+}
+
+// SetProviderBaseURLAndSave stages one endpoint change and publishes it only
+// after the complete configuration has been replaced on disk. A failed save
+// must not leave a server address active only in memory: a later unrelated
+// save could otherwise publish an address the user was told did not stick.
+func (c *Config) SetProviderBaseURLAndSave(key, baseURL string) error {
+	staged := c.Snapshot()
+	staged.SetProviderBaseURL(key, baseURL)
+	if err := staged.Save(); err != nil {
+		return fmt.Errorf("saving configuration: %w", err)
+	}
+	c.Providers = staged.Providers
+	c.Path = staged.Path
+	return nil
+}
+
+// SetAuthAndSave stages one provider's credential-resolution settings and
+// publishes them only after the atomic file replacement succeeds. Credential
+// values themselves never enter Config; this persists only resolver policy.
+func (c *Config) SetAuthAndSave(providerName string, settings credential.Settings) error {
+	staged := c.Snapshot()
+	if staged.Auth == nil {
+		staged.Auth = map[string]credential.Settings{}
+	}
+	staged.Auth[providerName] = settings
+	if err := staged.Save(); err != nil {
+		return fmt.Errorf("saving configuration: %w", err)
+	}
+	c.Auth = staged.Auth
+	c.Path = staged.Path
+	return nil
+}
+
+// SetRouteAutoAndSave stages the routing posture and publishes it to the live
+// configuration only after the complete file has been replaced. Callers may
+// then apply the matching runtime watcher state without a failed save leaving
+// the current process and the durable configuration in disagreement.
+func (c *Config) SetRouteAutoAndSave(on bool) error {
+	staged := c.Snapshot()
+	staged.RouteAuto = &on
+	if err := staged.Save(); err != nil {
+		return fmt.Errorf("saving configuration: %w", err)
+	}
+	c.RouteAuto = staged.RouteAuto
+	c.Path = staged.Path
+	return nil
+}
+
+// SetCompactAutoAndSave stages automatic compaction so a failed persistence
+// attempt cannot silently change when the running session compacts.
+func (c *Config) SetCompactAutoAndSave(on bool) error {
+	staged := c.Snapshot()
+	staged.CompactAuto = on
+	if err := staged.Save(); err != nil {
+		return fmt.Errorf("saving configuration: %w", err)
+	}
+	c.CompactAuto = staged.CompactAuto
+	c.Path = staged.Path
+	return nil
+}
+
+// SetCompactAtPercentAndSave stages the compaction threshold and adopts it
+// only after the complete configuration is durable.
+func (c *Config) SetCompactAtPercentAndSave(percent int) error {
+	staged := c.Snapshot()
+	staged.CompactAtPercent = percent
+	if err := staged.Save(); err != nil {
+		return fmt.Errorf("saving configuration: %w", err)
+	}
+	c.CompactAtPercent = staged.CompactAtPercent
+	c.Path = staged.Path
+	return nil
+}
+
+// SetUpdateChannelAndSave stages the release channel and adopts it only after
+// persistence succeeds.
+func (c *Config) SetUpdateChannelAndSave(channel string) error {
+	staged := c.Snapshot()
+	staged.UpdateChannel = channel
+	if err := staged.Save(); err != nil {
+		return fmt.Errorf("saving configuration: %w", err)
+	}
+	c.UpdateChannel = staged.UpdateChannel
+	c.Path = staged.Path
+	return nil
+}
+
+// SetUpdateAutoAndSave stages automatic updates and adopts the setting only
+// after persistence succeeds.
+func (c *Config) SetUpdateAutoAndSave(on bool) error {
+	staged := c.Snapshot()
+	staged.UpdateAuto = on
+	if err := staged.Save(); err != nil {
+		return fmt.Errorf("saving configuration: %w", err)
+	}
+	c.UpdateAuto = staged.UpdateAuto
+	c.Path = staged.Path
+	return nil
+}
+
+// SetProviderContextWindowAndSave stages one surface's declared context
+// allowance. The live provider map is replaced only after the file is, so a
+// failed /context command cannot affect routing or a later unrelated save.
+func (c *Config) SetProviderContextWindowAndSave(key string, tokens int) error {
+	staged := c.Snapshot()
+	staged.SetProviderContextWindow(key, tokens)
+	if err := staged.Save(); err != nil {
+		return fmt.Errorf("saving configuration: %w", err)
+	}
+	c.Providers = staged.Providers
+	c.Path = staged.Path
+	return nil
+}
+
+// RemoveTierAndSave stages a rung removal, preserving the live ladder when
+// persistence fails. The bool is false only when no such rung exists.
+func (c *Config) RemoveTierAndSave(id string) (bool, error) {
+	staged := c.Snapshot()
+	if !staged.RemoveTier(id) {
+		return false, nil
+	}
+	if err := staged.Save(); err != nil {
+		return true, fmt.Errorf("saving configuration: %w", err)
+	}
+	c.Tiers = staged.Tiers
+	c.Path = staged.Path
+	return true, nil
+}
+
+func cloneTiers(tiers []Tier) []Tier {
+	if tiers == nil {
+		return nil
+	}
+	cloned := make([]Tier, len(tiers))
+	for i, tier := range tiers {
+		cloned[i] = tier
+		cloned[i].Target = cloneTarget(tier.Target)
+		if tier.Fallbacks != nil {
+			cloned[i].Fallbacks = make([]provider.RouteTarget, len(tier.Fallbacks))
+			for j, fallback := range tier.Fallbacks {
+				cloned[i].Fallbacks[j] = cloneTarget(fallback)
+			}
+		}
+	}
+	return cloned
+}
+
+func cloneTarget(target provider.RouteTarget) provider.RouteTarget {
+	if target.Params.Temperature != nil {
+		temperature := *target.Params.Temperature
+		target.Params.Temperature = &temperature
+	}
+	if target.Params.Reasoning != nil {
+		reasoning := *target.Params.Reasoning
+		target.Params.Reasoning = &reasoning
+	}
+	return target
 }
 
 // RemoveTier drops a rung. Remaining tiers keep their IDs: t3 does not become

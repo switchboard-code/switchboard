@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -93,6 +94,496 @@ func TestEmptyTurnsAreNotStacked(t *testing.T) {
 	}
 	if turns := r.Turns(); len(turns) != 0 {
 		t.Errorf("turns = %v, want none", turns)
+	}
+}
+
+func TestUndoCurrentDoesNotFallThroughAnEmptyTurnToOlderSameLabelMutation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "same-label.txt")
+	write(t, path, "before")
+
+	r := NewRecorder()
+	first := TurnIdentity{SessionID: "session", OpeningMessage: 0}
+	second := TurnIdentity{SessionID: "session", OpeningMessage: 2}
+	r.BeginTurn(first.SessionID, first.OpeningMessage, "continue")
+	r.Record(path)
+	write(t, path, "after first turn")
+	r.BeginTurn(second.SessionID, second.OpeningMessage, "continue")
+
+	if current, ok := r.CurrentTurn(second); !ok || current.Files != 0 {
+		t.Fatalf("empty second turn is not authoritative: current=%+v ok=%v", current, ok)
+	}
+	if _, _, _, _, _, err := r.UndoCurrent(first); err == nil {
+		t.Fatal("UndoCurrent accepted an older turn instead of the empty current turn")
+	}
+	if got := readBack(t, path); got != "after first turn" {
+		t.Fatalf("refused UndoCurrent still changed the file: %q", got)
+	}
+	if _, _, _, _, label, err := r.Undo(); err != nil || label != "continue" {
+		t.Fatalf("older checkpoint was consumed by the refusal: label=%q err=%v", label, err)
+	}
+	if got := readBack(t, path); got != "before" {
+		t.Fatalf("ordinary undo did not retain the older checkpoint: %q", got)
+	}
+}
+
+func TestUndoCurrentRestoresTheExactIdentifiedTurn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "identified.txt")
+	write(t, path, "before")
+
+	r := NewRecorder()
+	identity := TurnIdentity{SessionID: "session", OpeningMessage: 4}
+	r.BeginTurn(identity.SessionID, identity.OpeningMessage, "edit")
+	r.Record(path)
+	write(t, path, "after")
+
+	if _, _, _, _, label, err := r.UndoCurrent(identity); err != nil || label != "edit" {
+		t.Fatalf("UndoCurrent: label=%q err=%v", label, err)
+	}
+	if got := readBack(t, path); got != "before" {
+		t.Fatalf("identified turn was not restored: %q", got)
+	}
+}
+
+func TestUndoCurrentKeepsTheExactTurnsCapturesAfterUndoFile(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.txt")
+	second := filepath.Join(dir, "second.txt")
+	write(t, first, "first before")
+	write(t, second, "second before")
+
+	r := NewRecorder()
+	identity := TurnIdentity{SessionID: "session", OpeningMessage: 6}
+	r.BeginTurn(identity.SessionID, identity.OpeningMessage, "edit both")
+	r.Record(first)
+	r.Record(second)
+	write(t, first, "first after")
+	write(t, second, "second after")
+
+	if _, _, err := r.UndoFile(first); err != nil {
+		t.Fatal(err)
+	}
+	if current, ok := r.CurrentTurn(identity); !ok || current.Files != 1 {
+		t.Fatalf("remaining capture lost its turn identity: current=%+v ok=%v", current, ok)
+	}
+	if _, _, _, _, _, err := r.UndoCurrent(identity); err != nil {
+		t.Fatal(err)
+	}
+	if got := readBack(t, first); got != "first before" {
+		t.Fatalf("UndoFile result changed: %q", got)
+	}
+	if got := readBack(t, second); got != "second before" {
+		t.Fatalf("UndoCurrent did not restore the remaining exact-turn capture: %q", got)
+	}
+}
+
+func TestPreparedUndoCurrentRestoresOnlyOnApply(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prepared.txt")
+	write(t, path, "before")
+	r := NewRecorder()
+	identity := TurnIdentity{SessionID: "session", OpeningMessage: 2}
+	r.BeginTurn(identity.SessionID, identity.OpeningMessage, "edit")
+	r.Record(path)
+	write(t, path, "after")
+
+	prepared, err := r.PrepareUndoCurrent(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readBack(t, path); got != "after" {
+		t.Fatalf("preparation changed the workspace: %q", got)
+	}
+	result, err := prepared.Apply()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Restored) != 1 || result.Restored[0] != path || len(result.Removed) != 0 {
+		t.Fatalf("prepared restore result = %+v", result)
+	}
+	if got := readBack(t, path); got != "before" {
+		t.Fatalf("Apply did not publish the pre-image: %q", got)
+	}
+	if current, ok := r.CurrentTurn(identity); !ok || current.Files != 0 || current.Partial {
+		t.Fatalf("successful Apply did not consume its exact evidence: current=%+v ok=%v", current, ok)
+	}
+	if _, err := prepared.Apply(); !errors.Is(err, ErrStale) {
+		t.Fatalf("prepared restore was reusable: %v", err)
+	}
+}
+
+func TestPreparedUndoCurrentPreflightsEveryPathBeforePublishing(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "a.txt")
+	second := filepath.Join(dir, "b.txt")
+	write(t, first, "first before")
+	write(t, second, "second before")
+	r := NewRecorder()
+	identity := TurnIdentity{SessionID: "session", OpeningMessage: 0}
+	r.BeginTurn(identity.SessionID, identity.OpeningMessage, "edit both")
+	for _, path := range []string{first, second} {
+		r.Record(path)
+	}
+	write(t, first, "first after")
+	write(t, second, "second after")
+
+	prepared, err := r.PrepareUndoCurrent(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, second, "newer external edit")
+	if _, err := prepared.Apply(); !errors.Is(err, ErrStale) {
+		t.Fatalf("stale Apply error = %v, want ErrStale", err)
+	}
+	if got := readBack(t, first); got != "first after" {
+		t.Fatalf("Apply restored a prefix before finding staleness: %q", got)
+	}
+	if got := readBack(t, second); got != "newer external edit" {
+		t.Fatalf("Apply overwrote the newer edit: %q", got)
+	}
+	if current, ok := r.CurrentTurn(identity); !ok || current.Files != 2 {
+		t.Fatalf("stale Apply consumed evidence: current=%+v ok=%v", current, ok)
+	}
+}
+
+func TestPreparedUndoCurrentRollsPublishedPathsForwardOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "a.txt")
+	second := filepath.Join(dir, "b.txt")
+	write(t, first, "first before")
+	write(t, second, "second before")
+	r := NewRecorder()
+	identity := TurnIdentity{SessionID: "session", OpeningMessage: 0}
+	r.BeginTurn(identity.SessionID, identity.OpeningMessage, "edit both")
+	for _, path := range []string{first, second} {
+		r.Record(path)
+	}
+	write(t, first, "first after")
+	write(t, second, "second after")
+	prepared, err := r.PrepareUndoCurrent(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	injected := errors.New("injected post-publication failure")
+	publications := 0
+	r.afterReplaceHook = func() error {
+		publications++
+		if publications == 2 {
+			return injected
+		}
+		return nil
+	}
+	if _, err := prepared.Apply(); !errors.Is(err, injected) {
+		t.Fatalf("Apply error = %v, want injected failure", err)
+	}
+	if got := readBack(t, first); got != "first after" {
+		t.Fatalf("first published path was not rolled forward: %q", got)
+	}
+	if got := readBack(t, second); got != "second after" {
+		t.Fatalf("failing published path was not rolled forward: %q", got)
+	}
+	if current, ok := r.CurrentTurn(identity); !ok || current.Files != 2 {
+		t.Fatalf("rolled-back Apply consumed evidence: current=%+v ok=%v", current, ok)
+	}
+
+	r.afterReplaceHook = nil
+	prepared, err = r.PrepareUndoCurrent(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepared.Apply(); err != nil {
+		t.Fatalf("retained evidence could not be applied: %v", err)
+	}
+	if got := readBack(t, first); got != "first before" {
+		t.Fatalf("retry did not restore first pre-image: %q", got)
+	}
+	if got := readBack(t, second); got != "second before" {
+		t.Fatalf("retry did not restore second pre-image: %q", got)
+	}
+}
+
+func TestPreparedUndoCurrentCommitRunsOnPreImagesAndRollsBackOnFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "publish.txt")
+	write(t, path, "before")
+	r := NewRecorder()
+	identity := TurnIdentity{SessionID: "session", OpeningMessage: 0}
+	r.BeginTurn(identity.SessionID, identity.OpeningMessage, "edit")
+	r.Record(path)
+	write(t, path, "after")
+	prepared, err := r.PrepareUndoCurrent(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	injected := errors.New("injected adoption failure")
+	commits := 0
+	_, err = prepared.ApplyAndCommit(func() error {
+		commits++
+		if got := readBack(t, path); got != "before" {
+			t.Fatalf("commit observed %q, want installed pre-image", got)
+		}
+		return injected
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("ApplyAndCommit error = %v, want injected failure", err)
+	}
+	if commits != 1 {
+		t.Fatalf("commit ran %d times, want once", commits)
+	}
+	if got := readBack(t, path); got != "after" {
+		t.Fatalf("failed commit did not roll the post-image forward: %q", got)
+	}
+	if current, ok := r.CurrentTurn(identity); !ok || current.Files != 1 {
+		t.Fatalf("failed commit consumed evidence: current=%+v ok=%v", current, ok)
+	}
+
+	prepared, err = r.PrepareUndoCurrent(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepared.ApplyAndCommit(func() error {
+		commits++
+		if got := readBack(t, path); got != "before" {
+			t.Fatalf("successful commit observed %q, want installed pre-image", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if commits != 2 {
+		t.Fatalf("successful commit count = %d, want 2 total", commits)
+	}
+	if got := readBack(t, path); got != "before" {
+		t.Fatalf("successful commit did not retain pre-image: %q", got)
+	}
+	if current, ok := r.CurrentTurn(identity); !ok || current.Files != 0 {
+		t.Fatalf("successful commit did not consume evidence: current=%+v ok=%v", current, ok)
+	}
+}
+
+func TestPreparedUndoCurrentRestoresCreatedAndDeletedPaths(t *testing.T) {
+	dir := t.TempDir()
+	created := filepath.Join(dir, "created.txt")
+	deleted := filepath.Join(dir, "deleted.txt")
+	write(t, deleted, "deleted before")
+	r := NewRecorder()
+	identity := TurnIdentity{SessionID: "session", OpeningMessage: 0}
+	r.BeginTurn(identity.SessionID, identity.OpeningMessage, "create and delete")
+	r.Record(created)
+	write(t, created, "created after")
+	r.Record(deleted)
+	if err := os.Remove(deleted); err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, err := r.PrepareUndoCurrent(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := prepared.Apply()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Removed) != 1 || result.Removed[0] != created ||
+		len(result.Restored) != 1 || result.Restored[0] != deleted {
+		t.Fatalf("created/deleted result = %+v", result)
+	}
+	if _, err := os.Stat(created); !os.IsNotExist(err) {
+		t.Fatalf("created path survived Apply: %v", err)
+	}
+	if got := readBack(t, deleted); got != "deleted before" {
+		t.Fatalf("deleted path was not restored: %q", got)
+	}
+}
+
+func TestPreparedUndoCurrentRollsCreatedAndDeletedPathsForward(t *testing.T) {
+	injected := errors.New("injected post-publication failure")
+	t.Run("created", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "created.txt")
+		r := NewRecorder()
+		identity := TurnIdentity{SessionID: "session", OpeningMessage: 0}
+		r.BeginTurn(identity.SessionID, identity.OpeningMessage, "create")
+		r.Record(path)
+		write(t, path, "created after")
+		prepared, err := r.PrepareUndoCurrent(identity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.afterRemoveHook = func() error { return injected }
+		if _, err := prepared.Apply(); !errors.Is(err, injected) {
+			t.Fatalf("Apply error = %v, want injected failure", err)
+		}
+		if got := readBack(t, path); got != "created after" {
+			t.Fatalf("created post-image was not rolled forward: %q", got)
+		}
+		if current, ok := r.CurrentTurn(identity); !ok || current.Files != 1 {
+			t.Fatalf("created-path rollback consumed evidence: current=%+v ok=%v", current, ok)
+		}
+	})
+
+	t.Run("deleted", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "deleted.txt")
+		write(t, path, "deleted before")
+		r := NewRecorder()
+		identity := TurnIdentity{SessionID: "session", OpeningMessage: 0}
+		r.BeginTurn(identity.SessionID, identity.OpeningMessage, "delete")
+		r.Record(path)
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		prepared, err := r.PrepareUndoCurrent(identity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.afterReplaceHook = func() error { return injected }
+		if _, err := prepared.Apply(); !errors.Is(err, injected) {
+			t.Fatalf("Apply error = %v, want injected failure", err)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("deleted post-image was not rolled forward: %v", err)
+		}
+		if current, ok := r.CurrentTurn(identity); !ok || current.Files != 1 {
+			t.Fatalf("deleted-path rollback consumed evidence: current=%+v ok=%v", current, ok)
+		}
+	})
+}
+
+func TestPreparedUndoCurrentRejectsAnonymousIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "anonymous.txt")
+	write(t, path, "before")
+	r := NewRecorder()
+	r.Begin("anonymous")
+	r.Record(path)
+	write(t, path, "after")
+
+	if _, err := r.PrepareUndoCurrent(TurnIdentity{}); !errors.Is(err, ErrStale) {
+		t.Fatalf("anonymous scope was prepared as a durable retry: %v", err)
+	}
+	if got := readBack(t, path); got != "after" {
+		t.Fatalf("anonymous refusal changed the file: %q", got)
+	}
+}
+
+func TestPreparedUndoCurrentBoundsRetainedFileCount(t *testing.T) {
+	r := NewRecorder()
+	identity := TurnIdentity{SessionID: "session", OpeningMessage: 0}
+	r.BeginTurn(identity.SessionID, identity.OpeningMessage, "generated files")
+	r.mu.Lock()
+	for i := 0; i <= maxPreparedUndoFiles; i++ {
+		// Synthetic committed captures exercise the pre-I/O count gate without
+		// creating a thousand filesystem entries just to test arithmetic.
+		r.cur.files["/synthetic/generated-"+strconv.Itoa(i)] = &fileState{committed: true}
+	}
+	r.mu.Unlock()
+
+	if _, err := r.PrepareUndoCurrent(identity); !errors.Is(err, ErrPreparedUndoTooLarge) {
+		t.Fatalf("file-count bound error = %v", err)
+	}
+	if current, ok := r.CurrentTurn(identity); !ok || current.Files != maxPreparedUndoFiles+1 {
+		t.Fatalf("bounded preparation consumed evidence: current=%+v ok=%v", current, ok)
+	}
+}
+
+func TestPreparedUndoCurrentBoundsAggregatePostImages(t *testing.T) {
+	r := NewRecorder()
+	identity := TurnIdentity{SessionID: "session", OpeningMessage: 0}
+	r.BeginTurn(identity.SessionID, identity.OpeningMessage, "large generated output")
+
+	// Build committed fingerprints directly so the bound is tested without
+	// allocating its full 32 MiB threshold in the test process. Prepare checks
+	// these sizes before any post-image file I/O.
+	r.mu.Lock()
+	for i := 0; i <= maxPreparedUndoBytes/maxFileBytes; i++ {
+		path := "/synthetic/post-image-" + strconv.Itoa(i)
+		r.cur.files[path] = &fileState{
+			committed: true,
+			after: fingerprint{
+				existed: true,
+				mode:    0o644,
+				size:    maxFileBytes,
+			},
+		}
+	}
+	r.mu.Unlock()
+
+	if _, err := r.PrepareUndoCurrent(identity); !errors.Is(err, ErrPreparedUndoTooLarge) {
+		t.Fatalf("aggregate byte bound error = %v", err)
+	}
+	if current, ok := r.CurrentTurn(identity); !ok || current.Files != maxPreparedUndoBytes/maxFileBytes+1 {
+		t.Fatalf("bounded preparation consumed evidence: current=%+v ok=%v", current, ok)
+	}
+}
+
+func TestPreparedUndoCurrentInvalidatesCursorMintedDuringApply(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cursor.txt")
+	write(t, path, "before")
+	r := NewRecorder()
+	identity := TurnIdentity{SessionID: "session", OpeningMessage: 0}
+	r.BeginTurn(identity.SessionID, identity.OpeningMessage, "edit")
+	r.Record(path)
+	write(t, path, "after")
+	prepared, err := r.PrepareUndoCurrent(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	r.restoreHook = func() {
+		close(started)
+		<-release
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := prepared.Apply()
+		done <- err
+	}()
+	<-started
+	cursor, _, _, ok := r.CurrentReviewCursor()
+	if !ok {
+		t.Fatal("open turn disappeared while Apply was paused")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if r.ReviewCursorValid(cursor) {
+		t.Fatal("cursor minted during Apply became valid after its evidence was consumed")
+	}
+}
+
+func TestPreparedUndoCurrentRefusesConcurrentPostImageAdvance(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "concurrent.txt")
+	write(t, path, "before")
+	r := NewRecorder()
+	identity := TurnIdentity{SessionID: "session", OpeningMessage: 0}
+	r.BeginTurn(identity.SessionID, identity.OpeningMessage, "edit")
+	r.RecordState(path, true, 0o644, []byte("before"))
+	write(t, path, "after one")
+	r.Commit(path, true, 0o644, sha256.Sum256([]byte("after one")))
+
+	opened := make(chan struct{})
+	release := make(chan struct{})
+	r.snapshotAfterOpenHook = func() {
+		close(opened)
+		<-release
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.PrepareUndoCurrent(identity)
+		done <- err
+	}()
+	<-opened
+	r.RecordState(path, true, 0o644, []byte("after one"))
+	write(t, path, "after two")
+	r.Commit(path, true, 0o644, sha256.Sum256([]byte("after two")))
+	close(release)
+	if err := <-done; !errors.Is(err, ErrStale) {
+		t.Fatalf("concurrent post-image advance error = %v, want ErrStale", err)
+	}
+	r.snapshotAfterOpenHook = nil
+	if current, ok := r.CurrentTurn(identity); !ok || current.Files != 1 {
+		t.Fatalf("concurrent preparation consumed evidence: current=%+v ok=%v", current, ok)
 	}
 }
 
@@ -628,8 +1119,8 @@ func TestUndoRestoresExactModeAndBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o755 {
-		t.Fatalf("mode=%o, want 755", info.Mode().Perm())
+	if want := restorableMode(0o755); info.Mode().Perm() != want.Perm() {
+		t.Fatalf("mode=%o, want %o", info.Mode().Perm(), want.Perm())
 	}
 }
 
@@ -803,7 +1294,7 @@ func TestReadSnapshotCurrentRequiresExactCommittedPostimage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !current.Existed || current.Mode.Perm() != 0o640 || string(current.Content) != "after" {
+	if !current.Existed || current.Mode.Perm() != restorableMode(0o640).Perm() || string(current.Content) != "after" {
 		t.Fatalf("current=%+v content=%q", current, current.Content)
 	}
 
@@ -857,7 +1348,7 @@ func TestReadSnapshotCurrentBoundsVerifiedPostimage(t *testing.T) {
 	if !errors.Is(err, ErrSnapshotTooLarge) {
 		t.Fatalf("error=%v, want ErrSnapshotTooLarge", err)
 	}
-	if !current.Existed || current.Mode.Perm() != 0o644 || current.Content != nil {
+	if !current.Existed || current.Mode.Perm() != restorableMode(0o644).Perm() || current.Content != nil {
 		t.Fatalf("bounded state=%+v", current)
 	}
 }

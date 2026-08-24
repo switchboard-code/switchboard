@@ -3,6 +3,8 @@ package tools
 import (
 	"strings"
 	"testing"
+
+	"github.com/switchboard-code/switchboard/internal/continuity"
 )
 
 func TestTodoReplacesListAndSnapshots(t *testing.T) {
@@ -109,13 +111,18 @@ func TestTodoCanonicalizesExactlyWhatContinuityCanStore(t *testing.T) {
 	}
 }
 
-func TestRestoreTodosReplacesClonesAndClears(t *testing.T) {
+func TestRestoreContinuityReplacesClonesAndClears(t *testing.T) {
 	r, _ := newRegistry(t)
 	input := []TodoItem{
 		{Text: "restored active", Status: TodoActive},
 		{Text: "restored pending", Status: TodoPending},
 	}
-	if err := r.RestoreTodos(input); err != nil {
+	working := continuity.Working{
+		Objective:     "finish session B",
+		NextAction:    "continue session B",
+		StopCondition: "session B tests pass",
+	}
+	if err := r.RestoreContinuity(input, working); err != nil {
 		t.Fatal(err)
 	}
 	input[0].Text = "mutated input"
@@ -124,18 +131,46 @@ func TestRestoreTodosReplacesClonesAndClears(t *testing.T) {
 	if got := r.Todos()[0].Text; got != "restored active" {
 		t.Fatalf("restore retained caller-owned storage: %q", got)
 	}
-	if err := r.RestoreTodos(nil); err != nil {
+	if got := r.Working(); got != working {
+		t.Fatalf("restored working context = %+v, want %+v", got, working)
+	}
+
+	// A normal todo update intentionally keeps an omitted objective and stop
+	// condition within one session. They must come from the restored session,
+	// never from whichever session happened to be bound before it.
+	run(t, r, "todo", map[string]any{"items": []map[string]any{{
+		"text": "updated session B task", "status": "active",
+	}}})
+	if got := r.Working(); got != (continuity.Working{
+		Objective:     working.Objective,
+		StopCondition: working.StopCondition,
+	}) {
+		t.Fatalf("todo omission did not retain only restored context: %+v", got)
+	}
+
+	if err := r.RestoreContinuity(nil, continuity.Working{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := r.Todos(); len(got) != 0 {
 		t.Fatalf("nil restore did not clear old-session todos: %+v", got)
 	}
+	if got := r.Working(); got != (continuity.Working{}) {
+		t.Fatalf("nil restore did not clear old-session working context: %+v", got)
+	}
+
+	run(t, r, "todo", map[string]any{"items": []map[string]any{{
+		"text": "fresh-session task", "status": "active",
+	}}})
+	if got := r.Working(); got != (continuity.Working{}) {
+		t.Fatalf("todo omission resurrected cleared working context: %+v", got)
+	}
 }
 
-func TestRestoreTodosRejectsMalformedStateWithoutMutation(t *testing.T) {
+func TestRestoreContinuityRejectsMalformedStateWithoutMutation(t *testing.T) {
 	r, _ := newRegistry(t)
 	want := []TodoItem{{Text: "keep", Status: TodoPending}}
-	if err := r.RestoreTodos(want); err != nil {
+	wantWorking := continuity.Working{Objective: "keep objective", StopCondition: "keep stop"}
+	if err := r.RestoreContinuity(want, wantWorking); err != nil {
 		t.Fatal(err)
 	}
 	for name, items := range map[string][]TodoItem{
@@ -144,12 +179,15 @@ func TestRestoreTodosRejectsMalformedStateWithoutMutation(t *testing.T) {
 		"two active": {{Text: "one", Status: TodoActive}, {Text: "two", Status: TodoActive}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := r.RestoreTodos(items); err == nil {
+			if err := r.RestoreContinuity(items, continuity.Working{Objective: "must not publish"}); err == nil {
 				t.Fatal("invalid restored list was accepted")
 			}
 			got := r.Todos()
 			if len(got) != 1 || got[0] != want[0] {
 				t.Fatalf("failed restore changed state: %+v", got)
+			}
+			if got := r.Working(); got != wantWorking {
+				t.Fatalf("failed restore changed working context: %+v", got)
 			}
 		})
 	}

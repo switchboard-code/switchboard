@@ -6,11 +6,27 @@ package main
 
 import (
 	"context"
-	"os/exec"
+	"os"
 	"runtime"
 
 	"github.com/switchboard-code/switchboard/internal/tools"
 )
+
+const osascriptExecutable = "/usr/bin/osascript"
+
+// computerExecutable is a fixed system capability, not a PATH-resolved
+// extension. A checkout may influence PATH before sb starts; that must not let
+// a repository-provided osascript impersonate a macOS system binary.
+func computerExecutable() (string, bool) {
+	if runtime.GOOS != "darwin" {
+		return "", false
+	}
+	info, err := os.Stat(osascriptExecutable)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return "", false
+	}
+	return osascriptExecutable, true
+}
 
 // addComputerUse registers the computer tool where the machine can serve
 // it: macOS, with osascript present, which every macOS ships. Absent is
@@ -21,11 +37,8 @@ import (
 // call surfaces the grant state with its remedy, and `sb doctor` probes it
 // on request, where a dialog is the point.
 func addComputerUse(registry *tools.Registry) {
-	if runtime.GOOS != "darwin" {
-		return
-	}
-	binary, err := exec.LookPath("osascript")
-	if err != nil {
+	binary, ok := computerExecutable()
+	if !ok {
 		return
 	}
 	_ = registry.AddExternal(tools.NewComputer(binary))
@@ -41,15 +54,15 @@ func doctorComputerRow(ctx context.Context) (doctorRow, bool) {
 	if runtime.GOOS != "darwin" {
 		return doctorRow{}, false
 	}
-	binary, err := exec.LookPath("osascript")
-	if err != nil {
+	binary, ok := computerExecutable()
+	if !ok {
 		return doctorRow{label: "computer", detail: "osascript not found; computer use is absent"}, true
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, doctorProbeTimeout)
 	defer cancel()
 	if err := tools.ProbeComputer(probeCtx, binary); err != nil {
 		return doctorRow{label: "computer",
-			detail: truncate(err.Error(), 90) + "; grant it under System Settings > Privacy & Security > Accessibility"}, true
+			detail: redactCredentialTextBeforeTruncate(err.Error(), 90) + "; grant it under System Settings > Privacy & Security > Accessibility"}, true
 	}
 	return doctorRow{label: "computer", detail: "accessibility granted; the computer tool is in the suite"}, true
 }

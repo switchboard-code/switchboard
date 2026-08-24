@@ -46,14 +46,14 @@ func renderPermissionRules(cfg *config.Config, mode permission.Mode) string {
 
 	if len(cfg.Permissions) == 0 {
 		b.WriteString("\nNo rules are written down, so every answer this session gives it forgets at exit.\n")
-		b.WriteString("Write them under [[permissions]] in " + cfg.Path + ":\n\n")
+		b.WriteString("Write them under [[permissions]] in " + cliText(cfg.Path) + ":\n\n")
 		b.WriteString("  [[permissions]]\n  decision = \"allow\"\n  tool = \"exec\"\n  argv_prefix = [\"go\", \"test\"]\n")
 		return strings.TrimRight(b.String(), "\n")
 	}
 
-	fmt.Fprintf(&b, "\nfrom %s, in the order they answer:\n", cfg.Path)
+	fmt.Fprintf(&b, "\nfrom %s, in the order they answer:\n", cliText(cfg.Path))
 	for i, rule := range cfg.Permissions {
-		fmt.Fprintf(&b, "  %2d  %s\n", i+1, config.RenderPermissionRule(rule))
+		fmt.Fprintf(&b, "  %2d  %s\n", i+1, cliText(config.RenderPermissionRule(rule)))
 	}
 	b.WriteString("\nA deny answers wherever it sits; among the rest the first match wins, and\n")
 	b.WriteString("these are consulted before any allow list an MCP server declared for itself.\n")
@@ -102,11 +102,11 @@ func runPermissionsCLI(w io.Writer, cfg *config.Config, args []string) error {
 	req := permission.Request{Tool: "exec", Effect: permission.EffectExecute, Argv: rest}
 	out := engine.Check(req)
 
-	fmt.Fprintf(w, "command   %s\n", strings.Join(rest, " "))
+	fmt.Fprintf(w, "command   %s\n", cliText(strings.Join(rest, " ")))
 	fmt.Fprintf(w, "mode      %s\n", mode)
-	fmt.Fprintf(w, "decision  %s (%s)\n", out.Decision, out.Reason)
+	fmt.Fprintf(w, "decision  %s (%s)\n", out.Decision, cliText(out.Reason))
 	if rule, ok := matchingRule(cfg.Permissions, req); ok {
-		fmt.Fprintf(w, "rule      %s, from %s\n", config.RenderPermissionRule(rule), cfg.Path)
+		fmt.Fprintf(w, "rule      %s, from %s\n", cliText(config.RenderPermissionRule(rule)), cliText(cfg.Path))
 	} else {
 		fmt.Fprintf(w, "rule      none matched; the answer is mode %s's own\n", mode)
 	}

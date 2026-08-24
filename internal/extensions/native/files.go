@@ -10,6 +10,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 )
 
 const (
@@ -19,6 +21,10 @@ const (
 )
 
 func readBoundedFile(filePath string, limit int64) ([]byte, error) {
+	return readBoundedFileWithHook(filePath, limit, nil)
+}
+
+func readBoundedFileWithHook(filePath string, limit int64, beforeOpen func()) ([]byte, error) {
 	info, err := os.Lstat(filePath)
 	if err != nil {
 		return nil, err
@@ -32,20 +38,38 @@ func readBoundedFile(filePath string, limit int64) ([]byte, error) {
 	if info.Size() > limit {
 		return nil, fmt.Errorf("configuration is %d bytes; limit is %d", info.Size(), limit)
 	}
-	file, err := os.Open(filePath)
+	if beforeOpen != nil {
+		beforeOpen()
+	}
+	file, err := openNativePathRead(filePath)
 	if err != nil {
 		return nil, err
 	}
-	raw, readErr := io.ReadAll(io.LimitReader(file, limit+1))
-	closeErr := file.Close()
-	if readErr != nil {
-		return nil, readErr
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil {
+		return nil, err
 	}
-	if closeErr != nil {
-		return nil, closeErr
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, errors.New("configuration changed while it was opened")
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
 	}
 	if int64(len(raw)) > limit {
 		return nil, fmt.Errorf("configuration grew beyond %d-byte limit while reading", limit)
+	}
+	finished, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	linked, linkErr := os.Lstat(filePath)
+	if linkErr != nil || linked.Mode()&os.ModeSymlink != 0 || !linked.Mode().IsRegular() ||
+		!os.SameFile(opened, finished) || !os.SameFile(finished, linked) ||
+		opened.Size() != finished.Size() || finished.Size() != int64(len(raw)) ||
+		!opened.ModTime().Equal(finished.ModTime()) {
+		return nil, errors.Join(linkErr, errors.New("configuration changed while it was read"))
 	}
 	return raw, nil
 }
@@ -148,6 +172,10 @@ func readJSONWithin(rootPath, relative string, target any) error {
 }
 
 func readWithin(rootPath, relative string, limit int64) ([]byte, error) {
+	return readWithinWithHook(rootPath, relative, limit, nil)
+}
+
+func readWithinWithHook(rootPath, relative string, limit int64, beforeOpen func()) ([]byte, error) {
 	relative, err := safeRelative(relative, false)
 	if err != nil {
 		return nil, err
@@ -156,7 +184,7 @@ func readWithin(rootPath, relative string, limit int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	root, err := os.OpenRoot(realRoot)
+	root, err := rootedfs.OpenRoot(realRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -174,20 +202,38 @@ func readWithin(rootPath, relative string, limit int64) ([]byte, error) {
 	if info.Size() > limit {
 		return nil, fmt.Errorf("file is %d bytes; limit is %d", info.Size(), limit)
 	}
-	file, err := root.Open(filepath.FromSlash(relative))
+	if beforeOpen != nil {
+		beforeOpen()
+	}
+	file, err := openNativeRootRead(root, filepath.FromSlash(relative))
 	if err != nil {
 		return nil, err
 	}
-	raw, readErr := io.ReadAll(io.LimitReader(file, limit+1))
-	closeErr := file.Close()
-	if readErr != nil {
-		return nil, readErr
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil {
+		return nil, err
 	}
-	if closeErr != nil {
-		return nil, closeErr
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, errors.New("path changed while it was opened")
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
 	}
 	if int64(len(raw)) > limit {
 		return nil, fmt.Errorf("file grew beyond %d-byte limit while reading", limit)
+	}
+	finished, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	linked, linkErr := root.Lstat(filepath.FromSlash(relative))
+	if linkErr != nil || linked.Mode()&os.ModeSymlink != 0 || !linked.Mode().IsRegular() ||
+		!os.SameFile(opened, finished) || !os.SameFile(finished, linked) ||
+		opened.Size() != finished.Size() || finished.Size() != int64(len(raw)) ||
+		!opened.ModTime().Equal(finished.ModTime()) {
+		return nil, errors.Join(linkErr, errors.New("path changed while it was read"))
 	}
 	return raw, nil
 }
@@ -205,7 +251,7 @@ func resolveLocalDirectory(rootPath, declared string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	root, err := os.OpenRoot(realRoot)
+	root, err := rootedfs.OpenRoot(realRoot)
 	if err != nil {
 		return "", err
 	}

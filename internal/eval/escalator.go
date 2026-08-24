@@ -35,6 +35,9 @@ type escalator struct {
 	inner  agent.Observer
 	caches map[provider.RouteTargetID]*agent.Cache
 
+	contextMu      sync.RWMutex
+	contextWindows map[provider.RouteTargetID]int
+
 	moves   int
 	visited []provider.RouteTargetID
 
@@ -47,6 +50,25 @@ func (e *escalator) attach(loop *agent.Loop) {
 	e.inner = loop.Observer
 	e.visited = []provider.RouteTargetID{loop.Target.ID()}
 	e.caches = map[provider.RouteTargetID]*agent.Cache{loop.Target.ID(): loop.Cache}
+	e.contextWindows = map[provider.RouteTargetID]int{}
+	priorContextWindow := loop.ContextWindow
+	loop.ContextWindow = func(target provider.RouteTarget) int {
+		e.contextMu.RLock()
+		window, ok := e.contextWindows[target.ID()]
+		e.contextMu.RUnlock()
+		if ok {
+			return window
+		}
+		if priorContextWindow != nil {
+			return priorContextWindow(target)
+		}
+		if e.catalog != nil {
+			if info, _, found := e.catalog.Lookup(target); found {
+				return info.ContextWindow
+			}
+		}
+		return 0
+	}
 	e.budget = newEvalBudget(e.routed.Budgets, e.catalog, loop)
 	e.budget.attach(loop, e.fidelityError)
 	loop.SetObserver(e)
@@ -108,9 +130,7 @@ func (e *escalator) assess(ctx context.Context) {
 		return
 	}
 
-	request := provider.Request{
-		System: e.loop.System, Tools: e.loop.Tools.Definitions(), Messages: e.loop.Session.State().Messages,
-	}
+	request := e.loop.Request(e.loop.Session.State().Messages)
 	requirements := e.routed.Requirements
 	requirements.NeedsTools = true
 	requirements.NeedsVision = requirements.NeedsVision || requestNeedsVision(request)
@@ -134,6 +154,9 @@ func (e *escalator) assess(ctx context.Context) {
 	}
 	cache := e.cacheFor(arm)
 	if !e.sticky.Apply(move, func() {
+		e.contextMu.Lock()
+		e.contextWindows[arm.Target.ID()] = arm.resolvedContextWindow
+		e.contextMu.Unlock()
 		e.loop.Bind(agent.Binding{Provider: arm.Provider, Target: arm.Target, Cache: cache})
 	}) {
 		return
@@ -232,7 +255,8 @@ func (b *evalBudget) before(contextTokens, attempt int) error {
 		return fidelityErrorf("budget preflight cannot price target %s", binding.Target.Display())
 	}
 	bound := candidateForRequest(
-		Arm{Name: "budget", Target: binding.Target}, 0, info, contextTokens, contextTokens).CeilingCost
+		Arm{Name: "budget", Target: binding.Target, Provider: binding.Provider},
+		0, info, contextTokens, contextTokens).CeilingCost
 	if bound == 0 && info.Metering == catalog.PerToken && !info.Free() {
 		return fidelityErrorf("budget preflight has no conservative price for target %s", binding.Target.Display())
 	}

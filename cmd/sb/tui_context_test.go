@@ -1,17 +1,65 @@
 package main
 
 import (
+	"errors"
+	"math"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/switchboard-code/switchboard/internal/agent"
 	"github.com/switchboard-code/switchboard/internal/config"
 	"github.com/switchboard-code/switchboard/internal/provider"
+	"github.com/switchboard-code/switchboard/internal/provider/anthropic"
 	"github.com/switchboard-code/switchboard/internal/session"
 )
 
 func sessionUsageFor(in, out int) session.Usage {
 	return session.Usage{Usage: provider.Usage{InputTokens: in, OutputTokens: out}}
+}
+
+func TestOneShotContextGateExplainsUnknownOutputWithoutSentinel(t *testing.T) {
+	target := provider.RouteTarget{Provider: "openaicompat", Surface: "generic", ModelID: "custom"}
+	err := checkRequestContext(nil, target, provider.Request{
+		Messages: []provider.Message{provider.UserText("summarize")},
+	}, nil, 32_768)
+	if err == nil {
+		t.Fatal("one-shot request with unknown output bound passed a finite window")
+	}
+	text := err.Error()
+	for _, want := range []string{"no finite output bound", "positive tier max_output", "/models", "config"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("one-shot refusal omitted %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, strconv.Itoa(math.MaxInt)) {
+		t.Fatalf("one-shot refusal printed its implementation sentinel: %s", text)
+	}
+}
+
+func TestOneShotContextGateExplainsExplicitCapReasoningConflict(t *testing.T) {
+	target := anthropic.Target("claude-haiku-4-5")
+	target.Params.MaxOutputTokens = 4096
+	target.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "high"}
+	err := checkRequestContext(anthropic.New(), target, provider.Request{
+		Messages: []provider.Message{provider.UserText("summarize")},
+	}, nil, 200_000)
+	if err == nil {
+		t.Fatal("one-shot request with conflicting explicit cap passed")
+	}
+	var capErr *provider.CapabilityError
+	if !errors.As(err, &capErr) || capErr.Target != target.ID() || capErr.Capability != "max_output with token-budget reasoning" {
+		t.Fatalf("one-shot conflict = %v, want typed CapabilityError for the exact target", err)
+	}
+	text := err.Error()
+	for _, want := range []string{"does not support max_output with token-budget reasoning", "explicit max_output 4096", "16384-token reasoning budget", "raise max_output", "lower or disable reasoning"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("one-shot explicit-cap refusal omitted %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "set a positive tier max_output") || strings.Contains(text, strconv.Itoa(math.MaxInt)) {
+		t.Fatalf("one-shot explicit-cap refusal gave omitted-cap/sentinel advice: %s", text)
+	}
 }
 
 // A compatible endpoint has no catalog entry and the format has no field for
@@ -66,6 +114,31 @@ func TestAnUnknownWindowIsSaidRatherThanShownAsEmpty(t *testing.T) {
 	}
 	if got := saved.ProviderForTarget("openaicompat", "generic").ContextWindow; got != 32768 {
 		t.Fatalf("the window saved as %d", got)
+	}
+}
+
+func TestContextWindowSaveFailureLeavesLiveAndRuntimeAllowanceUnchanged(t *testing.T) {
+	m := testModel(t)
+	m.app.config.Path = t.TempDir() // a directory cannot be replaced by the config file
+	m.app.loop.Target = provider.RouteTarget{Provider: "openaicompat", Surface: "generic", ModelID: "local"}
+	m.app.loop.Bind(m.app.loop.Binding())
+	key := config.ProviderSurfaceKey("openaicompat", "generic")
+	m.app.config.SetProviderContextWindow(key, 16_384)
+	m.refreshCtxWindow()
+	if m.ctxWindow != 16_384 {
+		t.Fatalf("fixture runtime window = %d", m.ctxWindow)
+	}
+
+	cmd := setContextWindowCmd(m, "32768")
+	msg, ok := cmd().(noticeMsg)
+	if !ok || msg.level != "error" || !strings.Contains(msg.text, "nothing changed") {
+		t.Fatalf("failed /context notice = %#v", msg)
+	}
+	if got := m.app.config.ProviderForTarget("openaicompat", "generic").ContextWindow; got != 16_384 {
+		t.Fatalf("failed save changed live config window to %d", got)
+	}
+	if m.ctxWindow != 16_384 {
+		t.Fatalf("failed save changed runtime window to %d", m.ctxWindow)
 	}
 }
 

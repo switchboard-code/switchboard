@@ -9,9 +9,12 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/x/ansi"
+
 	"github.com/switchboard-code/switchboard/internal/catalog"
 	"github.com/switchboard-code/switchboard/internal/config"
 	"github.com/switchboard-code/switchboard/internal/session"
+	"github.com/switchboard-code/switchboard/internal/terminaltext"
 )
 
 func (m *tuiModel) addBanner(sess *session.Session, resumed bool) {
@@ -21,7 +24,7 @@ func (m *tuiModel) addBanner(sess *session.Session, resumed bool) {
 
 	brand := th.bold.Render("switchboard")
 	if v := currentVersion(); v != "" {
-		brand += " " + th.dim.Render(v)
+		brand += " " + th.dim.Render(terminaltext.Escape(v))
 	}
 	// The mark is the ladder itself: four ascending bars in the heat ramp,
 	// cool to warm. The product's thesis as its wordmark, and a mark no
@@ -36,31 +39,35 @@ func (m *tuiModel) addBanner(sess *session.Session, resumed bool) {
 		widest := 0
 		idWidest := 0
 		for _, t := range app.config.Tiers {
-			if n := len(t.Target.Display()); n > widest {
+			if n := ansi.StringWidth(terminaltext.Escape(t.Target.Display())); n > widest {
 				widest = n
 			}
-			if n := len(t.ID); n > idWidest {
+			if n := ansi.StringWidth(terminaltext.Escape(t.ID)); n > idWidest {
 				idWidest = n
 			}
 		}
+		idWidth := min(idWidest, 16)
+		targetWidth := min(widest, 40)
 		for rank, t := range app.config.Tiers {
+			id := padRight(fitCells(terminaltext.Escape(t.ID), idWidth), idWidth)
+			target := padRight(fitCells(terminaltext.Escape(t.Target.Display()), targetWidth), targetWidth)
 			bar := "  "
 			if rank == activeRank {
 				bar = th.rung(rank).Render("▌ ")
 			}
-			row := bar + th.rung(rank).Render(padRight(t.ID, idWidest)) + "  " +
-				th.text.Render(padRight(t.Target.Display(), min(widest, 40))) +
-				"  " + th.faint.Render(meteringWord(app.catalog, t))
+			row := bar + th.rung(rank).Render(id) + "  " +
+				th.text.Render(target) +
+				"  " + th.faint.Render(terminaltext.Escape(meteringWord(app.catalog, t)))
 			lines = append(lines, row)
 		}
 	} else {
 		lines = append(lines, th.dim.Render("  no ladder configured; /models binds one"))
 	}
 
-	facts := []string{app.workspace, string(app.loop.Perms.Mode()), app.loop.Perms.Execution().Summary()}
+	facts := []string{terminaltext.Escape(app.workspace), terminaltext.Escape(string(app.loop.Perms.Mode())), terminaltext.Escape(app.loop.Perms.Execution().Summary())}
 	lines = append(lines,
 		th.faint.Render("  "+strings.Join(facts, " · ")),
-		th.faint.Render("  session "+state.ID+sessionNote(state, resumed)+" · /help for commands"),
+		th.faint.Render("  session "+terminaltext.Escape(state.ID)+terminaltext.Escape(sessionNote(state, resumed))+" · /help for commands"),
 	)
 	if app.onboarded {
 		lines = append(lines, th.dim.Render(

@@ -7,8 +7,13 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/switchboard-code/switchboard/internal/catalog"
+	"github.com/switchboard-code/switchboard/internal/credential"
 	"github.com/switchboard-code/switchboard/internal/delegate"
 )
+
+type taskSteerer interface {
+	Steer(id, message string) error
+}
 
 func cmdTasks(m *tuiModel, args string) tea.Cmd {
 	parentID := m.app.loop.Session.ID()
@@ -73,10 +78,25 @@ func steerTask(m *tuiModel, parentID, id, message string) tea.Cmd {
 	if found == nil {
 		return noticeCmd("warn", "no delegate task "+workspaceSanitize(id)+" belongs to this session")
 	}
-	if err := subagentTasks.Steer(found.ID, message); err != nil {
-		return noticeCmd("warn", err.Error())
+	return guardedTaskSteer(m, subagentTasks, found.ID, message)
+}
+
+// guardedTaskSteer is the only UI seam that hands new text to a running
+// delegate. It uses the same outbound credential gate as a primary steer:
+// child sessions and child providers are no less external merely because the
+// task was launched by this process.
+func guardedTaskSteer(m *tuiModel, target taskSteerer, id, message string) tea.Cmd {
+	leaks := credential.ScanPrompt(message)
+	send := func(safe string) tea.Cmd {
+		if err := target.Steer(id, safe); err != nil {
+			return noticeCmd("warn", err.Error())
+		}
+		return noticeCmd("", "told "+id+"; it reads this when its current round finishes")
 	}
-	return noticeCmd("", "told "+found.ID+"; it reads this when its current round finishes")
+	if len(leaks) > 0 {
+		return m.openSecretGate(leaks, message, send)
+	}
+	return send(message)
 }
 
 func tasksForSession(manager *delegate.TaskManager, parentID string) []delegate.TaskSnapshot {

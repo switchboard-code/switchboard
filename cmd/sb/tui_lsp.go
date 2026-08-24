@@ -707,10 +707,10 @@ func (m *tuiModel) onLSPEditorDone(msg lspEditorDoneMsg) tea.Cmd {
 	// Returning from an external editor is an invalidation boundary even when
 	// the process reports an error: it may have saved before failing. The file
 	// index and every location in this semantic result must be treated as old.
-	if m.workspaceRuntime != nil {
-		m.workspaceRuntime.invalidate()
-	}
-	msg.view.stale = true
+	invalidateRestoredWorkspace(m)
+	m.lspGeneration++
+	msg.view.generation = m.lspGeneration
+	msg.view.request++ // reject a semantic result launched before the editor
 	if msg.err != nil {
 		return noticeCmd("error", "editor: "+msg.err.Error())
 	}

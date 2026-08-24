@@ -12,9 +12,6 @@ package session
 import (
 	"bufio"
 	"encoding/json"
-	"errors"
-	"io"
-	"os"
 	"strings"
 	"time"
 
@@ -28,7 +25,12 @@ type FileEdit struct {
 	Workspace string
 	At        time.Time // when the tool result was recorded
 	Turn      int       // 1-based user-turn ordinal within the session
-	Prompt    string    // the turn's opening words, untruncated
+	// Prompt is populated only from an exact durable authored projection.
+	// PromptAuthoredKnown distinguishes an intentionally empty authored prompt
+	// from legacy Content that may contain @file, shell, or harness expansion.
+	Prompt              string
+	PromptAuthoredKnown bool
+	PromptSynthetic     bool
 
 	// CallID is the tool-use id the provider stamped on the call. A fork
 	// copies its source's records byte for byte, timestamps included, so
@@ -77,22 +79,25 @@ type editInput struct {
 // one; a call whose turn ended before a usage record — an interrupted
 // message — never gets a result either, so it is dropped with the rest.
 type pendingCall struct {
-	id        string
-	name      string
-	input     json.RawMessage
-	turn      int
-	turnDepth int
-	prompt    string
-	target    string
+	id                  string
+	name                string
+	input               json.RawMessage
+	turn                int
+	turnDepth           int
+	prompt              string
+	promptAuthoredKnown bool
+	promptSynthetic     bool
+	target              string
 }
 
 // ReadFileEdits replays a log and returns its successful file mutations in
-// record order. A failed or denied call is dropped — the file never
-// changed — and a corrupt tail ends the read where every other reader
-// stops. Mutations a shell command made are not here and cannot be: only
-// write and edit put their bytes in the record.
+// record order. A failed or denied call is dropped — the file never changed —
+// and an incomplete final frame ends the read where every other reader stops.
+// A complete corrupt frame is an error rather than a silently shortened
+// provenance history. Mutations a shell command made are not here and cannot
+// be: only write and edit put their bytes in the record.
 func ReadFileEdits(path string) ([]FileEdit, error) {
-	f, err := os.Open(path)
+	f, err := openPublishedLog(path)
 	if err != nil {
 		return nil, err
 	}
@@ -110,21 +115,25 @@ func ReadFileEdits(path string) ([]FileEdit, error) {
 // a panic — the same bar the record decoder holds.
 func readFileEditRecords(r *bufio.Reader) ([]FileEdit, error) {
 	var (
-		out       []FileEdit
-		sessionID string
-		workspace string
-		messages  int
-		turn      int
-		turnDepth int
-		prompt    string
-		routes    = map[int]Route{} // keyed by TurnDepth, the one exact key a route record carries
-		pending   = map[string]*pendingCall{}
-		awaiting  []*pendingCall // calls whose usage record has not arrived
+		out                 []FileEdit
+		sessionID           string
+		workspace           string
+		messages            int
+		turn                int
+		turnDepth           int
+		prompt              string
+		promptAuthoredKnown bool
+		promptSynthetic     bool
+		routes              = map[int]Route{} // keyed by TurnDepth, the one exact key a route record carries
+		pending             = map[string]*pendingCall{}
+		awaiting            []*pendingCall // calls whose usage record has not arrived
 	)
 
+	lastSeq := 0
+	budget := newReplayBudget(defaultReplayLimits, 0)
 	for {
-		rec, _, err := decodeRecord(r)
-		if errors.Is(err, io.EOF) || errors.Is(err, ErrCorruptRecord) {
+		rec, _, err := budget.decode(r, &lastSeq)
+		if isRecoverableRecordEnd(err) {
 			break
 		}
 		if err != nil {
@@ -138,7 +147,7 @@ func readFileEditRecords(r *bufio.Reader) ([]FileEdit, error) {
 			if OpensTurn(m) {
 				turn++
 				turnDepth = messages
-				prompt = strings.TrimSpace(m.AuthoredText())
+				prompt, promptAuthoredKnown, promptSynthetic = authoredTurnPrompt(m)
 			}
 			messages++
 			if m.Role == provider.RoleAssistant {
@@ -151,12 +160,14 @@ func readFileEditRecords(r *bufio.Reader) ([]FileEdit, error) {
 						continue
 					}
 					call := &pendingCall{
-						id:        use.ID,
-						name:      use.Name,
-						input:     use.Input,
-						turn:      turn,
-						turnDepth: turnDepth,
-						prompt:    prompt,
+						id:                  use.ID,
+						name:                use.Name,
+						input:               use.Input,
+						turn:                turn,
+						turnDepth:           turnDepth,
+						prompt:              prompt,
+						promptAuthoredKnown: promptAuthoredKnown,
+						promptSynthetic:     promptSynthetic,
 					}
 					pending[use.ID] = call
 					awaiting = append(awaiting, call)
@@ -221,14 +232,16 @@ func readFileEditRecords(r *bufio.Reader) ([]FileEdit, error) {
 // is not something replay can honestly use.
 func (c *pendingCall) fileEdit(at time.Time, sessionID, workspace string) (FileEdit, bool) {
 	edit := FileEdit{
-		SessionID: sessionID,
-		Workspace: workspace,
-		At:        at,
-		Turn:      c.turn,
-		Prompt:    c.prompt,
-		CallID:    c.id,
-		Target:    c.target,
-		turnDepth: c.turnDepth,
+		SessionID:           sessionID,
+		Workspace:           workspace,
+		At:                  at,
+		Turn:                c.turn,
+		Prompt:              c.prompt,
+		PromptAuthoredKnown: c.promptAuthoredKnown,
+		PromptSynthetic:     c.promptSynthetic,
+		CallID:              c.id,
+		Target:              c.target,
+		turnDepth:           c.turnDepth,
 	}
 	switch c.name {
 	case "write":
@@ -249,6 +262,20 @@ func (c *pendingCall) fileEdit(at time.Time, sessionID, workspace string) (FileE
 	return edit, true
 }
 
+// authoredTurnPrompt extracts only the durable user-visible projection. The
+// legacy AuthoredText fallback is intentionally forbidden here: Content may
+// include file bytes, shell output, continuity context, or injected evidence.
+func authoredTurnPrompt(message provider.Message) (text string, known, synthetic bool) {
+	if message.Synthetic {
+		return "", false, true
+	}
+	text, known = message.AuthoredProjection()
+	if !known {
+		return "", false, false
+	}
+	return strings.TrimSpace(text), true, false
+}
+
 // OpensTurn reports whether a message is a user turn's opening: user-role,
 // not injected mid-turn, and not a tool-result carrier. An image-only
 // opening still opens a turn; its prompt is just empty.
@@ -263,4 +290,12 @@ func OpensTurn(m provider.Message) bool {
 		}
 	}
 	return true
+}
+
+// OpensUserTurn is the authored/user-facing subset of OpensTurn. Synthetic
+// openings still delimit a real model turn for replay, continuity delivery,
+// cost attribution, and edit provenance, but they must not be presented or
+// counted as words the user supplied.
+func OpensUserTurn(m provider.Message) bool {
+	return OpensTurn(m) && !m.Synthetic
 }

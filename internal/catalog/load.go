@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 )
 
 //go:embed bundled.toml
@@ -18,6 +20,8 @@ var bundledTOML string
 // UserOverrideFile is where a user corrects an entry or describes a local
 // endpoint the bundled catalog cannot know about.
 const UserOverrideFile = "models.toml"
+
+const maxUserOverrideBytes = 1 << 20
 
 type catalogFile struct {
 	Revision       string      `toml:"revision"`
@@ -90,7 +94,7 @@ func loadBundled() (*Catalog, error) {
 }
 
 func (c *Catalog) applyOverrides(path string) error {
-	data, err := os.ReadFile(path)
+	data, err := rootedfs.ReadFile(filepath.Dir(path), filepath.Base(path), maxUserOverrideBytes)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil

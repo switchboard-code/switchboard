@@ -1,0 +1,2 @@
+go test fuzz v1
+string("## Objective\r\nContinue the verified objective.\r\n\r\n## Constraints\r\nKeep the active constraints.\r\n\r\n## Execution frontier\r\n- Done: prior verified work.\r\n- In progress: none.\r\n- Next: continue the objecs.\r\n\r\r\n- Blocked/pending: none.\r\n\r\n## Workspace\r\nRelevant files remain in the workspace.\r\n\r\n## Decisions\r\nPreserve the current approach.\r\n\r\n## Verification\r\nRun the focused checks.\r\n\r\n## Critical context\r\nNo additional literals.")

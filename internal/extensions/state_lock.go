@@ -5,33 +5,53 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"runtime"
 	"time"
+
+	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 )
 
 const pluginStateLockTimeout = 2 * time.Second
 
+var pluginStateLockBeforeOpenTestHook func()
+var pluginStateLockAfterOpenTestHook func()
+
 type pluginStateLock struct {
-	file *os.File
+	file      *os.File
+	directory *pluginStateDirectory
 }
 
 func acquirePluginStateLock(ctx context.Context, statePath string) (*pluginStateLock, error) {
+	directory, err := openPluginStateDirectory(statePath)
+	if err != nil {
+		return nil, err
+	}
+	lock, err := acquirePluginStateLockInDirectory(ctx, directory)
+	if err != nil {
+		return nil, errors.Join(err, directory.close())
+	}
+	lock.directory = directory
+	return lock, nil
+}
+
+func acquirePluginStateLockInDirectory(ctx context.Context, directory *pluginStateDirectory) (*pluginStateLock, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
-		return nil, fmt.Errorf("creating plugin state directory: %w", err)
+	if err := directory.validateLinked(); err != nil {
+		return nil, err
 	}
-	path := statePath + ".lock"
-	before, err := os.Lstat(path)
+	name := directory.name + ".lock"
+	before, err := directory.root.Lstat(name)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("inspecting plugin state lock: %w", err)
 	}
 	if err == nil && (before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular()) {
 		return nil, errors.New("plugin state lock is not a regular file")
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if pluginStateLockBeforeOpenTestHook != nil {
+		pluginStateLockBeforeOpenTestHook()
+	}
+	file, _, err := fileprivacy.OpenReadWriteOrCreateInRoot(directory.root, name)
 	if err != nil {
 		return nil, fmt.Errorf("opening plugin state lock: %w", err)
 	}
@@ -43,15 +63,22 @@ func acquirePluginStateLock(ctx context.Context, statePath string) (*pluginState
 	if err != nil {
 		return closeWith(fmt.Errorf("inspecting opened plugin state lock: %w", err))
 	}
-	current, err := os.Lstat(path)
+	current, err := directory.root.Lstat(name)
 	if err != nil || current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || !os.SameFile(current, after) {
-		return closeWith(errors.New("plugin state lock changed while it was opened"))
+		return closeWith(errors.Join(errors.New("plugin state lock changed while it was opened"), err))
 	}
 	if before != nil && !os.SameFile(before, after) {
 		return closeWith(errors.New("plugin state lock changed while it was opened"))
 	}
-	if runtime.GOOS != "windows" && after.Mode().Perm()&0o077 != 0 {
-		return closeWith(fmt.Errorf("plugin state lock permissions are %04o, want 0600", after.Mode().Perm()))
+	ownerOnly, err := fileprivacy.IsOwnerOnly(file)
+	if err != nil || !ownerOnly {
+		return closeWith(errors.Join(errors.New("plugin state lock is not owner-only"), err))
+	}
+	if err := directory.validateLinked(); err != nil {
+		return closeWith(err)
+	}
+	if pluginStateLockAfterOpenTestHook != nil {
+		pluginStateLockAfterOpenTestHook()
 	}
 	deadline := time.Now().Add(pluginStateLockTimeout)
 	for {
@@ -67,6 +94,21 @@ func acquirePluginStateLock(ctx context.Context, statePath string) (*pluginState
 				_ = unlockPluginStateFile(file)
 				return closeWith(err)
 			}
+			locked, statErr := file.Stat()
+			linked, linkErr := directory.root.Lstat(name)
+			ownerOnly, ownerErr := fileprivacy.IsOwnerOnly(file)
+			if statErr != nil || linkErr != nil || ownerErr != nil || !ownerOnly ||
+				linked.Mode()&os.ModeSymlink != 0 || !linked.Mode().IsRegular() || !os.SameFile(locked, linked) {
+				_ = unlockPluginStateFile(file)
+				return closeWith(errors.Join(
+					errors.New("plugin state lock changed identity or permissions while it was acquired"),
+					statErr, linkErr, ownerErr,
+				))
+			}
+			if err := directory.validateLinked(); err != nil {
+				_ = unlockPluginStateFile(file)
+				return closeWith(err)
+			}
 			return &pluginStateLock{file: file}, nil
 		}
 		if time.Now().After(deadline) {
@@ -77,14 +119,17 @@ func acquirePluginStateLock(ctx context.Context, statePath string) (*pluginState
 }
 
 func (lock *pluginStateLock) Close() error {
-	if lock == nil || lock.file == nil {
+	if lock == nil {
 		return nil
 	}
-	unlockErr := unlockPluginStateFile(lock.file)
-	closeErr := lock.file.Close()
-	lock.file = nil
-	if unlockErr != nil {
-		return unlockErr
+	var err error
+	if lock.file != nil {
+		err = errors.Join(unlockPluginStateFile(lock.file), lock.file.Close())
+		lock.file = nil
 	}
-	return closeErr
+	if lock.directory != nil {
+		err = errors.Join(err, lock.directory.close())
+		lock.directory = nil
+	}
+	return err
 }

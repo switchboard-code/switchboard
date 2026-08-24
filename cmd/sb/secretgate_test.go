@@ -14,6 +14,15 @@ import (
 
 const testGitHubToken = "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789"
 
+func chooseRedact(m *tuiModel) tea.Cmd {
+	// Both secret gates put the safe drop row last. Moving up twice reaches
+	// redact in the three-row outbound gate and remains there in the two-row
+	// durable-storage gate.
+	m.key(tea.KeyMsg{Type: tea.KeyUp})
+	m.key(tea.KeyMsg{Type: tea.KeyUp})
+	return m.key(tea.KeyMsg{Type: tea.KeyEnter})
+}
+
 // A key-shaped prompt does not start a turn; it opens the gate, and until
 // the user answers, nothing has left the machine.
 func TestStartTurnHoldsAKeyBehindTheGate(t *testing.T) {
@@ -28,6 +37,9 @@ func TestStartTurnHoldsAKeyBehindTheGate(t *testing.T) {
 	if m.busy {
 		t.Error("the turn began before the gate was answered")
 	}
+	if flat := strings.Join(m.tr.flat, "\n"); strings.Contains(flat, testGitHubToken) {
+		t.Fatal("the transcript rendered the token before the gate was answered")
+	}
 	view := m.dlg.view(90, m.th)
 	if !strings.Contains(view, "GitHub token") {
 		t.Errorf("the gate does not name what it found:\n%s", view)
@@ -37,8 +49,185 @@ func TestStartTurnHoldsAKeyBehindTheGate(t *testing.T) {
 	}
 }
 
-// The three answers: redact rewrites the outbound copy, send passes it as
-// typed, and esc drops it — the safe direction is the default.
+func TestSubmitRedactsHistoryAndDefersTheUserCard(t *testing.T) {
+	home := t.TempDir()
+	isolateTestHome(t, home)
+	m := testModel(t)
+	prompt := "review this: " + testGitHubToken
+	m.ta.SetValue(prompt)
+
+	if cmd := m.submit(); cmd != nil {
+		t.Fatal("a gated submit returned work before the gate resolved")
+	}
+	if len(m.history) != 1 || strings.Contains(m.history[0], testGitHubToken) {
+		t.Fatalf("in-memory history kept the raw token: %#v", m.history)
+	}
+	path, err := historyPath(m.app.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), testGitHubToken) {
+		t.Fatal("durable history kept the raw token")
+	}
+	if flat := strings.Join(m.tr.flat, "\n"); strings.Contains(flat, testGitHubToken) {
+		t.Fatal("the transcript painted the raw token while the gate was open")
+	}
+
+	chooseRedact(m)
+	if m.dlg != nil {
+		t.Fatal("redact did not close the gate")
+	}
+	flat := strings.Join(m.tr.flat, "\n")
+	if strings.Contains(flat, testGitHubToken) || !strings.Contains(flat, "[redacted: a GitHub token]") {
+		t.Fatalf("the resolved transcript did not use the redacted spelling:\n%s", flat)
+	}
+}
+
+func TestDroppingSecretPromptLeavesNoUserCard(t *testing.T) {
+	m := testModel(t)
+	prompt := "review this: " + testGitHubToken
+	if cmd := m.startTurn(prompt, ""); cmd != nil {
+		t.Fatal("a gated turn returned work")
+	}
+	before := strings.Join(m.tr.flat, "\n")
+	done, _ := m.dlg.update(tea.KeyMsg{Type: tea.KeyEscape}, m.th)
+	if !done {
+		t.Fatal("escape did not resolve the gate")
+	}
+	after := strings.Join(m.tr.flat, "\n")
+	if after != before || strings.Contains(after, testGitHubToken) {
+		t.Fatalf("dropping the prompt changed the transcript:\n%s", after)
+	}
+}
+
+func TestSteerAndSkillPromptsDoNotPaintSecretsBeforeTheGate(t *testing.T) {
+	t.Run("steer", func(t *testing.T) {
+		m := testModel(t)
+		prompt := "use " + testGitHubToken + " in the next round"
+		if cmd := m.steer(prompt); cmd != nil {
+			t.Fatal("secret-bearing steer ran before the gate")
+		}
+		if got := m.app.takeSteers(); len(got) != 0 {
+			t.Fatalf("pre-gate steers = %+v", got)
+		}
+		if flat := strings.Join(m.tr.flat, "\n"); strings.Contains(flat, testGitHubToken) {
+			t.Fatal("steer painted the raw token before the gate")
+		}
+		chooseRedact(m)
+		if m.dlg != nil {
+			t.Fatal("redact did not close the steer gate")
+		}
+		steers := m.app.takeSteers()
+		if len(steers) != 1 || strings.Contains(steers[0], testGitHubToken) ||
+			!strings.Contains(steers[0], "[redacted: a GitHub token]") {
+			t.Fatalf("redacted steers = %+v", steers)
+		}
+	})
+
+	t.Run("skill", func(t *testing.T) {
+		m := testModel(t)
+		display := "/skill review " + testGitHubToken
+		prompt := "follow the review instructions with " + testGitHubToken
+		if cmd := m.startSkillPrompt(display, prompt); cmd != nil {
+			t.Fatal("secret-bearing skill prompt ran before the gate")
+		}
+		if flat := strings.Join(m.tr.flat, "\n"); strings.Contains(flat, testGitHubToken) {
+			t.Fatal("skill invocation painted the raw token before the gate")
+		}
+		chooseRedact(m)
+		if m.dlg != nil {
+			t.Fatal("redact did not close the skill gate")
+		}
+		flat := strings.Join(m.tr.flat, "\n")
+		if strings.Contains(flat, testGitHubToken) || !strings.Contains(flat, "[redacted: a GitHub token]") {
+			t.Fatalf("skill display was not redacted:\n%s", flat)
+		}
+	})
+}
+
+func TestCredentialGatedSteerCannotCrossItsTurnBoundary(t *testing.T) {
+	m := testModel(t)
+	m.busy = true
+	m.turnPlanning = false
+	m.turnGeneration = 41
+	prompt := "use " + testGitHubToken + " in this turn only"
+
+	if cmd := m.steer(prompt); cmd != nil {
+		t.Fatal("secret-bearing steer ran before the gate")
+	}
+	if m.dlg == nil {
+		t.Fatal("secret-bearing steer opened no gate")
+	}
+	// The model turn completes while the user is still considering the
+	// credential decision. Resolving the old gate must not arm a future turn.
+	m.busy = false
+	chooseRedact(m)
+
+	if pending := m.app.takeSteers(); len(pending) != 0 {
+		t.Fatalf("late credential decision armed a later turn: %v", pending)
+	}
+	if len(m.queue) != 0 {
+		t.Fatalf("late credential decision silently queued a new prompt: %v", m.queue)
+	}
+	flat := strings.Join(m.tr.flat, "\n")
+	if strings.Contains(flat, testGitHubToken) || !strings.Contains(flat, "that turn ended while the credential decision was open") {
+		t.Fatalf("late steer refusal was unsafe or silent:\n%s", flat)
+	}
+}
+
+func TestRacePromptSecretGateDefersBothBranchesAndTheTranscript(t *testing.T) {
+	m := raceModel(t)
+	_, generation, sourceID, err := m.startOperation("race setup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := "compare with " + testGitHubToken
+	probe := raceProbeMsg{
+		operation: generation, sourceID: sourceID, prompt: prompt,
+		a: m.app.config.Tiers[0], b: m.app.config.Tiers[1],
+		ca: &racedProvider{}, cb: &racedProvider{},
+	}
+	if cmd := m.onRaceProbe(probe); cmd != nil {
+		t.Fatal("secret-bearing race began before the gate resolved")
+	}
+	if m.dlg == nil {
+		t.Fatal("race prompt opened no secret gate")
+	}
+	if flat := strings.Join(m.tr.flat, "\n"); strings.Contains(flat, testGitHubToken) {
+		t.Fatal("race prompt painted the token before the gate")
+	}
+	setup := chooseRedact(m)
+	if m.dlg != nil || setup == nil {
+		t.Fatalf("redacted race gate dialog=%T setup=%v", m.dlg, setup)
+	}
+	flat := strings.Join(m.tr.flat, "\n")
+	if strings.Contains(flat, testGitHubToken) || !strings.Contains(flat, "[redacted: a GitHub token]") {
+		t.Fatalf("race transcript was not redacted:\n%s", flat)
+	}
+	m.finishOperation(generation, false)
+
+	// Dropping the same prompt frees the exclusive operation and leaves no
+	// user card or branch setup behind.
+	m = raceModel(t)
+	_, generation, sourceID, err = m.startOperation("race setup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe.operation, probe.sourceID = generation, sourceID
+	m.onRaceProbe(probe)
+	before := strings.Join(m.tr.flat, "\n")
+	done, setup := m.dlg.update(tea.KeyMsg{Type: tea.KeyEscape}, m.th)
+	if !done || setup != nil || m.operationActive || strings.Join(m.tr.flat, "\n") != before {
+		t.Fatalf("dropped race: done=%v setup=%v active=%v", done, setup, m.operationActive)
+	}
+}
+
+// The three answers: a stray Enter drops, redact rewrites the outbound copy,
+// send passes it as typed, and esc drops it too.
 func TestSecretGateAnswers(t *testing.T) {
 	m := testModel(t)
 	prompt := "use " + testGitHubToken + " for the API"
@@ -49,10 +238,24 @@ func TestSecretGateAnswers(t *testing.T) {
 
 	var sent string
 	m.openSecretGate(leaks, prompt, func(p string) tea.Cmd { sent = p; return nil })
-	done, _ := m.dlg.update(tea.KeyMsg{Type: tea.KeyEnter}, m.th) // first item: redact
-	if !done {
-		t.Fatal("the gate did not resolve on enter")
+	if cmd := m.key(tea.KeyMsg{Type: tea.KeyEnter}); cmd != nil {
+		t.Fatal("the safe drop unexpectedly returned a command")
 	}
+	if sent != "" || m.dlg != nil {
+		t.Fatalf("stray Enter sent %q or left dialog %T", sent, m.dlg)
+	}
+
+	// The gate can arrive between composer keystrokes. Ordinary text must not
+	// filter the choices and turn a later Enter into raw-secret egress.
+	m.openSecretGate(leaks, prompt, func(p string) tea.Cmd { sent = p; return nil })
+	m.key(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	m.key(tea.KeyMsg{Type: tea.KeyEnter})
+	if sent != "" || m.dlg != nil {
+		t.Fatalf("composer rune plus Enter sent %q or left dialog %T", sent, m.dlg)
+	}
+
+	m.openSecretGate(leaks, prompt, func(p string) tea.Cmd { sent = p; return nil })
+	chooseRedact(m)
 	if strings.Contains(sent, testGitHubToken) {
 		t.Errorf("redact sent the secret: %q", sent)
 	}
@@ -62,9 +265,15 @@ func TestSecretGateAnswers(t *testing.T) {
 
 	sent = ""
 	m.openSecretGate(leaks, prompt, func(p string) tea.Cmd { sent = p; return nil })
-	if done, _ = m.dlg.update(tea.KeyMsg{Type: tea.KeyEscape}, m.th); !done {
-		t.Fatal("esc did not resolve the gate")
+	m.key(tea.KeyMsg{Type: tea.KeyUp}) // drop -> send is an explicit move
+	m.key(tea.KeyMsg{Type: tea.KeyEnter})
+	if sent != prompt {
+		t.Errorf("deliberate send passed %q, want the original prompt", sent)
 	}
+
+	sent = ""
+	m.openSecretGate(leaks, prompt, func(p string) tea.Cmd { sent = p; return nil })
+	m.key(tea.KeyMsg{Type: tea.KeyEscape})
 	if sent != "" {
 		t.Errorf("esc sent the prompt anyway: %q", sent)
 	}

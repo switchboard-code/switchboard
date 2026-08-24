@@ -203,7 +203,12 @@ func (v *turnReviewView) visualLines(width int) []string {
 	for _, line := range v.lines {
 		line = strings.ReplaceAll(line, "\t", `\t`)
 		wrapped := ansi.Hardwrap(line, width, true)
-		visual = append(visual, strings.Split(wrapped, "\n")...)
+		rows := strings.Split(wrapped, "\n")
+		for i := range rows {
+			rows[i] = fitCells(rows[i], width)
+		}
+		rows = independentSGRLines(rows, strings.Contains(line, "\x1b["))
+		visual = append(visual, rows...)
 	}
 	v.visual = visual
 	v.visualWidth = width

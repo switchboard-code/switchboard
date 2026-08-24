@@ -61,11 +61,19 @@ scanned for credentials before they enter the log.
 Tool approvals from parallel delegates take one serialized lane and name the
 task asking, so prompts do not overlap or lose their owner.
 
+Every interactive modal uses that same FIFO lane: approvals, questions,
+pickers, free-text prompts, secret gates, and race verdicts cannot overwrite
+one another. Approval opens on **No**. Enter therefore denies until the user
+moves to Yes or Always; bare letter keys do not approve. Ctrl+C, quit, and a
+terminal exit cancel the visible dialog and every queued waiter, including a
+result that arrives after its owner was cancelled. Dialogs keep the question,
+warning, and safe choices visible down to a 20-column terminal.
+
 ## Common commands
 
 | Command | Purpose |
 | --- | --- |
-| `/models` | Browse available models and bind tiers |
+| `/models` | Browse models, bind tiers, and set the output cap an unlisted model needs |
 | `/tiers` | Show the ladder and active profile |
 | `/t3` | Pin the session to tier 3 |
 | `/tier auto` | Resume automatic per-turn routing |
@@ -73,7 +81,8 @@ task asking, so prompts do not overlap or lose their owner.
 | `/why` | Explain routing decisions and reprice the session on other tiers |
 | `/think high` | Change reasoning effort for the active target |
 | `/context` | Show estimated system, tool, and conversation use separately from provider-reported usage |
-| `/compact [preview]` | Preview or perform context compaction |
+| `/compact [objective]` | Compact the session; an explicit objective safely anchors legacy history |
+| `/compact preview` | Preview what context compaction would replace |
 | `/budget 2.50` | Set the persistent dollar ceiling |
 | `/destinations` | Show or set the providers this workspace's turns may reach |
 | `/permissions` | Show the standing rules that answer without asking |
@@ -82,7 +91,8 @@ task asking, so prompts do not overlap or lose their owner.
 | `/cache` | Show the cache belief used by routing |
 | `/doctor` | Run startup, credential, sandbox, tool, and MCP checks |
 | `/doctor extensions` | Inspect every retained startup extension diagnostic in discovery order |
-| `/tasks [cancel <id>]` | Inspect current-session delegate work or cancel one queued or running task |
+| `/workflow [list|show <name>|run <name> [args]]` | Inspect or run a staged subagent workflow |
+| `/tasks [cancel <id>|steer <id> <text>]` | Inspect, guide, or cancel current-session delegate work |
 | `/setup` | Reopen provider setup |
 | `/mode <plan|default|acceptEdits|auto|yolo|bypass>` | Change the permission policy, including mid-turn |
 | `/sandbox on|off|auto|status` | Change or inspect command confinement for this process |
@@ -106,6 +116,8 @@ capped at 100, and its
 IDs live only in the current process, although delegate session logs remain
 durable. Targeted cancel does not cancel sibling tasks. The full batch rules are
 in [Delegation and named agents](extensions.md#delegation-and-named-agents).
+Targeted steer is credential-gated and arrives at the worker's next completed
+model-round boundary rather than changing an in-flight request.
 
 ## Scheduled prompts
 
@@ -186,7 +198,40 @@ will summarize. `[slots] summarizer` assigns a dedicated tier to this work.
 
 The session does not wait to be told to go on: the new context's first turn
 starts by itself, acting on the summary rather than retelling it. Prompts
-queued while the summary ran go first — they are the continuation.
+queued while the summary ran go first — they are the continuation. The compact
+seed and automatic continuation are recorded and rendered as Switchboard
+context, not attributed to the user or included in user-turn counts.
+
+The summarizer is given one injection-resistant handoff contract with seven
+sections: Objective, Constraints, Execution frontier, Workspace, Decisions,
+Verification, and Critical context. Conversation text, repository content, and
+tool output are source data, not new instructions. Durable authored/opening,
+user-steer, injected, and synthetic
+provenance is projected explicitly, so a late watch/advisor message or a
+handoff-looking string cannot replace the user's newest scope. Recognized
+credentials are redacted from authored text, message text, tool arguments, and
+tool results before the summarizer call, including when a dedicated slot sends
+history to a different provider. Provider-specific hidden reasoning and binary
+image/document payloads do not cross that boundary; explicit omission markers
+make compaction text-only and prevent the summary from claiming it inspected
+them.
+
+Session schemas before 5 did not preserve the boundary between the words a
+person typed and context the harness appended to the same user-role message.
+Switchboard therefore refuses plain or automatic compaction when a resumed
+legacy transcript has no newer verified authored opening or steer. The refusal
+does not call a model or alter the source session and tells the user to run
+`/compact <current objective>`. That argument is marked in the one-shot
+summarizer request as the newest verified user-authored scope and the sole
+authority for the handoff's Objective; lookalike markers in historical content
+remain untrusted data.
+
+A handoff with a preamble, a non-substantive Objective, a missing or empty
+four-field execution frontier, duplicated, reordered, or unexpected headings,
+a tool call, an incomplete stop, or more than 32 KiB is refused
+before a child session becomes resumable. Uninspectable historical block data
+is likewise refused before egress, leaving the source untouched. The TUI and
+REPL use this same implementation and context preflight.
 
 ### What crosses a context boundary
 
@@ -217,11 +262,31 @@ round: a warning repeated at every boundary is one that stops being read.
 | `/fork [turns|pin]` | Continue from an earlier prefix in a new session log |
 | `/pin [name]` | List pins or name the current point for a later fork |
 | `/retry [tier]` | Revert the last captured turn and replay its recorded opening, optionally on another tier |
+| `/retry abandon` | Resolve an interrupted retry without replaying or duplicating any work |
 | `/resume` | Open a recorded session |
+| `/session` | Show the active session ID, exact serving target, counts, and resume health |
 
 Inside a running session, bare `/recap` reads the previous log because the
 current session is not where the user left off. `sb recap <id>` reads a
 specific session.
+
+The `/resume` picker is a read-only health check, not merely a timestamp list.
+Each row names its authored-turn and message counts, exact effective serving
+target, and any interrupted assistant output, pending interrupted-tool repair,
+continuity capsule, recoverable torn tail, or complete corrupt record. `/session`
+shows the same health for the active log. Inventory never repairs or truncates
+a candidate; writable adoption repairs only a provably unterminated final
+frame. A complete frame with a bad checksum, header, or payload remains intact
+and blocks resume.
+
+Assistant stream deltas cross a write-ahead barrier before the observer or TUI
+may display them. On a clean turn those checkpoints collapse into the ordinary
+single assistant message. After interruption they replay as one visibly
+incomplete assistant message, remain exportable evidence, and are excluded
+from token estimates, cache plans, routing, and every provider request. A tool
+call that reached the durable tail without a result receives one synthetic
+error result at writable adoption: its outcome is unknown, and Switchboard
+does not repeat a possibly non-idempotent action.
 
 Forking does not rewrite the original log. The copied message prefix remains
 byte-identical, so a provider that still holds it may serve the branch from
@@ -230,9 +295,61 @@ cache. Files are not rewound by a fork.
 `/retry` uses a fork at the last turn's opening and replays the exact recorded
 message, including image and reference metadata. The discarded answer remains
 resumable with a `user_corrected` label. File changes recorded by write and edit
-are restored first. A partial or failed restore refuses the replay and remains
-retryable until it is explicitly handled. Shell side effects remain. A tier
+are restored as one prepared transaction bound to the exact session opening,
+not its shortened display label. The child session is staged first. Only after
+runtime adoption and every pre-image succeeds does publication make it
+resumable; a publication failure rolls every file forward to its post-image and
+retains the checkpoint evidence. A stale, partial, oversized, or failed restore
+refuses the replay and remains retryable. Shell side effects remain. A tier
 argument runs the replay there and then returns.
+
+The child also receives a bounded retry intent before publication. It stores
+the source session and message coordinate, a digest of the opening, and the
+exact destination target and ordered fallbacks—not a second copy of the prompt,
+attachment, or credential-bearing bytes. The child opening carries a
+publication-bound, provider-invisible marker. Immediately before the first
+model stream call, Switchboard syncs a `started` transition. Context or budget
+refusal before that seam makes zero provider calls and leaves the marked
+opening safe to resume without appending it twice.
+
+On restart, a unique pending child takes priority over modification time and
+the set-aside source. A child still at the cut, or with exactly one marked
+opening whose digest matches the source, can replay automatically once. A
+started, ambiguous, corrupt, multiply-published, or otherwise mismatched
+handoff never guesses: prompts, schedules, shell commands, forks, races, and
+other mutations remain blocked while inspection, exit, and `/retry abandon`
+stay available. After abandoning the handoff, `/resume` can return to the
+set-aside source. Headless and REPL surfaces refuse unresolved
+handoffs; only the interactive TUI presents or performs recovery. Background
+schedules, advisor startup, update checks, and LSP polling wait until a safe
+automatic replay has durably resolved.
+
+Before `/retry` publishes—even when the turn has no restorable files—it writes,
+checksums, bounds, and syncs a private per-workspace recovery journal containing
+the exact post-images (an empty bounded set when no checkpoint is available). On
+the next start, Switchboard resolves that journal before listing or adopting a
+session. A valid published child commits the pre-turn workspace; an unpublished
+or missing child rolls every checkpointed path forward to the source session's
+post-turn state. Recovery is idempotent across another interruption. A path
+that matches neither recorded state, a corrupt journal, a foreign publication
+marker, or a live owner blocks adoption instead of guessing. Successful
+recovery is reported at startup.
+
+Clear, compact, fork, retry, and race children use the same staged-session
+boundary. A crash or cancelled operation can leave diagnostic bytes, but an
+unpublished child is absent from list, latest, resume, export, cost, and blame
+surfaces and cannot displace the last adopted session. Session schema 5 makes
+staging visible only through a separately validated publication marker. A
+same-schema older reader may ignore a retry-intent record, which is why an
+unmarked opening is never accepted as proof that no provider call began.
+
+Live failure and cancellation paths retain invisible staged logs and partial
+markers instead of attempting a cross-file delete beside a possible commit.
+Startup maintenance removes only private-store artifacts older than 30 days,
+at most 16 per run, while holding the same exclusive append lock used by every
+Switchboard publisher. Marker and pathname changes it observes are refusals;
+arbitrary non-cooperative mutation by another process running as the same OS
+user is outside that serialization guarantee.
 
 ### Continuity capsules
 
@@ -241,18 +358,28 @@ conversation. The production loop records a successful todo state and derives
 its next action. Capsule content is normalized, size-limited, and scanned for
 credentials before it is written.
 
-After a restart or session swap, the newest undelivered valid capsule is stamped
-into the next user opening before routing, estimation, and provider send, then
-consumed. Pending and delivered state survives the swap, so an already-delivered
-capsule is not injected again. It stays hidden from the visible transcript; the
-prompt, history label, and retry label remain the text the user wrote. The swap
+After a restart or session swap, the newest undelivered, non-stale valid capsule
+is stamped into the next user opening before routing, estimation, and provider
+send, then consumed. Pending and delivered state survives the swap, so an
+already-delivered capsule is not injected again. It stays hidden from the
+visible transcript; the prompt, history label, and retry label remain the text
+the user wrote. The swap
 also restores active todos and revokes old file-read authority. Fork and retry
 preserve a capsule only when its recorded message boundary belongs to the branch.
 
-Compaction carries the live recorded todo state and derived next action when
-present. It records immediate parent lineage and stamps the capsule once into
-the compact seed without duplicating it in the generated summary. The next real
-user opening is therefore clean.
+A later authoritative user opening or durable user steer makes an older capsule
+stale. Resume health says so, and a generic resume neither restores its todos nor
+stamps it into another opening; the append-only capsule remains available as
+audit and lineage evidence. Machine injections and synthetic compaction
+continuations do not acquire that authority merely by occupying a user-role
+message.
+
+When structured continuity exists, compaction carries its immediate parent
+lineage but derives the new objective, phase, next action, and active task from
+the freshly validated handoff. It never re-promotes an older todo or objective
+after a later user cancellation or scope change. The new capsule is stamped
+once into the compact seed without duplicating it in the generated summary, so
+the next real user opening is clean.
 
 A capsule is advisory. It tells the next model what the previous context
 believed, but it does not grant file-read authority, relax permissions, or
@@ -471,6 +598,13 @@ refused `background` rather than handed a process it has no verb for.
 ```sh
 git diff | sb -p "review this"
 ```
+
+`sb -workflow <name> [arguments]` runs a workflow without entering the TUI.
+It is always unattended, including when launched from a terminal: no model or
+delegate can open a permission or question prompt. A decision not already
+answered by the active mode or a standing rule fails closed. Workflow syntax,
+stage/carry behavior, and limits are documented in
+[Native extension compatibility](extensions.md#delegation-and-named-agents).
 
 Because stdin supplied content, it cannot answer an approval prompt. A tool
 that needs approval is refused and the reason is returned to the model. Bypass

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"github.com/switchboard-code/switchboard/internal/delegate"
 	"github.com/switchboard-code/switchboard/internal/tools"
 )
@@ -43,6 +45,46 @@ func TestTasksSurfaceFiltersAndLabelsParentSession(t *testing.T) {
 		if strings.Contains(got, stale) {
 			t.Fatalf("task surface leaked another session's %q:\n%s", stale, got)
 		}
+	}
+}
+
+type recordingTaskSteerer struct {
+	id, message string
+	calls       int
+}
+
+func (s *recordingTaskSteerer) Steer(id, message string) error {
+	s.id, s.message = id, message
+	s.calls++
+	return nil
+}
+
+func TestTaskSteerUsesTheOutboundCredentialGate(t *testing.T) {
+	m := testModel(t)
+	target := &recordingTaskSteerer{}
+	prompt := "use " + testGitHubToken + " while checking the child"
+
+	if cmd := guardedTaskSteer(m, target, "task-007", prompt); cmd != nil {
+		t.Fatal("a secret-bearing task steer ran before the gate resolved")
+	}
+	if target.calls != 0 || m.dlg == nil {
+		t.Fatalf("pre-gate calls = %d, dialog = %T", target.calls, m.dlg)
+	}
+	cmd := chooseRedact(m)
+	if cmd != nil {
+		_ = cmd()
+	}
+	if target.calls != 1 || target.id != "task-007" || strings.Contains(target.message, testGitHubToken) ||
+		!strings.Contains(target.message, "[redacted: a GitHub token]") {
+		t.Fatalf("redacted task steer = calls %d, id %q, message %q", target.calls, target.id, target.message)
+	}
+
+	target = &recordingTaskSteerer{}
+	m.dlg = nil
+	guardedTaskSteer(m, target, "task-008", prompt)
+	done, _ := m.dlg.update(tea.KeyMsg{Type: tea.KeyEscape}, m.th)
+	if !done || target.calls != 0 {
+		t.Fatalf("dropping task steer resolved=%v calls=%d", done, target.calls)
 	}
 }
 

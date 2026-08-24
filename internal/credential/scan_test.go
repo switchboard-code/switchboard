@@ -63,6 +63,61 @@ func TestScanPromptDeduplicatesRepeatedPastes(t *testing.T) {
 	}
 }
 
+func TestScanPromptDoesNotDependOnTheByteBeforeAnIssuerPrefix(t *testing.T) {
+	key := "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+	text := strings.Repeat("x", 4096) + key
+	leaks := ScanPrompt(text)
+	if len(leaks) != 1 || leaks[0].Kind != "a GitHub token" {
+		t.Fatalf("scan missed a credential adjacent to capture padding: %v", leaks)
+	}
+	if redacted := Redact(text, leaks); strings.Contains(redacted, key) ||
+		!strings.Contains(redacted, "[redacted: a GitHub token]") {
+		t.Fatalf("redaction retained an adjacent credential: %q", redacted)
+	}
+}
+
+func TestSafePrefixForTruncationKeepsCompleteTokensForTheGate(t *testing.T) {
+	complete := "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+	crossing := "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	text := complete + " safe padding " + crossing + " tail"
+	limit := strings.Index(text, crossing) + len(crossing) - 1
+
+	got, cut := SafePrefixForTruncation(text, limit)
+	if cut != strings.Index(text, crossing) {
+		t.Fatalf("safe cut = %d, want crossing token start %d", cut, strings.Index(text, crossing))
+	}
+	if !strings.Contains(got, complete) || len(ScanPrompt(got)) != 1 {
+		t.Fatalf("complete in-bound token did not remain available to the gate: %q", got)
+	}
+	if strings.Contains(got, crossing) || strings.Contains(got, "ghp_ABC") ||
+		!strings.Contains(got, "[redacted: a GitHub token]") {
+		t.Fatalf("boundary-crossing token was not safely replaced: %q", got)
+	}
+}
+
+func TestSafePrefixForTruncationLeavesOrdinaryAndExcludedTokensAlone(t *testing.T) {
+	secret := "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+	for _, tc := range []struct {
+		name  string
+		text  string
+		limit int
+		want  string
+		cut   int
+	}{
+		{name: "ordinary", text: "abcdef", limit: 4, want: "abcd", cut: 4},
+		{name: "whole input", text: "abcdef", limit: 8, want: "abcdef", cut: 6},
+		{name: "token begins at boundary", text: "prefix" + secret, limit: len("prefix"), want: "prefix", cut: len("prefix")},
+		{name: "zero", text: secret, limit: 0, want: "", cut: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, cut := SafePrefixForTruncation(tc.text, tc.limit)
+			if got != tc.want || cut != tc.cut {
+				t.Fatalf("SafePrefixForTruncation = %q, %d; want %q, %d", got, cut, tc.want, tc.cut)
+			}
+		})
+	}
+}
+
 // The Secret rule applies to findings too: no rendering shows the match.
 func TestLeakHasNoRenderingThatShowsTheSecret(t *testing.T) {
 	secret := "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789"

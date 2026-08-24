@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
-	"errors"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/switchboard-code/switchboard/internal/terminaltext"
 	"github.com/switchboard-code/switchboard/internal/tools"
 )
 
@@ -18,27 +18,35 @@ import (
 type questionMsg struct {
 	q       tools.Question
 	respond chan tools.Answer
+	token   *dialogToken
 }
 
 // tuiQuestioner resolves the ask tool against a dialog. A program that has
 // already quit leaves no one to answer, and the cancelled context is what
 // unblocks the loop — never a fabricated answer.
-type tuiQuestioner struct{ p *tea.Program }
+type tuiQuestioner struct {
+	p            tuiMessageSender
+	lifetimeDone <-chan struct{}
+}
 
 func (a *tuiQuestioner) AskUser(ctx context.Context, q tools.Question) (tools.Answer, error) {
+	if tuiLifetimeStopped(a.lifetimeDone) {
+		return tools.Answer{}, tuiWaitCancellation(ctx)
+	}
 	respond := make(chan tools.Answer, 1)
-	a.p.Send(questionMsg{q: q, respond: respond})
+	token := &dialogToken{}
+	a.p.Send(questionMsg{q: q, respond: respond, token: token})
 	select {
-	case ans, shown := <-respond:
-		if !shown {
-			// The channel closed without an answer: the surface had another
-			// prompt open and could not show this one. Saying so beats
-			// reporting a decline nobody made.
-			return tools.Answer{}, errors.New("another prompt is already open, so the question could not be shown")
+	case ans := <-respond:
+		if tuiLifetimeStopped(a.lifetimeDone) || ctx.Err() != nil {
+			return tools.Answer{}, tuiWaitCancellation(ctx)
 		}
 		return ans, nil
 	case <-ctx.Done():
+		a.p.Send(cancelDialogMsg{token: token})
 		return tools.Answer{}, ctx.Err()
+	case <-a.lifetimeDone:
+		return tools.Answer{}, tuiWaitCancellation(ctx)
 	}
 }
 
@@ -61,6 +69,7 @@ func newQuestionDialog(q tools.Question, respond chan tools.Answer) *questionDia
 	return &questionDialog{
 		q:       q,
 		respond: respond,
+		sel:     -1,
 		marked:  make([]bool, len(q.Options)),
 		input:   ti,
 	}
@@ -112,20 +121,29 @@ func (d *questionDialog) update(key tea.KeyMsg, th *theme) (bool, tea.Cmd) {
 
 	switch key.String() {
 	case "esc":
-		return d.resolve(tools.Answer{Declined: true}), nil
-	case "up", "k":
-		if d.sel > 0 {
+		return true, d.cancel()
+	case "up":
+		if d.sel < 0 {
+			d.sel = 0
+		} else if d.sel > 0 {
 			d.sel--
 		}
-	case "down", "j":
-		if d.sel < d.otherRow() {
+	case "down":
+		if d.sel < 0 {
+			d.sel = 0
+		} else if d.sel < d.otherRow() {
 			d.sel++
 		}
 	case " ":
-		if d.q.Multi && d.sel < len(d.q.Options) {
+		if d.q.Multi && d.sel >= 0 && d.sel < len(d.q.Options) {
 			d.marked[d.sel] = !d.marked[d.sel]
 		}
 	case "enter":
+		// Questions can appear between two keystrokes while the model is
+		// working. Enter is inert until navigation makes an answer explicit.
+		if d.sel < 0 {
+			return false, nil
+		}
 		if d.sel == d.otherRow() {
 			d.typing = true
 			d.input.Focus()
@@ -140,29 +158,100 @@ func (d *questionDialog) update(key tea.KeyMsg, th *theme) (bool, tea.Cmd) {
 			}
 		}
 		return d.resolve(tools.Answer{Picked: []string{d.q.Options[d.sel].Label}}), nil
-	default:
-		// Digits quick-pick on a single-select question; on a multi they
-		// toggle, so the keyboard shape matches what enter will send.
-		if s := key.String(); len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
-			i := int(s[0] - '1')
-			if i < len(d.q.Options) {
-				if d.q.Multi {
-					d.marked[i] = !d.marked[i]
-					d.sel = i
-				} else {
-					return d.resolve(tools.Answer{Picked: []string{d.q.Options[i].Label}}), nil
-				}
-			}
-		}
 	}
 	return false, nil
 }
 
+func (d *questionDialog) cancel() tea.Cmd {
+	d.typing = false
+	d.input.Reset()
+	d.resolve(tools.Answer{Declined: true})
+	return nil
+}
+
 func (d *questionDialog) view(width int, th *theme) string {
+	return d.viewWithin(width, dialogUnlimitedHeight, th)
+}
+
+func (d *questionDialog) viewWithin(width, height int, th *theme) string {
+	boxWidth, contentWidth := dialogDimensions(width)
+	d.input.Width = max(contentWidth-3, 1)
+	d.input.SetCursor(d.input.Position())
+	if height <= 10 {
+		lines := []string{fitCells(th.bold.Render(" "+terminaltext.Escape(d.q.Question)), contentWidth)}
+		questionLine := 0
+		focus := 0
+		if d.typing {
+			focus = len(lines)
+			lines = append(lines, fitCells(th.accent.Render("▌ ")+safeTextInputView(d.input), contentWidth))
+			lines = append(lines, th.faint.Render(fitCells("enter answer · esc back", contentWidth)))
+		} else {
+			firstChoice := len(lines)
+			for i, opt := range d.q.Options {
+				label := terminaltext.Escape(opt.Label)
+				if opt.Detail != "" {
+					label += " · " + terminaltext.Escape(opt.Detail)
+				}
+				if d.q.Multi {
+					mark := "[ ] "
+					if d.marked[i] {
+						mark = "[x] "
+					}
+					label = mark + label
+				}
+				prefix := "  "
+				style := th.dim
+				if i == d.sel {
+					prefix = th.accent.Render("▌ ")
+					style = th.bold
+					focus = len(lines)
+				}
+				lines = append(lines, fitCells(prefix+style.Render(label), contentWidth))
+			}
+			otherLine := len(lines)
+			prefix := "  "
+			style := th.dim
+			if d.sel == d.otherRow() {
+				prefix = th.accent.Render("▌ ")
+				style = th.bold
+				focus = otherLine
+			}
+			lines = append(lines, fitCells(prefix+style.Render("type your own answer"), contentWidth))
+			if d.sel < 0 {
+				focus = firstChoice
+			}
+			hint := "esc decline · ↑↓ · enter"
+			if d.q.Multi {
+				hint = "esc decline · ↑↓ · space"
+			}
+			lines = append(lines, th.faint.Render(fitCells(hint, contentWidth)))
+		}
+		hintLine := len(lines) - 1
+		contentHeight := max(height-2, 1)
+		content := strings.Join(dialogWindow(lines, contentHeight, focus, questionLine, hintLine), "\n")
+		box := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(th.accent.GetForeground()).
+			Padding(0, 1).
+			Width(boxWidth)
+		return box.Render(content)
+	}
+
 	var b strings.Builder
-	b.WriteString(th.bold.Render(" "+d.q.Question) + "\n\n")
+	writeLine := func(line string) {
+		b.WriteString(wrapCells(line, contentWidth))
+		b.WriteByte('\n')
+	}
+	writeBounded := func(line string, maxLines int) {
+		b.WriteString(wrapCellsBounded(line, contentWidth, maxLines))
+		b.WriteByte('\n')
+	}
+	writeBounded(th.bold.Render(" "+terminaltext.Escape(d.q.Question)), 4)
+	b.WriteByte('\n')
 
 	for i, opt := range d.q.Options {
+		label := terminaltext.Escape(opt.Label)
+		detail := terminaltext.Escape(opt.Detail)
 		mark := ""
 		if d.q.Multi {
 			mark = "[ ] "
@@ -170,42 +259,49 @@ func (d *questionDialog) view(width int, th *theme) string {
 				mark = "[x] "
 			}
 		}
-		row := mark + opt.Label
-		if opt.Detail != "" {
-			row += "  " + th.dim.Render(opt.Detail)
+		row := mark + label
+		if detail != "" {
+			row += "  " + th.dim.Render(detail)
 		}
 		if i == d.sel && !d.typing {
-			b.WriteString(th.accent.Render(" ▌ ") + th.bold.Render(mark+opt.Label))
-			if opt.Detail != "" {
-				b.WriteString("  " + th.dim.Render(opt.Detail))
+			row = th.accent.Render(" ▌ ") + th.bold.Render(mark+label)
+			if detail != "" {
+				row += "  " + th.dim.Render(detail)
 			}
-			b.WriteString("\n")
+			writeBounded(row, 2)
 		} else {
-			b.WriteString(th.dim.Render("   ") + row + "\n")
+			writeBounded(th.dim.Render("   ")+row, 2)
 		}
 	}
 
 	if d.typing {
-		b.WriteString(th.accent.Render(" ▌ ") + d.input.View() + "\n")
-		b.WriteString(th.faint.Render(" enter answer · esc back to the options"))
+		writeLine(th.accent.Render(" ▌ ") + safeTextInputView(d.input))
+		b.WriteString(wrapCells(th.faint.Render(" enter answer · esc back to the options"), contentWidth))
 	} else {
 		other := "type your own answer"
 		if d.sel == d.otherRow() {
-			b.WriteString(th.accent.Render(" ▌ ") + th.bold.Render(other) + "\n")
+			writeLine(th.accent.Render(" ▌ ") + th.bold.Render(other))
 		} else {
-			b.WriteString(th.dim.Render("   "+other) + "\n")
+			writeLine(th.dim.Render("   " + other))
 		}
 		hint := " ↑↓ choose · enter answer · esc decline"
 		if d.q.Multi {
 			hint = " ↑↓ choose · space mark · enter answer · esc decline"
 		}
-		b.WriteString(th.faint.Render(hint))
+		b.WriteString(wrapCells(th.faint.Render(hint), contentWidth))
 	}
 
+	content := strings.TrimRight(b.String(), "\n")
+	lines := strings.Split(content, "\n")
+	focus := dialogLine(lines, "▌", true)
+	if focus < 0 {
+		focus = max(len(lines)-2, 0)
+	}
+	content = boundedBoxContent(content, height, focus, 0, len(lines)-1)
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(th.accent.GetForeground()).
 		Padding(0, 1).
-		Width(max(width-4, 40))
-	return box.Render(strings.TrimRight(b.String(), "\n"))
+		Width(boxWidth)
+	return box.Render(content)
 }

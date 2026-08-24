@@ -55,10 +55,14 @@ func RenderExplicit(sk Skill, args string) (string, error) {
 	if len(blockers) > 0 {
 		return "", fmt.Errorf("skill %s cannot be invoked safely: %s", sk.Key(), strings.Join(blockers, "; "))
 	}
+	// Invocation checks use the source body above. Redact only the value that
+	// will be rendered into a prompt so callers retain an unchanged inventory
+	// and a repository-authored credential can never rely on an interactive
+	// prompt gate to keep it from the provider.
+	body := redactSkillEgress(sk.Body)
 	if sk.Origin.Ecosystem == EcosystemClaude {
-		return renderClaudeArguments(sk.Body, args, sk.ArgumentNames)
+		return renderClaudeArguments(body, args, sk.ArgumentNames)
 	}
-	body := sk.Body
 	if strings.TrimSpace(args) != "" {
 		body += "\n\nARGUMENTS: " + args
 	}

@@ -2,18 +2,10 @@
 
 package tools
 
-import "golang.org/x/sys/windows"
+import "os"
 
-func replaceMutationPath(from, to string) error {
-	fromp, err := windows.UTF16PtrFromString(from)
-	if err != nil {
-		return err
-	}
-	top, err := windows.UTF16PtrFromString(to)
-	if err != nil {
-		return err
-	}
-	return windows.MoveFileEx(fromp, top, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
+func replaceMutationPath(parent *os.Root, from, to string) error {
+	return parent.Rename(from, to)
 }
 
-func syncMutationDirectory(string) error { return nil }
+func syncMutationDirectory(*os.Root) error { return nil }

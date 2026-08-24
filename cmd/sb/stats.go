@@ -204,7 +204,7 @@ func runStatsCLI(w io.Writer, store *session.Store, cat *catalog.Catalog, cfg *c
 	switch scope {
 	case "all":
 		for _, line := range statsAllLines(cat, store) {
-			fmt.Fprintln(w, strings.TrimRight(line, " "))
+			fmt.Fprintln(w, cliText(strings.TrimRight(line, " ")))
 		}
 		return nil
 	case "":
@@ -214,7 +214,7 @@ func runStatsCLI(w io.Writer, store *session.Store, cat *catalog.Catalog, cfg *c
 	}
 	// No session is active in a CLI run, so no rung wears the marker.
 	for _, line := range statsLines(cfg.Tiers, cat, "", store, workspace) {
-		fmt.Fprintln(w, strings.TrimRight(line, " "))
+		fmt.Fprintln(w, cliText(strings.TrimRight(line, " ")))
 	}
 	return nil
 }

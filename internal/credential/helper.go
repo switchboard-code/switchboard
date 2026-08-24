@@ -7,7 +7,33 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"unicode/utf8"
 )
+
+const maxHelperCaptureBytes = 64 << 10
+
+type boundedHelperCapture struct {
+	buf      bytes.Buffer
+	overflow bool
+}
+
+func (c *boundedHelperCapture) Write(p []byte) (int, error) {
+	written := len(p)
+	remaining := maxHelperCaptureBytes + 1 - c.buf.Len()
+	if remaining > 0 {
+		if remaining < len(p) {
+			_, _ = c.buf.Write(p[:remaining])
+		} else {
+			_, _ = c.buf.Write(p)
+		}
+	}
+	if c.buf.Len() > maxHelperCaptureBytes || len(p) > remaining {
+		c.overflow = true
+	}
+	return written, nil
+}
+
+func (c *boundedHelperCapture) String() string { return c.buf.String() }
 
 // HelperStore runs a command the user configured and takes its standard output
 // as the credential.
@@ -45,7 +71,10 @@ func (s *HelperStore) Get(ctx context.Context, ref Ref) (Secret, error) {
 		return Secret{}, ErrNotFound
 	}
 
-	cmd := exec.CommandContext(ctx, s.Command[0], s.Command[1:]...)
+	// runCredentialCommand owns cancellation for the whole process group. Do
+	// not use CommandContext here: its direct-child kill can race the bounded
+	// descendant and retained-pipe cleanup.
+	cmd := exec.Command(s.Command[0], s.Command[1:]...)
 	// The helper is told which credential is wanted, so one command can serve
 	// every provider without the config repeating itself.
 	cmd.Env = append(cmd.Environ(),
@@ -54,13 +83,13 @@ func (s *HelperStore) Get(ctx context.Context, ref Ref) (Secret, error) {
 	)
 	cmd.Env = append(cmd.Env, s.Env...)
 
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr boundedHelperCapture
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
-		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return Secret{}, ctx.Err()
+	if err := runCredentialCommand(ctx, cmd); err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return Secret{}, contextErr
 		}
 		if execErr := new(exec.Error); errors.As(err, &execErr) {
 			return Secret{}, &Unavailable{
@@ -71,7 +100,10 @@ func (s *HelperStore) Get(ctx context.Context, ref Ref) (Secret, error) {
 		// stdout is the credential channel and is never quoted back, including
 		// here: a helper that fails partway may well have written part of a
 		// secret to it.
-		return Secret{}, fmt.Errorf("%s failed: %w%s", s.Name(), err, diagnostics(stderr.String()))
+		return Secret{}, fmt.Errorf("%s failed: %w%s", s.Name(), err, diagnostics(stderr.String(), stderr.overflow))
+	}
+	if stdout.overflow {
+		return Secret{}, fmt.Errorf("%s returned more than %d credential bytes; output withheld", s.Name(), maxHelperCaptureBytes)
 	}
 
 	value := strings.TrimSpace(stdout.String())
@@ -83,14 +115,24 @@ func (s *HelperStore) Get(ctx context.Context, ref Ref) (Secret, error) {
 
 // diagnostics formats a helper's stderr for an error message, capped so a
 // helper that dumps a page of output does not bury the failure.
-func diagnostics(stderr string) string {
+
+func diagnostics(stderr string, overflow ...bool) string {
+	if len(overflow) > 0 && overflow[0] {
+		return fmt.Sprintf(": diagnostics exceeded %d bytes and were withheld", maxHelperCaptureBytes)
+	}
+	stderr = strings.ToValidUTF8(stderr, "�")
+	stderr = Redact(stderr, ScanPrompt(stderr))
 	stderr = strings.TrimSpace(stderr)
 	if stderr == "" {
 		return ""
 	}
 	const limit = 400
 	if len(stderr) > limit {
-		stderr = stderr[:limit] + "..."
+		keep := limit
+		for keep > 0 && !utf8.RuneStart(stderr[keep]) {
+			keep--
+		}
+		stderr = stderr[:keep] + "..."
 	}
 	return ": " + strings.ReplaceAll(stderr, "\n", "; ")
 }

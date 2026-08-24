@@ -49,6 +49,9 @@ func (r *Repository) Status(ctx context.Context) ([]PathState, error) {
 // StatusPaths reads porcelain-v2 status. Nil paths means the whole worktree;
 // otherwise every path is treated literally and must remain inside Root.
 func (r *Repository) StatusPaths(ctx context.Context, paths []string) ([]PathState, error) {
+	if err := r.executionAllowed(); err != nil {
+		return nil, err
+	}
 	pathspecs, err := r.pathspecs(paths)
 	if err != nil {
 		return nil, err

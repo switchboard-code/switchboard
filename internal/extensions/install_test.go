@@ -22,6 +22,9 @@ func TestAcquireInstallLockHonorsCancellation(t *testing.T) {
 	if err := root.Mkdir("held.lock", 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := securePrivateInstallDirectory(root, "held.lock"); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	started := time.Now()
@@ -229,6 +232,9 @@ func TestInstallRejectsSourceMutationAndBounds(t *testing.T) {
 		{
 			name: "control path",
 			mutate: func(t *testing.T, root string) {
+				if runtime.GOOS == "windows" {
+					t.Skip("Win32 filenames cannot contain the control-character fixture")
+				}
 				mustWriteInstallFile(t, filepath.Join(root, "bad\nname"), []byte("bad"), 0o600)
 			},
 			want: "control",
@@ -305,7 +311,7 @@ func TestInstallRejectsForgedTraversalAndControlIdentity(t *testing.T) {
 	if _, err := Install(plugin, badCache); err == nil {
 		t.Fatal("Install accepted a control character in cache root")
 	}
-	if _, err := os.Stat(badCache); !os.IsNotExist(err) {
+	if _, err := os.Stat(badCache); runtime.GOOS != "windows" && !os.IsNotExist(err) {
 		t.Fatalf("invalid cache root was created: %v", err)
 	}
 }
@@ -413,6 +419,11 @@ func TestInstallRejectsCorruptedCachedTree(t *testing.T) {
 	raw, err := os.ReadFile(corruptPath)
 	if err != nil || string(raw) != "corrupted" {
 		t.Fatalf("corrupted cache was repaired or replaced: %v %q", err, raw)
+	}
+	if runtime.GOOS == "windows" {
+		// Windows has no portable Unix mode-bit permission class. Its DACL
+		// tampering case is covered in install_security_windows_test.go.
+		return
 	}
 
 	// Even permission-only tampering is a conflict although executable-vs-
@@ -645,13 +656,7 @@ func canonicalInstallPath(t *testing.T, root string) string {
 
 func assertInstallMode(t *testing.T, path string, want os.FileMode) {
 	t.Helper()
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := info.Mode().Perm(); got != want {
-		t.Fatalf("%s mode = %04o, want %04o", path, got, want)
-	}
+	assertInstallPlatformProtection(t, path, want)
 }
 
 func assertNoInstallArtifacts(t *testing.T, root string) {

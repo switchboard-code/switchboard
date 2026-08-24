@@ -21,6 +21,7 @@ import (
 	"github.com/switchboard-code/switchboard/internal/catalog"
 	"github.com/switchboard-code/switchboard/internal/config"
 	"github.com/switchboard-code/switchboard/internal/credential"
+	"github.com/switchboard-code/switchboard/internal/terminaltext"
 )
 
 // credentialRefs lists every provider/surface pair worth offering a key for:
@@ -40,12 +41,22 @@ func credentialRefs(cfg *config.Config, cat *catalog.Catalog) []credential.Ref {
 		add(r)
 	}
 	var rest []credential.Ref
-	for _, info := range cat.Surfaces() {
+	addCatalogSurface := func(info catalog.ModelInfo) {
 		r := credential.Ref{Provider: info.Provider, Account: info.Surface}
 		if !seen[r.String()] {
 			seen[r.String()] = true
 			rest = append(rest, r)
 		}
+	}
+	for _, info := range cat.Surfaces() {
+		addCatalogSurface(info)
+	}
+	// Surfaces returns only explicit surface defaults: a concrete entry's
+	// capabilities cannot become a surface floor. Its provider/surface identity
+	// is still enough to offer a credential on a fresh machine, so include
+	// entry-only surfaces here without consuming any model semantics.
+	for _, info := range cat.Entries() {
+		addCatalogSurface(info)
 	}
 	sort.Slice(rest, func(i, j int) bool { return rest[i].String() < rest[j].String() })
 	return append(refs, rest...)
@@ -55,9 +66,29 @@ func credentialRefs(cfg *config.Config, cat *catalog.Catalog) []credential.Ref {
 // its gathering off the UI goroutine: credential standing is a helper exec
 // away, a model list is a server round trip away.
 type pickerMsg struct {
-	title  string
-	items  []pickerItem
-	action func(id string) tea.Cmd
+	title      string
+	items      []pickerItem
+	action     func(id string) tea.Cmd
+	generation uint64
+	sessionID  string
+}
+
+func (b asyncResultBinding) bindPicker(msg pickerMsg) pickerMsg {
+	msg.generation = b.generation
+	msg.sessionID = b.sessionID
+	return msg
+}
+
+func (b asyncResultBinding) bindSecret(msg secretPromptMsg) secretPromptMsg {
+	msg.generation = b.generation
+	msg.sessionID = b.sessionID
+	return msg
+}
+
+func (b asyncResultBinding) bindText(msg textPromptMsg) textPromptMsg {
+	msg.generation = b.generation
+	msg.sessionID = b.sessionID
+	return msg
 }
 
 func cmdLogin(m *tuiModel, args string) tea.Cmd {
@@ -69,7 +100,8 @@ func cmdLogin(m *tuiModel, args string) tea.Cmd {
 		return openSecretCmd(m, ref)
 	}
 
-	cfg, cat := m.app.config, m.app.catalog
+	cfg, cat := m.app.config.Snapshot(), m.app.catalog
+	binding := m.bindAsyncResult()
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -83,7 +115,7 @@ func cmdLogin(m *tuiModel, args string) tea.Cmd {
 				desc:  credentialStanding(ctx, cfg, ref),
 			})
 		}
-		return pickerMsg{
+		return binding.bindPicker(pickerMsg{
 			title: "store a credential",
 			items: items,
 			action: func(refStr string) tea.Cmd {
@@ -91,9 +123,9 @@ func cmdLogin(m *tuiModel, args string) tea.Cmd {
 				if err != nil {
 					return noticeCmd("error", err.Error())
 				}
-				return openSecretCmd(m, ref)
+				return openSecretCmdBound(m, ref, binding)
 			},
-		}
+		})
 	}
 }
 
@@ -120,6 +152,10 @@ func credentialStanding(ctx context.Context, cfg *config.Config, ref credential.
 // picker that invoked us is mid-update, and its closing sets m.dlg to nil
 // after this returns.
 func openSecretCmd(m *tuiModel, ref credential.Ref) tea.Cmd {
+	return openSecretCmdBound(m, ref, m.bindAsyncResult())
+}
+
+func openSecretCmdBound(m *tuiModel, ref credential.Ref, binding asyncResultBinding) tea.Cmd {
 	store := credential.NewOSStore()
 	writer, ok := any(store).(credential.Writer)
 	if !ok {
@@ -127,14 +163,16 @@ func openSecretCmd(m *tuiModel, ref credential.Ref) tea.Cmd {
 			"set "+credential.EnvNames(ref)[0]+" in the environment instead")
 	}
 	return func() tea.Msg {
-		return secretPromptMsg{ref: ref, writer: writer, storeName: store.Name()}
+		return binding.bindSecret(secretPromptMsg{ref: ref, writer: writer, storeName: store.Name()})
 	}
 }
 
 type secretPromptMsg struct {
-	ref       credential.Ref
-	writer    credential.Writer
-	storeName string
+	ref        credential.Ref
+	writer     credential.Writer
+	storeName  string
+	generation uint64
+	sessionID  string
 
 	// then, when set, runs after a successful store: the flow that opened
 	// the prompt gets to continue (setup reopens its checklist).
@@ -163,8 +201,7 @@ func newSecretDialog(ref credential.Ref, storeName string, submit func(string) t
 func (d *secretDialog) update(key tea.KeyMsg, th *theme) (bool, tea.Cmd) {
 	switch key.String() {
 	case "esc":
-		d.input.Reset()
-		return true, nil
+		return true, d.cancel()
 	case "enter":
 		value := strings.TrimSpace(d.input.Value())
 		d.input.Reset()
@@ -178,39 +215,74 @@ func (d *secretDialog) update(key tea.KeyMsg, th *theme) (bool, tea.Cmd) {
 	return false, cmd
 }
 
-func (d *secretDialog) view(width int, th *theme) string {
-	var b strings.Builder
-	b.WriteString(th.bold.Render(" credential for "+d.ref.String()) + "\n")
-	b.WriteString(th.dim.Render(" paste or type; input is hidden; stored in the "+d.storeName) + "\n\n")
-	b.WriteString(" " + d.input.View() + "\n")
-	b.WriteString(th.faint.Render(" enter store · empty entry skips · esc cancel"))
+func (d *secretDialog) cancel() tea.Cmd {
+	d.input.Reset()
+	return nil
+}
 
+func (d *secretDialog) view(width int, th *theme) string {
+	return d.viewWithin(width, dialogUnlimitedHeight, th)
+}
+
+func (d *secretDialog) viewWithin(width, height int, th *theme) string {
+	boxWidth, contentWidth := dialogDimensions(width)
+	d.input.Width = max(contentWidth-1, 1)
+	d.input.SetCursor(d.input.Position())
+	if height <= 10 {
+		lines := []string{fitCells(th.bold.Render(terminaltext.Escape(d.ref.String())), contentWidth)}
+		identityLine := 0
+		lines = append(lines, fitCells(th.dim.Render("store: "+terminaltext.Escape(d.storeName)), contentWidth))
+		inputLine := len(lines)
+		lines = append(lines, fitCells(th.accent.Render("▌ ")+safeTextInputView(d.input), contentWidth))
+		footerLine := len(lines)
+		lines = append(lines, th.faint.Render(fitCells("enter store · esc", contentWidth)))
+		contentHeight := max(height-2, 1)
+		content := strings.Join(dialogWindow(lines, contentHeight, inputLine, identityLine, footerLine), "\n")
+		box := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(borderColor(th)).
+			Padding(0, 1).
+			Width(boxWidth)
+		return box.Render(content)
+	}
+
+	var b strings.Builder
+	b.WriteString(wrapCellsBounded(th.bold.Render(" credential for "+terminaltext.Escape(d.ref.String())), contentWidth, 3) + "\n")
+	b.WriteString(wrapCellsBounded(th.dim.Render(" paste or type; input is hidden; stored in the "+terminaltext.Escape(d.storeName)), contentWidth, 3) + "\n\n")
+	b.WriteString(wrapCells(" "+d.input.View(), contentWidth) + "\n")
+	b.WriteString(wrapCells(th.faint.Render(" enter store · empty entry skips · esc cancel"), contentWidth))
+
+	content := b.String()
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	inputLine := max(len(lines)-2, 0)
+	content = boundedBoxContent(content, height, inputLine, 0, len(lines)-1)
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(borderColor(th)).
 		Padding(0, 1).
-		Width(max(width-4, 40))
-	return box.Render(b.String())
+		Width(boxWidth)
+	return box.Render(content)
 }
 
 // storeSecretCmd writes the credential off the UI goroutine and reports where
 // it landed, never what it was.
 //
-// The adapters built before the key existed are dropped on the way out. An
-// adapter caches the credential it was constructed with, so without this the
-// key is stored, the store is reported, and every request for the rest of the
-// session still goes out unauthenticated.
-func storeSecretCmd(reg *providers, ref credential.Ref, writer credential.Writer, storeName, value string) tea.Cmd {
+// The success message asks Update to drop adapters built before the key
+// existed. An adapter caches the credential it was constructed with, but the
+// worker cannot reset it here: rebuilding providers reads live Config, whose
+// single writer is the TUI event loop.
+func storeSecretCmd(ref credential.Ref, writer credential.Writer, storeName, value string, after tea.Cmd) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := writer.Set(ctx, ref, value); err != nil {
 			return noticeMsg{level: "error", text: "storing " + ref.String() + " failed: " + err.Error()}
 		}
-		if reg != nil {
-			reg.reset()
+		return noticeMsg{
+			text:             "stored " + ref.String() + " in the " + storeName,
+			refreshProviders: true,
+			after:            after,
 		}
-		return noticeMsg{text: "stored " + ref.String() + " in the " + storeName}
 	}
 }
 
@@ -223,7 +295,8 @@ func cmdLogout(m *tuiModel, args string) tea.Cmd {
 		return removeSecretCmd(ref)
 	}
 
-	cfg, cat := m.app.config, m.app.catalog
+	cfg, cat := m.app.config.Snapshot(), m.app.catalog
+	binding := m.bindAsyncResult()
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -241,7 +314,7 @@ func cmdLogout(m *tuiModel, args string) tea.Cmd {
 		if len(items) == 0 {
 			return noticeMsg{text: "the " + store.Name() + " holds no switchboard credentials"}
 		}
-		return pickerMsg{
+		return binding.bindPicker(pickerMsg{
 			title: "remove a credential",
 			items: items,
 			action: func(refStr string) tea.Cmd {
@@ -251,30 +324,37 @@ func cmdLogout(m *tuiModel, args string) tea.Cmd {
 				}
 				return removeSecretCmd(ref)
 			},
-		}
+		})
 	}
 }
 
 func removeSecretCmd(ref credential.Ref) tea.Cmd {
+	store := credential.NewOSStore()
+	writer, ok := any(store).(credential.Writer)
+	if !ok {
+		return noticeCmd("error", store.Name()+" stores nothing on this platform")
+	}
+	return removeSecretWithWriterCmd(ref, writer)
+}
+
+func removeSecretWithWriterCmd(ref credential.Ref, writer credential.Writer) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		store := credential.NewOSStore()
-		writer, ok := any(store).(credential.Writer)
-		if !ok {
-			return noticeMsg{level: "error", text: store.Name() + " stores nothing on this platform"}
-		}
 		if err := writer.Delete(ctx, ref); err != nil {
 			if errors.Is(err, credential.ErrNotFound) {
 				return noticeMsg{level: "error", text: "no stored credential for " + ref.String()}
 			}
 			return noticeMsg{level: "error", text: err.Error()}
 		}
-		text := "removed " + ref.String() + " from the " + store.Name()
+		text := "removed " + ref.String() + " from the " + writer.Name()
 		if leftover := environmentStillSupplies(ctx, ref); leftover != "" {
 			text += "; note that " + leftover + " is still set in this environment and takes precedence"
 		}
-		return noticeMsg{text: text}
+		// Clients resolve credentials at construction and probe evidence belongs
+		// to those concrete clients. Update invalidates both on its serialized
+		// event-loop seam before rendering this success.
+		return noticeMsg{text: text, refreshProviders: true}
 	}
 }

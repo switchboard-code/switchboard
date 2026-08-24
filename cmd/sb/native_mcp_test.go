@@ -114,7 +114,7 @@ command = "codex-server"
 func TestNativeMCPCLIRecoversRemovedOptionalCodexActivationWithoutBinary(t *testing.T) {
 	home := t.TempDir()
 	workspace := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateTestHome(t, home)
 	t.Setenv("PATH", filepath.Join(home, "no-binaries"))
 	t.Setenv("CODEX_HOME", "")
 	configPath := filepath.Join(home, ".codex", "config.toml")
@@ -184,7 +184,7 @@ command = "secret-docs-command"
 func TestNativeMCPMissingSnapshotStillFailsRequiredActivation(t *testing.T) {
 	home := t.TempDir()
 	workspace := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateTestHome(t, home)
 	t.Setenv("PATH", filepath.Join(home, "no-binaries"))
 	t.Setenv("CODEX_HOME", "")
 	configPath := filepath.Join(home, ".codex", "config.toml")
@@ -215,7 +215,7 @@ required = true
 func TestNativeMCPRequiredProjectActivationDoesNotApplyToAnotherWorkspace(t *testing.T) {
 	home := t.TempDir()
 	workspaceA, workspaceB := t.TempDir(), t.TempDir()
-	t.Setenv("HOME", home)
+	isolateTestHome(t, home)
 	t.Setenv("PATH", filepath.Join(home, "no-binaries"))
 	t.Setenv("CODEX_HOME", "")
 	statePath := filepath.Join(home, ".switchboard", nativeMCPStateFileName)

@@ -1,12 +1,33 @@
 package eval
 
 import (
+	"context"
+	"errors"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
+
+const (
+	fakeGoHelperEnv = "SWITCHBOARD_EVAL_TEST_FAKE_GO"
+	fakeGoMarkerEnv = "SWITCHBOARD_EVAL_TEST_FAKE_GO_MARKER"
+)
+
+func TestMain(m *testing.M) {
+	if os.Getenv(fakeGoHelperEnv) == "1" {
+		marker := os.Getenv(fakeGoMarkerEnv)
+		if marker == "" || os.WriteFile(marker, []byte("executed"), 0o600) != nil {
+			os.Exit(98)
+		}
+		os.Exit(99)
+	}
+	os.Exit(m.Run())
+}
 
 func repoRoot(t *testing.T) string {
 	t.Helper()
@@ -72,6 +93,338 @@ func TestTheCorpusMeetsTheFloor(t *testing.T) {
 	}
 }
 
+func TestTaskVerifierIgnoresCopiedRepositoryGoOnPATH(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the PATH-shadow executable fixture is a POSIX script")
+	}
+	want, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err = filepath.EvalSymlinks(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := t.TempDir()
+	for name, body := range map[string]string{
+		"go.mod":          "module example.com/switchboard/pathshadow\n\ngo 1.20\n",
+		"fixture.go":      "package fixture\n",
+		"fixture_test.go": "package fixture\n\nimport \"testing\"\n\nfunc TestFixture(t *testing.T) {}\n",
+		"go":              "#!/bin/sh\n: > \"$FAKE_GO_MARKER\"\nexit 99\n",
+	} {
+		mode := os.FileMode(0o644)
+		if name == "go" {
+			mode = 0o755
+		}
+		if err := os.WriteFile(filepath.Join(source, name), []byte(body), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	copy := t.TempDir()
+	task := taskFor(source, spec{id: "path-shadow", pkg: "./"})
+	if err := task.Setup(copy); err != nil {
+		t.Fatalf("copying verifier fixture: %v", err)
+	}
+	marker := filepath.Join(t.TempDir(), "fake-go-ran")
+	t.Setenv("FAKE_GO_MARKER", marker)
+	t.Setenv("PATH", copy+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	solved, detail, err := task.Verify(context.Background(), copy)
+	if err != nil {
+		t.Fatalf("verifying copied repository: %v", err)
+	}
+	if !solved {
+		t.Fatalf("real Go verifier did not pass: %s", detail)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("copied repository's PATH-shadowed go executed; marker stat error = %v", err)
+	}
+	environ, err := verifierGoEnv(source, copy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := verifierGoExecutable(environ, source, copy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Path() != want || !filepath.IsAbs(got.Path()) {
+		t.Fatalf("running Go executable = %q, want absolute %q", got.Path(), want)
+	}
+}
+
+func TestTaskVerifierRejectsLaunchCheckoutGoForDifferentWorkspace(t *testing.T) {
+	realGo, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	realGo, err = filepath.Abs(realGo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realGoCanonical, err := filepath.EvalSymlinks(realGo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trustedBin, err := filepath.EvalSymlinks(filepath.Dir(realGo))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	launchWorkspace := t.TempDir()
+	if err := os.Mkdir(filepath.Join(launchWorkspace, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	launchBin := filepath.Join(launchWorkspace, "bin")
+	if err := os.Mkdir(launchBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeName := "go"
+	if runtime.GOOS == "windows" {
+		fakeName += ".exe"
+	}
+	fakeGo := filepath.Join(launchBin, fakeName)
+	testExecutable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceExecutable, err := os.Open(testExecutable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceExecutable.Close()
+	fakeExecutable, err := os.OpenFile(fakeGo, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(fakeExecutable, sourceExecutable); err != nil {
+		_ = fakeExecutable.Close()
+		t.Fatal(err)
+	}
+	if err := fakeExecutable.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	source := t.TempDir()
+	for name, body := range map[string]string{
+		"go.mod":          "module example.com/switchboard/crossworkspace\n\ngo 1.20\n",
+		"fixture.go":      "package fixture\n",
+		"fixture_test.go": "package fixture\n\nimport \"testing\"\n\nfunc TestFixture(t *testing.T) {}\n",
+	} {
+		if err := os.WriteFile(filepath.Join(source, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	copyDir := t.TempDir()
+	task := taskFor(source, spec{id: "cross-workspace-path-shadow", pkg: "./"})
+	if err := task.Setup(copyDir); err != nil {
+		t.Fatal(err)
+	}
+
+	marker := filepath.Join(t.TempDir(), "fake-go-ran")
+	t.Setenv(fakeGoHelperEnv, "1")
+	t.Setenv(fakeGoMarkerEnv, marker)
+	t.Setenv("PATH", launchBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Chdir(launchWorkspace)
+
+	environ, err := verifierGoEnv(source, copyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var filteredPath string
+	for _, entry := range environ {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok && strings.EqualFold(key, "PATH") {
+			filteredPath = value
+		}
+	}
+	retainedTrustedBin := false
+	for _, directory := range filepath.SplitList(filteredPath) {
+		if directory == launchBin {
+			t.Fatalf("verifier PATH retained launch-checkout directory %q", launchBin)
+		}
+		if directory == trustedBin {
+			retainedTrustedBin = true
+		}
+	}
+	if !retainedTrustedBin {
+		t.Fatalf("verifier PATH %q dropped trusted Go directory %q", filteredPath, trustedBin)
+	}
+	resolved, err := verifierGoExecutable(environ, source, copyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Path() != realGoCanonical {
+		t.Fatalf("verifier Go = %q, want trusted executable %q", resolved.Path(), realGoCanonical)
+	}
+
+	solved, detail, err := task.Verify(context.Background(), copyDir)
+	if err != nil || !solved || detail != "" {
+		t.Fatalf("cross-workspace verifier = solved=%v detail=%q err=%v", solved, detail, err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("launch-checkout Go executed: %v", err)
+	}
+}
+
+func TestTaskVerifierIgnoresHostileAmbientGOROOT(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the hostile Go executable fixture is a POSIX script")
+	}
+	const child = "SB_EVAL_HOSTILE_GOROOT_CHILD"
+	marker := os.Getenv("SB_EVAL_HOSTILE_GOROOT_MARKER")
+	if os.Getenv(child) == "1" {
+		source := t.TempDir()
+		for name, body := range map[string]string{
+			"go.mod":          "module example.com/switchboard/hostilegoroot\n\ngo 1.20\n",
+			"fixture.go":      "package fixture\n",
+			"fixture_test.go": "package fixture\n\nimport \"testing\"\n\nfunc TestFixture(t *testing.T) {}\n",
+		} {
+			if err := os.WriteFile(filepath.Join(source, name), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		copy := t.TempDir()
+		task := taskFor(source, spec{id: "hostile-goroot", pkg: "./"})
+		if err := task.Setup(copy); err != nil {
+			t.Fatal(err)
+		}
+		solved, detail, err := task.Verify(context.Background(), copy)
+		if err != nil || !solved || detail != "" {
+			t.Fatalf("hostile GOROOT verifier = solved=%v detail=%q err=%v", solved, detail, err)
+		}
+		if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+			t.Fatalf("hostile GOROOT Go executable ran: %v", statErr)
+		}
+		return
+	}
+
+	fakeRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(fakeRoot, "bin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker = filepath.Join(t.TempDir(), "hostile-go-ran")
+	fakeGo := "#!/bin/sh\n: > '" + strings.ReplaceAll(marker, "'", "'\"'\"'") + "'\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(fakeRoot, "bin", "go"), []byte(fakeGo), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestTaskVerifierIgnoresHostileAmbientGOROOT$")
+	env := make([]string, 0, len(os.Environ())+3)
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if name != "GOROOT" && name != child && name != "SB_EVAL_HOSTILE_GOROOT_MARKER" {
+			env = append(env, entry)
+		}
+	}
+	cmd.Env = append(env,
+		"GOROOT="+fakeRoot,
+		child+"=1",
+		"SB_EVAL_HOSTILE_GOROOT_MARKER="+marker,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("hostile-GOROOT child: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("hostile GOROOT Go executable ran: %v", err)
+	}
+}
+
+func TestVerifierGoEnvPinsOfflinePolicyAndDropsAmbientToolControls(t *testing.T) {
+	workspace := t.TempDir()
+	external := t.TempDir()
+	t.Setenv("PATH", workspace+string(os.PathListSeparator)+external)
+	t.Setenv("GOFLAGS", "-toolexec="+filepath.Join(workspace, "evil"))
+	t.Setenv("GOTOOLCHAIN", filepath.Join(workspace, "toolchain"))
+	t.Setenv("CC", filepath.Join(workspace, "cc"))
+	t.Setenv("NODE_OPTIONS", "--require="+filepath.Join(workspace, "evil.js"))
+
+	environ, err := verifierGoEnv(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make(map[string][]string)
+	for _, entry := range environ {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok {
+			values[strings.ToUpper(name)] = append(values[strings.ToUpper(name)], value)
+		}
+	}
+	for name, want := range map[string]string{
+		"GOENV": "off", "GOFLAGS": "-count=1", "GOTOOLCHAIN": "local",
+		"GOWORK": "off", "GOPROXY": "off", "GOSUMDB": "off",
+		"GOVCS": "*:off", "CGO_ENABLED": "0",
+	} {
+		if got := values[name]; len(got) != 1 || got[0] != want {
+			t.Errorf("%s = %q, want exactly %q", name, got, want)
+		}
+	}
+	for _, name := range []string{"CC", "NODE_OPTIONS"} {
+		if got := values[name]; len(got) != 0 {
+			t.Errorf("verifier environment retained %s=%q", name, got)
+		}
+	}
+	wantPath, err := filepath.EvalSymlinks(external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := values["PATH"]; len(got) != 1 || got[0] != wantPath {
+		t.Fatalf("verifier PATH = %q, want exactly %q", got, wantPath)
+	}
+}
+
+func TestTaskVerifierDeadlineStopsHangingTestProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("process-group descendant proof is Unix-specific")
+	}
+	source := t.TempDir()
+	for name, body := range map[string]string{
+		"go.mod":          "module example.com/switchboard/hangingverifier\n\ngo 1.20\n",
+		"fixture.go":      "package fixture\n",
+		"fixture_test.go": "package fixture\n\nimport \"testing\"\n\nfunc TestHang(t *testing.T) { select {} }\n",
+	} {
+		if err := os.WriteFile(filepath.Join(source, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dir := t.TempDir()
+	task := taskFor(source, spec{id: "hanging-verifier", pkg: "./"})
+	if err := task.Setup(dir); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	solved, detail, err := task.Verify(ctx, dir)
+	if !errors.Is(err, context.DeadlineExceeded) || solved || detail != "" {
+		t.Fatalf("hanging verifier = solved=%v detail=%q err=%v", solved, detail, err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("hanging verifier returned after %s", elapsed)
+	}
+}
+
+func TestVerifierOutputCapExactAndOneOver(t *testing.T) {
+	out := &verifierOutput{}
+	exact := strings.Repeat("x", maxVerifierOutputBytes)
+	if n, err := out.Write([]byte(exact)); err != nil || n != len(exact) {
+		t.Fatalf("exact write = %d, %v", n, err)
+	}
+	if got, truncated := out.String(); truncated || got != exact {
+		t.Fatalf("exact output = len %d truncated %v", len(got), truncated)
+	}
+	if n, err := out.Write([]byte("y")); err != nil || n != 1 {
+		t.Fatalf("one-over write = %d, %v", n, err)
+	}
+	got, truncated := out.String()
+	if !truncated || len(got) != maxVerifierOutputBytes {
+		t.Fatalf("one-over output = len %d truncated %v", len(got), truncated)
+	}
+	if got[0] != 'x' || got[len(got)-1] != 'y' {
+		t.Fatalf("one-over output head/tail = %q/%q", got[:1], got[len(got)-1:])
+	}
+}
+
 // Every task must break its package and be restored by the obvious fix. A task
 // that passes before it is attempted measures nothing, and one that cannot be
 // fixed measures nothing either.
@@ -96,7 +449,7 @@ func TestTasksBreakWhatTheyClaimAndPassWhenRestored(t *testing.T) {
 				t.Fatalf("setup: %v", err)
 			}
 
-			solved, detail, err := task.Verify(dir)
+			solved, detail, err := task.Verify(context.Background(), dir)
 			if err != nil {
 				t.Fatalf("verify: %v", err)
 			}

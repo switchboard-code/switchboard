@@ -279,9 +279,9 @@ func TestCostCLISaysSoWhenEmpty(t *testing.T) {
 // free money.
 func TestCostTurnsOrdersAsksByBill(t *testing.T) {
 	turns := []session.TurnCost{
-		{Turn: 1, Prompt: "cheap warmup", Calls: 2, Usage: provider.Usage{InputTokens: 900, OutputTokens: 80}},
-		{Turn: 2, Prompt: "the expensive refactor", Calls: 6, Usage: provider.Usage{InputTokens: 40_000, OutputTokens: 2_000}, CostMicroUSD: 840_000},
-		{Turn: 3, Prompt: "a smaller fix", Calls: 3, Usage: provider.Usage{InputTokens: 9_000, OutputTokens: 400}, CostMicroUSD: 310_000},
+		{Turn: 1, Prompt: "cheap warmup", PromptAuthoredKnown: true, Calls: 2, Usage: provider.Usage{InputTokens: 900, OutputTokens: 80}},
+		{Turn: 2, Prompt: "the expensive refactor", PromptAuthoredKnown: true, Calls: 6, Usage: provider.Usage{InputTokens: 40_000, OutputTokens: 2_000}, CostMicroUSD: 840_000},
+		{Turn: 3, Prompt: "a smaller fix", PromptAuthoredKnown: true, Calls: 3, Usage: provider.Usage{InputTokens: 9_000, OutputTokens: 400}, CostMicroUSD: 310_000},
 	}
 	out := strings.Join(costTurnsLines(turns), "\n")
 
@@ -303,11 +303,26 @@ func TestCostTurnsOrdersAsksByBill(t *testing.T) {
 
 func TestCostTurnsLabelsBackgroundBuckets(t *testing.T) {
 	out := strings.Join(costTurnsLines([]session.TurnCost{
-		{Turn: 1, Purpose: session.UsagePurposeTurn, Prompt: "user ask", Calls: 1, CostMicroUSD: 100},
+		{Turn: 1, Purpose: session.UsagePurposeTurn, Prompt: "user ask", PromptAuthoredKnown: true, Calls: 1, CostMicroUSD: 100},
 		{Purpose: session.UsagePurposeAdvisor, Calls: 1, Usage: provider.Usage{InputTokens: 50}, CostMicroUSD: 200},
 	}), "\n")
 	if !strings.Contains(out, "background/advisor") || !strings.Contains(out, "not attributed to a user turn") {
 		t.Fatalf("background work was not explicit:\n%s", out)
+	}
+}
+
+func TestCostTurnsWithholdsUnknownLegacyPromptBytes(t *testing.T) {
+	const expanded = "inspect @private.env EXPANDED_FILE_BYTES INJECTED_TOOL_OUTPUT"
+	out := strings.Join(costTurnsLines([]session.TurnCost{{
+		Turn: 1, Purpose: session.UsagePurposeTurn, Prompt: expanded,
+		PromptAuthoredKnown: false, Calls: 1, CostMicroUSD: 100,
+	}}), "\n")
+	if strings.Contains(out, "private.env") || strings.Contains(out, "EXPANDED_FILE_BYTES") ||
+		strings.Contains(out, "INJECTED_TOOL_OUTPUT") {
+		t.Fatalf("legacy provider-visible content escaped /cost turns:\n%s", out)
+	}
+	if !strings.Contains(out, "authored wording unavailable for this legacy turn") {
+		t.Fatalf("withheld legacy provenance is not explained:\n%s", out)
 	}
 }
 
@@ -350,7 +365,8 @@ func TestReadTurnCostsFoldsUsageOntoItsTurn(t *testing.T) {
 		t.Fatalf("two turns recorded, %d read: %+v", len(turns), turns)
 	}
 	first := turns[0]
-	if first.Calls != 2 || first.Usage.InputTokens != 300 || first.CostMicroUSD != 5_000 || first.Prompt != "first ask" {
+	if first.Calls != 2 || first.Usage.InputTokens != 300 || first.CostMicroUSD != 5_000 ||
+		first.Prompt != "first ask" || !first.PromptAuthoredKnown {
 		t.Errorf("the first turn's metering drifted: %+v", first)
 	}
 	if turns[1].Calls != 1 || turns[1].Usage.InputTokens != 50 {

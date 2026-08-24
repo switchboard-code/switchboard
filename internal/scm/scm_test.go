@@ -10,7 +10,17 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/switchboard-code/switchboard/internal/safeexec"
 )
+
+type testExecutionAuthority bool
+
+func (a testExecutionAuthority) Trusted(string) bool { return bool(a) }
+
+type mutableTestExecutionAuthority struct{ trusted bool }
+
+func (a *mutableTestExecutionAuthority) Trusted(string) bool { return a != nil && a.trusted }
 
 func TestDiscover(t *testing.T) {
 	root := initTestRepo(t)
@@ -19,7 +29,7 @@ func TestDiscover(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	repo, err := Discover(context.Background(), nested)
+	repo, err := Discover(context.Background(), nested, testExecutionAuthority(true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,6 +43,9 @@ func TestDiscover(t *testing.T) {
 }
 
 func TestDiscoverRootContainingNewline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Win32 paths cannot contain newlines")
+	}
 	root := filepath.Join(t.TempDir(), "repo\nroot")
 	if err := os.Mkdir(root, 0o755); err != nil {
 		t.Fatal(err)
@@ -42,7 +55,7 @@ func TestDiscoverRootContainingNewline(t *testing.T) {
 	}
 	gitTest(t, root, "init", "--quiet")
 
-	repo, err := Discover(context.Background(), root)
+	repo, err := Discover(context.Background(), root, testExecutionAuthority(true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +70,7 @@ func TestDiscoverRootContainingNewline(t *testing.T) {
 
 func TestDiscoverUnbornRepository(t *testing.T) {
 	root := initTestRepo(t)
-	repo, err := Discover(context.Background(), root)
+	repo, err := Discover(context.Background(), root, testExecutionAuthority(true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +83,7 @@ func TestDiscoverUnbornRepository(t *testing.T) {
 }
 
 func TestDiscoverNonRepositoryRetainsGitDiagnostic(t *testing.T) {
-	_, err := Discover(context.Background(), t.TempDir())
+	_, err := Discover(context.Background(), t.TempDir(), testExecutionAuthority(true))
 	if !errors.Is(err, ErrNotRepository) {
 		t.Fatalf("error = %v, want ErrNotRepository", err)
 	}
@@ -89,7 +102,7 @@ func TestDiscoverRejectsBareRepository(t *testing.T) {
 	}
 	root := t.TempDir()
 	gitTest(t, root, "init", "--bare", "--quiet")
-	if _, err := Discover(context.Background(), root); !errors.Is(err, ErrNotRepository) {
+	if _, err := Discover(context.Background(), root, testExecutionAuthority(true)); !errors.Is(err, ErrNotRepository) {
 		t.Fatalf("error = %v, want ErrNotRepository", err)
 	}
 }
@@ -102,6 +115,10 @@ func TestStableGitEnv(t *testing.T) {
 		"GIT_LITERAL_PATHSPECS=0",
 		"GIT_DIR=/elsewhere",
 		"GIT_WORK_TREE=/elsewhere",
+		"GIT_EXEC_PATH=/workspace/bin",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0=/workspace/hooks",
 	})
 	values := make(map[string][]string)
 	for _, entry := range env {
@@ -122,10 +139,84 @@ func TestStableGitEnv(t *testing.T) {
 			t.Errorf("%s = %q, want exactly %q", key, got, want)
 		}
 	}
-	for _, key := range []string{"GIT_DIR", "GIT_WORK_TREE"} {
+	for _, key := range []string{
+		"GIT_DIR", "GIT_WORK_TREE", "GIT_EXEC_PATH", "GIT_CONFIG_COUNT",
+		"GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+	} {
 		if got := values[key]; len(got) != 0 {
 			t.Errorf("%s leaked into child environment: %q", key, got)
 		}
+	}
+}
+
+func TestGitEnvShebangCannotDispatchWorkspaceInterpreter(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("env-shebang fixture is Unix-only")
+	}
+	root := t.TempDir()
+	workspaceBin := filepath.Join(root, "workspace-bin")
+	externalBin := filepath.Join(root, "external-bin")
+	if err := os.Mkdir(workspaceBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(externalBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	workspaceMarker := filepath.Join(root, "workspace-interpreter-ran")
+	trustedMarker := filepath.Join(root, "trusted-interpreter-ran")
+	interpreter := "switchboard-test-shell"
+	if err := os.WriteFile(filepath.Join(workspaceBin, interpreter), []byte("#!/bin/sh\n/usr/bin/touch '"+workspaceMarker+"'\nexit 90\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	trusted := "#!/bin/sh\n/usr/bin/touch '" + trustedMarker + "'\nexec /bin/sh \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(externalBin, interpreter), []byte(trusted), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(externalBin, "git"), []byte("#!/usr/bin/env "+interpreter+"\nprintf 'true\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", workspaceBin+string(os.PathListSeparator)+externalBin)
+	git, err := safeexec.ResolveOutside("git", workspaceBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := runGit(context.Background(), git, workspaceBin, 128, "rev-parse", "--is-inside-work-tree")
+	if result.err != nil {
+		t.Fatal(result.commandError("test Git"))
+	}
+	if got := strings.TrimSpace(string(result.stdout)); got != "true" {
+		t.Fatalf("Git output = %q, want true", got)
+	}
+	if _, err := os.Stat(trustedMarker); err != nil {
+		t.Fatalf("trusted external interpreter did not run: %v", err)
+	}
+	if _, err := os.Stat(workspaceMarker); !os.IsNotExist(err) {
+		t.Fatalf("workspace interpreter executed through Git env shebang: %v", err)
+	}
+}
+
+func TestDiscoverRequiresExecutionAuthorityBeforeGitResolution(t *testing.T) {
+	workspace := t.TempDir()
+	t.Setenv("PATH", workspace)
+	_, err := Discover(context.Background(), workspace, testExecutionAuthority(false))
+	if !errors.Is(err, ErrExecutionNotTrusted) {
+		t.Fatalf("error = %v, want ErrExecutionNotTrusted", err)
+	}
+}
+
+func TestRepositoryRechecksRevokedExecutionAuthority(t *testing.T) {
+	root := initTestRepo(t)
+	authority := &mutableTestExecutionAuthority{trusted: true}
+	repo, err := Discover(context.Background(), root, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority.trusted = false
+	if _, err := repo.Status(context.Background()); !errors.Is(err, ErrExecutionNotTrusted) {
+		t.Fatalf("status error = %v, want ErrExecutionNotTrusted", err)
+	}
+	if _, err := repo.DiffHEAD(context.Background(), DiffOptions{}); !errors.Is(err, ErrExecutionNotTrusted) {
+		t.Fatalf("diff error = %v, want ErrExecutionNotTrusted", err)
 	}
 }
 
@@ -162,7 +253,7 @@ func initTestRepo(t *testing.T) string {
 
 func openTestRepo(t *testing.T, root string) *Repository {
 	t.Helper()
-	repo, err := Discover(context.Background(), root)
+	repo, err := Discover(context.Background(), root, testExecutionAuthority(true))
 	if err != nil {
 		t.Fatal(err)
 	}

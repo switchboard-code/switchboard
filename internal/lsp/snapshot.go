@@ -2,10 +2,10 @@ package lsp
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
-	"os"
-	"unicode/utf8"
+
+	workspacefs "github.com/switchboard-code/switchboard/internal/workspace"
 )
 
 // Keeping the raw document below half the frame cap leaves room for JSON
@@ -13,65 +13,49 @@ import (
 // file cannot turn one semantic lookup into unbounded allocation.
 const maxDocumentBytes = maxLSPMessageBytes / 2
 
-// readDocumentSnapshot is the only disk-reader used by document sync. The one
-// returned byte slice feeds both didOpen/didChange and position resolution.
-func readDocumentSnapshot(ctx context.Context, path string) ([]byte, error) {
+// readDocumentSnapshot is the only disk-reader used by document sync. The
+// authority was bound to the exact workspace directory identity before the
+// language server started. Keeping that capability separate from path is what
+// makes retained document names safe: an ancestor replaced by a symlink cannot
+// turn a later workspace/symbol reconciliation into a host-file read.
+//
+// The one returned byte slice feeds both didOpen/didChange and position
+// resolution.
+func readDocumentSnapshot(ctx context.Context, authority *workspacefs.Root, path string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	info, err := os.Stat(path)
+	if authority == nil {
+		return nil, fmt.Errorf("language-server workspace authority is unavailable")
+	}
+	document, err := authority.Read(path, maxDocumentBytes)
 	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file", path)
-	}
-	if info.Size() > maxDocumentBytes {
-		return nil, fmt.Errorf("%s is %d bytes; language-server document limit is %d", path, info.Size(), maxDocumentBytes)
-	}
-
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	opened, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !opened.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s stopped being a regular file before it was read", path)
-	}
-	if !os.SameFile(info, opened) {
-		return nil, fmt.Errorf("%s was replaced before its language-server snapshot was read", path)
-	}
-	if opened.Size() > maxDocumentBytes {
-		return nil, fmt.Errorf("%s is %d bytes; language-server document limit is %d", path, opened.Size(), maxDocumentBytes)
-	}
-
-	data, err := io.ReadAll(io.LimitReader(file, maxDocumentBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > maxDocumentBytes {
-		return nil, fmt.Errorf("%s exceeds the %d-byte language-server document limit", path, maxDocumentBytes)
-	}
-	after, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	current, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !os.SameFile(opened, current) || after.Size() != opened.Size() || !after.ModTime().Equal(opened.ModTime()) {
-		return nil, fmt.Errorf("%s changed while its language-server snapshot was read", path)
+		switch {
+		case errors.Is(err, workspacefs.ErrTooLarge):
+			return nil, fmt.Errorf("%s exceeds the language-server document limit of %d bytes: %w", path, maxDocumentBytes, err)
+		case errors.Is(err, workspacefs.ErrBinary):
+			return nil, fmt.Errorf("%s is not valid UTF-8 text: %w", path, err)
+		}
+		return nil, fmt.Errorf("reading language-server document %s: %w", path, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !utf8.Valid(data) {
-		return nil, fmt.Errorf("%s is not valid UTF-8", path)
+	return document.Content, nil
+}
+
+func (c *Client) readDocumentSnapshot(ctx context.Context, path string) ([]byte, error) {
+	if c == nil {
+		return nil, fmt.Errorf("language-server client is unavailable")
 	}
-	return data, nil
+	if c.documentRootErr != nil {
+		return nil, fmt.Errorf("language-server workspace authority is unavailable: %w", c.documentRootErr)
+	}
+	return readDocumentSnapshot(ctx, c.documentRoot, path)
+}
+
+func documentAuthorityChanged(err error) bool {
+	return errors.Is(err, workspacefs.ErrOutsideRoot) ||
+		errors.Is(err, workspacefs.ErrStaleLocation) ||
+		errors.Is(err, workspacefs.ErrSecureReadUnsupported)
 }

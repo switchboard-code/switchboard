@@ -2,9 +2,28 @@ package execution
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 )
+
+type egressProbeCandidate struct {
+	paths []string
+	args  []string
+}
+
+var systemEgressProbeCandidates = []egressProbeCandidate{
+	{
+		paths: []string{"/usr/bin/curl", "/bin/curl"},
+		args:  []string{"-s", "-m", "3", "http://1.1.1.1", "-o", "/dev/null"},
+	},
+	{
+		paths: []string{"/usr/bin/wget", "/bin/wget"},
+		args:  []string{"-q", "-T", "3", "-O", "/dev/null", "http://1.1.1.1"},
+	},
+	{
+		paths: []string{"/usr/bin/nc", "/bin/nc"},
+		args:  []string{"-z", "-w", "3", "1.1.1.1", "80"},
+	},
+}
 
 // linuxSelfTest proves bubblewrap confines a command on this machine, right
 // now. Unprivileged user namespaces are a kernel configuration that some
@@ -85,7 +104,7 @@ func linuxSelfTest(wrap wrapFunc) (bool, string) {
 			// Say what was not measured. The network namespace is still created
 			// by the kernel and TestNetworkNamespaceFlags covers the policy
 			// mapping, but this host produced no live evidence of it.
-			detail += " (no curl, wget, or nc available, so egress was not exercised)"
+			detail += " (no trusted system curl, wget, or nc available, so egress was not exercised)"
 		}
 	}
 	return ok, detail
@@ -95,13 +114,23 @@ func linuxSelfTest(wrap wrapFunc) (bool, string) {
 // address with no name resolution, so a refusal means the network was blocked
 // rather than DNS being unavailable.
 func egressProbeArgv() []string {
-	for _, c := range [][]string{
-		{"curl", "-s", "-m", "3", "http://1.1.1.1", "-o", "/dev/null"},
-		{"wget", "-q", "-T", "3", "-O", "/dev/null", "http://1.1.1.1"},
-		{"nc", "-z", "-w", "3", "1.1.1.1", "80"},
-	} {
-		if path, err := exec.LookPath(c[0]); err == nil {
-			return append([]string{path}, c[1:]...)
+	return selectEgressProbe(systemEgressProbeCandidates)
+}
+
+func selectEgressProbe(candidates []egressProbeCandidate) []string {
+	for _, candidate := range candidates {
+		for _, path := range candidate.paths {
+			// The sandbox self-test runs before the profile has earned execution
+			// trust. Its probe must therefore be a fixed system executable, never a
+			// checkout-provided PATH shadow.
+			if !filepath.IsAbs(path) {
+				continue
+			}
+			info, err := os.Stat(path)
+			if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+				continue
+			}
+			return append([]string{path}, candidate.args...)
 		}
 	}
 	return nil

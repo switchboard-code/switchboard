@@ -165,3 +165,32 @@ func TestRedReflectsTheLastRun(t *testing.T) {
 		t.Error("still red after a pass")
 	}
 }
+
+func TestObservationDoesNotAdvanceTheBaselineUntilCommitted(t *testing.T) {
+	w, set := scripted(t)
+	set("--- FAIL: TestStaged\n", "1")
+
+	observation := w.Observe(context.Background())
+	if w.Red() {
+		t.Fatal("an uncommitted observation changed the watch baseline")
+	}
+	rep := w.Commit(observation)
+	if !w.Red() || !rep.FirstRun || len(rep.New) != 1 {
+		t.Fatalf("committing the staged observation did not advance exactly once: %+v", rep)
+	}
+}
+
+func TestResetBaselineMakesTheCurrentFailureNewToTheNextConversation(t *testing.T) {
+	w, set := scripted(t)
+	set("--- FAIL: TestAgain\n", "1")
+	w.Run(context.Background())
+	if rep := w.Run(context.Background()); len(rep.New) != 0 || rep.Persisting != 1 {
+		t.Fatalf("precondition: repeated failure was not deduplicated: %+v", rep)
+	}
+
+	w.ResetBaseline()
+	rep := w.Run(context.Background())
+	if !rep.FirstRun || len(rep.New) != 1 || rep.Persisting != 0 {
+		t.Fatalf("reset baseline leaked the prior conversation's delta: %+v", rep)
+	}
+}

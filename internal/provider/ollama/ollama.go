@@ -121,6 +121,7 @@ func (c *Client) Stream(ctx context.Context, target provider.RouteTarget, req pr
 // deliberately crude and flagged inexact so budget checks widen their margin
 // rather than trusting it.
 func (c *Client) CountTokens(_ context.Context, _ provider.RouteTarget, req provider.Request) (provider.TokenEstimate, error) {
+	req = provider.ReplayRequest(req)
 	chars := 0
 	for _, b := range req.System {
 		chars += blockChars(b)
@@ -165,8 +166,11 @@ func (c *Client) Models(ctx context.Context) ([]string, error) {
 	defer resp.Body.Close()
 
 	var tags tagsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
-		return nil, &provider.ProtocolError{Provider: Name, Detail: "decoding /api/tags", Err: err}
+	if err := provider.DecodeBoundedModelList(resp.Body, Name, "decoding /api/tags", "models", &tags); err != nil {
+		return nil, err
+	}
+	if err := validateTags(tags); err != nil {
+		return nil, err
 	}
 	names := make([]string, 0, len(tags.Models))
 	for _, m := range tags.Models {
@@ -190,8 +194,11 @@ func (c *Client) Probe(ctx context.Context, target provider.RouteTarget) (provid
 	defer tagsResp.Body.Close()
 
 	var tags tagsResponse
-	if err := json.NewDecoder(tagsResp.Body).Decode(&tags); err != nil {
-		return res, &provider.ProtocolError{Provider: Name, Detail: "decoding /api/tags", Err: err}
+	if err := provider.DecodeBoundedModelList(tagsResp.Body, Name, "decoding /api/tags", "models", &tags); err != nil {
+		return res, err
+	}
+	if err := validateTags(tags); err != nil {
+		return res, err
 	}
 	res.Reachable = true
 	for _, m := range tags.Models {
@@ -217,9 +224,12 @@ func (c *Client) Probe(ctx context.Context, target provider.RouteTarget) (provid
 	defer showResp.Body.Close()
 
 	var show showResponse
-	if err := json.NewDecoder(showResp.Body).Decode(&show); err != nil {
-		return res, &provider.ProtocolError{Provider: Name, Detail: "decoding /api/show", Err: err}
+	if err := provider.DecodeBoundedJSON(showResp.Body, Name, "decoding /api/show", &show); err != nil {
+		return res, err
 	}
+	// /api/show's capability list is the model's own complete declaration for
+	// this server. Absence of vision here is known text-only, not silence.
+	res.VisionKnown = true
 	for _, capability := range show.Capabilities {
 		switch capability {
 		case "tools":
@@ -237,6 +247,15 @@ func (c *Client) Probe(ctx context.Context, target provider.RouteTarget) (provid
 	}
 	res.ContextWindow, res.WindowEnforced = show.contextWindow()
 	return res, nil
+}
+
+func validateTags(tags tagsResponse) error {
+	for _, model := range tags.Models {
+		if err := provider.ValidateModelID(model.Name); err != nil {
+			return &provider.ProtocolError{Provider: Name, Detail: "validating /api/tags", Err: err}
+		}
+	}
+	return nil
 }
 
 // numCtx reads a num_ctx set in the Modelfile's parameter block. That number
@@ -295,13 +314,13 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) (*htt
 	}
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		raw := provider.ReadAPIErrorBody(resp.Body)
 		msg := strings.TrimSpace(string(raw))
 		var wireErr errorResponse
 		if json.Unmarshal(raw, &wireErr) == nil && wireErr.Error != "" {
 			msg = wireErr.Error
 		}
-		return nil, &provider.APIError{Provider: Name, StatusCode: resp.StatusCode, Body: msg}
+		return nil, &provider.APIError{Provider: Name, StatusCode: resp.StatusCode, Body: provider.SanitizeAPIErrorText(msg)}
 	}
 	return resp, nil
 }
@@ -320,6 +339,7 @@ func (c *Client) buildRequest(target provider.RouteTarget, req provider.Request,
 			Detail:     "Ollama manages its KV cache internally and exposes no breakpoint control",
 		}
 	}
+	req = provider.ReplayRequest(req)
 
 	out := chatRequest{Model: target.ModelID, Stream: stream}
 
@@ -381,7 +401,7 @@ func (c *Client) buildRequest(target provider.RouteTarget, req provider.Request,
 // result to its call through a message-level tool_name rather than through
 // blocks.
 func toWireMessages(target provider.RouteTarget, m provider.Message) ([]wireMessage, error) {
-	if m.Incomplete {
+	if m.Role == provider.RoleAssistant && m.Incomplete {
 		return nil, nil
 	}
 

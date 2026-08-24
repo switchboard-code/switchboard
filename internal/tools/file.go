@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
-	"os"
 	"strings"
 
 	"github.com/switchboard-code/switchboard/internal/permission"
@@ -63,24 +62,31 @@ func (t *readTool) Plan(input json.RawMessage) (Plan, error) {
 }
 
 func (t *readTool) read(abs string, in readInput) (Result, error) {
-	info, err := os.Stat(abs)
-	if err != nil {
-		return errorf("cannot read %s: %v", t.r.display(abs), err)
-	}
-	if info.IsDir() {
-		return errorf("%s is a directory", t.r.display(abs))
-	}
+	return t.readWithHook(abs, in, nil)
+}
 
-	data, err := os.ReadFile(abs)
+func (t *readTool) readWithHook(abs string, in readInput, beforeOpen func()) (Result, error) {
+	root, relative, err := t.r.openResolvedWorkspace(abs)
 	if err != nil {
 		return errorf("cannot read %s: %v", t.r.display(abs), err)
+	}
+	defer root.Close()
+	data, info, err := readRegularWorkspaceFile(root, relative, t.r.display(abs), maxWorkspaceFileBytes, beforeOpen)
+	if err != nil {
+		return errorf("cannot read %s: %v", t.r.display(abs), err)
+	}
+	// A root handle follows its directory across a rename. Revalidate the
+	// canonical workspace pathname after the complete read so bytes from a
+	// root moved outside the workspace cannot become a tool result.
+	if err := t.r.verifyWorkspaceRoot(root); err != nil {
+		return errorf("cannot read %s: workspace changed while it was read", t.r.display(abs))
 	}
 
 	// The hash covers the whole file even when only a slice is returned. A
 	// partial read still tells the agent what version it saw, and a write must
 	// be checked against the file as a whole.
 	current := hashContent(data)
-	t.r.versions.record(abs, current)
+	t.r.versions.record(abs, current, info)
 
 	if len(data) > maxReadBytes && in.Limit == 0 {
 		return errorf("%s is %d bytes, over the %d byte limit for a whole-file read; "+

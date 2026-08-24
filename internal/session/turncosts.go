@@ -8,12 +8,8 @@ package session
 import (
 	"bufio"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"math"
-	"os"
-	"strings"
 
 	"github.com/switchboard-code/switchboard/internal/provider"
 )
@@ -21,8 +17,13 @@ import (
 // TurnCost is one user turn's metering: what its calls consumed, summed
 // from the usage records that rode between its opening and the next.
 type TurnCost struct {
-	Turn   int
-	Prompt string
+	Turn int
+	// Prompt is populated only from an exact durable authored projection.
+	// PromptAuthoredKnown distinguishes an intentionally empty authored prompt
+	// from legacy Content that may contain @file, shell, or harness expansion.
+	Prompt              string
+	PromptAuthoredKnown bool
+	PromptSynthetic     bool
 	// Purpose is "turn" for user turns. Compact, learn, advisor, and
 	// unattributed buckets are explicit background model work and have Turn 0.
 	Purpose      string
@@ -36,7 +37,7 @@ type TurnCost struct {
 // advisor, compaction, or skill-distillation request must never ride the most
 // recent user's bill merely because its record happened to follow that turn.
 func ReadTurnCosts(path string) ([]TurnCost, error) {
-	f, err := os.Open(path)
+	f, err := openPublishedLog(path)
 	if err != nil {
 		return nil, err
 	}
@@ -76,9 +77,11 @@ func ReadTurnCosts(path string) ([]TurnCost, error) {
 		cur.CostMicroUSD = total
 		return nil
 	}
+	lastSeq := 0
+	budget := newReplayBudget(defaultReplayLimits, len(magic)+4)
 	for {
-		rec, _, err := decodeRecord(r)
-		if errors.Is(err, io.EOF) || errors.Is(err, ErrCorruptRecord) {
+		rec, _, err := budget.decode(r, &lastSeq)
+		if isRecoverableRecordEnd(err) {
 			return finish(), nil
 		}
 		if err != nil {
@@ -88,7 +91,11 @@ func ReadTurnCosts(path string) ([]TurnCost, error) {
 			return nil, err
 		} else if ok {
 			if OpensTurn(message) {
-				turns = append(turns, TurnCost{Turn: len(turns) + 1, Prompt: strings.TrimSpace(message.AuthoredText()), Purpose: UsagePurposeTurn})
+				prompt, known, synthetic := authoredTurnPrompt(message)
+				turns = append(turns, TurnCost{
+					Turn: len(turns) + 1, Prompt: prompt, PromptAuthoredKnown: known,
+					PromptSynthetic: synthetic, Purpose: UsagePurposeTurn,
+				})
 			}
 			continue
 		}

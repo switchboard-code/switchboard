@@ -43,6 +43,24 @@ func TestMarkdownStartsAtTheGutter(t *testing.T) {
 	}
 }
 
+func TestMarkdownAsciiProfileEmitsNoANSI(t *testing.T) {
+	previous := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.Ascii)
+	t.Cleanup(func() { lipgloss.SetColorProfile(previous) })
+
+	md := newMarkdown(80, true)
+	lines := md.render("# Heading\n\nSome **bold** and `code`.\n\n```go\nfunc main() {}\n```")
+	joined := strings.Join(lines, "\n")
+	if strings.Contains(joined, "\x1b") {
+		t.Fatalf("ASCII markdown contains an escape sequence: %q", joined)
+	}
+	for _, want := range []string{"Heading", "Some ", "bold", "code", "func main() {}"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("ASCII markdown lost %q: %q", want, joined)
+		}
+	}
+}
+
 func stripANSI(s string) string {
 	var b strings.Builder
 	inSeq := false

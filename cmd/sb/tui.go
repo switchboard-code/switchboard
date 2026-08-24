@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/switchboard-code/switchboard/internal/advisor"
 	"github.com/switchboard-code/switchboard/internal/agent"
@@ -31,6 +32,7 @@ import (
 	"github.com/switchboard-code/switchboard/internal/schedule"
 	"github.com/switchboard-code/switchboard/internal/session"
 	"github.com/switchboard-code/switchboard/internal/skills"
+	"github.com/switchboard-code/switchboard/internal/terminaltext"
 	"github.com/switchboard-code/switchboard/internal/tools"
 	"github.com/switchboard-code/switchboard/internal/trust"
 )
@@ -55,6 +57,18 @@ type toolEndMsg struct {
 type noticeMsg struct {
 	level, text string
 
+	// refreshProviders says a completed external credential mutation changed
+	// what newly constructed adapters will resolve. The worker that touched
+	// the credential store must not rebuild providers itself: reset reads the
+	// live Config and therefore belongs on this event-loop seam.
+	refreshProviders bool
+
+	// after resumes a dialog flow only after this message has been applied.
+	// tea.Sequence executes its next command as soon as the previous command
+	// returns, before Update necessarily handles that command's message; a
+	// credential continuation must observe the provider reset above.
+	after tea.Cmd
+
 	// resumed marks a notice whose flow has already queued what comes next.
 	// A host that advances on every notice would otherwise take a step of its
 	// own alongside the one the flow scheduled.
@@ -71,15 +85,23 @@ type askMsg struct {
 	req     permission.Request
 	out     permission.Outcome
 	respond chan permission.Response
+	token   *dialogToken
 }
+type cancelDialogMsg struct{ token *dialogToken }
 type turnDoneMsg struct {
-	generation uint64
-	err        error
-	after      session.State
+	generation          uint64
+	err                 error
+	after               session.State
+	suppressAutoCompact bool
 }
 type turnPlanMsg struct {
-	generation uint64
-	opening    provider.Message
+	generation      uint64
+	providerRetries int
+	// suppressAutoCompact belongs to exactly this launch. Compaction sets it
+	// on the first queued or synthetic continuation; a failed/cancelled plan
+	// drops it with this message instead of arming a later turn.
+	suppressAutoCompact bool
+	opening             provider.Message
 	// prompt/images are display-only projections kept for UI diagnostics and
 	// tests. Routing and sending use opening exclusively.
 	prompt string
@@ -101,22 +123,36 @@ type tierNowMsg struct {
 	abandoned string
 }
 type tierSwitchMsg struct {
-	tier      config.Tier
-	client    provider.Provider
-	silent    bool   // a /tN override restoring what it borrowed, not a user switch
-	note      string // a fallback substitution, rendered before content is sent
-	err       error
-	operation uint64
-	sourceID  string
+	tier            config.Tier
+	requested       config.Tier
+	client          provider.Provider
+	providerRetries int
+	silent          bool   // a /tN override restoring what it borrowed, not a user switch
+	note            string // a fallback substitution, rendered before content is sent
+	err             error
+	operation       uint64
+	sourceID        string
 }
 type sessionSwapMsg struct {
-	sess     *session.Session
-	tier     config.Tier
-	client   provider.Provider
-	fresh    bool
-	note     string // rendered after the swap; how a fork says where it came from
-	warnNote bool   // a fallback substitution, persisted on the resumed session
-	pinned   bool   // reconstructed durable manual/automatic routing posture
+	sess             *session.Session
+	tier             config.Tier
+	client           provider.Provider
+	providerRetries  int
+	reprobeFallbacks bool // resume may select its configured outage path again after a reset
+	fresh            bool
+	note             string // rendered after the swap; how a fork says where it came from
+	warnNote         bool   // a fallback substitution, persisted on the resumed session
+	pinned           bool   // reconstructed durable manual/automatic routing posture
+
+	// publishAfter is a finalized race alternative. It remains staged until
+	// the primary winner has been bound and published; failure before that
+	// point discards both. Its note suffix is rendered only if this secondary,
+	// non-adoption audit publication succeeds.
+	publishAfter     *session.Session
+	publishAfterNote string
+	// publishDurably is a deterministic fault seam for adoption tests. Runtime
+	// messages leave it nil and call Session.PublishDurably directly.
+	publishDurably durableSessionPublisher
 
 	// preserveRuntimeTarget keeps a process-only /think parameter change out
 	// of a derived session. Ordinary clear/fork/retry/compact operations carry
@@ -139,6 +175,9 @@ type sessionSwapMsg struct {
 	// andThen, when set, runs once the swap has landed — how /retry sends
 	// its replay into the forked session rather than the one it left.
 	andThen tea.Cmd
+	// retry carries the staged file inverse and source label. It is committed
+	// only after the child runtime binding and loop session have both adopted.
+	retry *retryAdoption
 	// continueTurn makes onSessionSwap claim turn-planning ownership before
 	// returning andThen, closing the event-loop gap between bind and replay.
 	continueTurn bool
@@ -155,10 +194,16 @@ type sessionSwapMsg struct {
 	// the work back up, not wait for the user to say "continue" to a model
 	// that already has the summary.
 	continuePrompt string
+	// suppressAutoCompactOnce belongs to the first launch after this swap. A
+	// queued user prompt wins over continuePrompt and consumes it; otherwise
+	// the synthetic continuation does. It is never retained on tuiModel.
+	suppressAutoCompactOnce bool
 }
 type overrideProbeMsg struct {
-	generation uint64
-	opening    provider.Message
+	generation          uint64
+	providerRetries     int
+	suppressAutoCompact bool
+	opening             provider.Message
 	// prompt/images never reconstruct the outbound message; opening is the
 	// single routing and provider value.
 	prompt string
@@ -174,6 +219,7 @@ type updateCheckMsg struct {
 	err    error
 }
 type updateAppliedMsg struct{ version string }
+type tuiStartupReadyMsg struct{}
 type copyMsg struct {
 	n    int
 	what string // "response" or "code block"; the notice names what landed
@@ -189,16 +235,36 @@ type extensionActionMsg struct {
 	sourceID  string
 }
 
-type turnExecution struct {
+// asyncResultBinding ties UI work performed off the event-loop goroutine to
+// both the session and the request that launched it. The generation prevents
+// an older picker in the same session from replacing a newer one; the session
+// identity prevents any result from crossing a resume/fork/compact boundary.
+type asyncResultBinding struct {
 	generation uint64
-	watcher    *watcher
-	advisor    *advisor.Advisor
-	startedOn  config.Tier
-	before     session.State
-	usage      session.UsageCursor
-	started    time.Time
-	decision   *route.Decision
-	features   route.SessionFeatures
+	sessionID  string
+}
+
+type turnExecution struct {
+	generation          uint64
+	suppressAutoCompact bool
+	watcher             *watcher
+	advisor             *advisor.Advisor
+	startedOn           config.Tier
+	before              session.State
+	usage               session.UsageCursor
+	started             time.Time
+	decision            *route.Decision
+	features            route.SessionFeatures
+	retryIntent         string
+	resumeRetry         bool
+}
+
+// primaryTurnRun is the process-lifetime ownership for one launched model
+// turn. Its generation is the same generation carried by turnDoneMsg; done is
+// closed only after every session write owned by runTurn has finished.
+type primaryTurnRun struct {
+	generation uint64
+	done       chan struct{}
 }
 
 func noticeCmd(level, text string) tea.Cmd {
@@ -222,6 +288,16 @@ type tuiModel struct {
 	turnStarted config.Tier
 	turnBefore  session.State
 	queue       []string
+
+	// activeRetryIntent marks the retry continuation that owns planning or
+	// execution. It is cleared with a synced completion/abandon record.
+	activeRetryIntent  string
+	resumeRetryOpening bool
+	// deferredStartup keeps schedulers, advisor startup, update checks, and LSP
+	// polling behind a recovered retry's execution boundary. A started/ambiguous
+	// handoff never releases it; a provably unstarted retry releases it only
+	// after the live turn has durably resolved the intent.
+	deferredStartup func() tea.Cmd
 
 	// Status-line state. The model renders from its own copies rather than
 	// reading loop fields, because the loop's goroutine can be mutating them.
@@ -255,17 +331,27 @@ type tuiModel struct {
 	tokChars int
 	tokAt    time.Time
 
-	history   []string
-	histIdx   int
-	sugSel    int
-	sugClosed bool
+	history      []string
+	histIdx      int
+	histDraft    string
+	histDraftSet bool
+	sugSel       int
+	sugClosed    bool
 
 	// pendingShell holds ! command transcripts awaiting the next turn, and
 	// the mention fields back @path completion (tui_mentions.go).
-	pendingShell  []string
-	mentionSel    int
-	mentionList   []string
-	mentionListAt time.Time
+	pendingShell []string
+	mentionSel   int
+	// mentionList is retained as a small injected inventory for focused tests;
+	// production completion uses mentionResults from the asynchronous shared
+	// workspace index and never walks the checkout on the UI goroutine.
+	mentionList        []string
+	mentionListAt      time.Time
+	mentionResults     []string
+	mentionResultQuery string
+	mentionResultEpoch uint64
+	mentionRequest     uint64
+	mentionLoading     bool
 
 	// routeLog records every tier move this session, for /why. The transcript
 	// scrolls; the question "how did I end up on t3" should not.
@@ -303,22 +389,27 @@ type tuiModel struct {
 	dlg  dialog
 	full fullscreen
 
+	// Every modal enters through one broker. dialogToken identifies an
+	// asynchronous waiter; local pickers use nil. Queued dialogs retain their
+	// own cancellation behavior, so one prompt can never overwrite or strand
+	// another.
+	dialogToken *dialogToken
+	dialogQueue []queuedDialog
+	// resolvingDialog is detached, not cancelled, when its own synchronous
+	// callback commits a session swap. Cancelling it would invoke the selected
+	// action a second time (race verdicts are the concrete case).
+	resolvingDialog dialog
+
 	workspaceRuntime    *workspaceRuntime
 	workspaceGeneration uint64
 	lspGeneration       uint64
-
-	pendingAsk chan permission.Response
-
-	// pendingQuestion is the ask tool's open question, held so a quit can
-	// resolve it as declined: the loop is blocked on this channel, and an
-	// exit that left it hanging would leave the turn unable to end.
-	pendingQuestion chan tools.Answer
 
 	restoreTier      *config.Tier
 	restoreBinding   agent.Binding
 	restoreSticky    route.StickySnapshot
 	restoreStickySet bool
 	lastTitle        string
+	clipboardWrite   func(string)
 	quitArmed        bool
 	quitting         bool
 
@@ -329,6 +420,7 @@ type tuiModel struct {
 	turnCtx        context.Context
 	turnGeneration uint64
 	turnPlanning   bool
+	primaryTurn    *primaryTurnRun
 
 	// An operation owns the same busy/cancel surface as a turn while work that
 	// can replace or materially mutate the session runs off the UI goroutine.
@@ -340,7 +432,18 @@ type tuiModel struct {
 	operationGeneration uint64
 	operationSourceID   string
 	operationName       string
-	initialCmd          tea.Cmd
+	operationOwner      *operationRun
+	trackOperationTasks bool
+
+	// Update publication is independent of turns and session operations, but
+	// the process must not return while it is replacing its own executable.
+	updateOwner *updateTaskOwner
+
+	asyncResultGeneration uint64
+	initialCmd            tea.Cmd
+	startupPublication    *session.Session
+	startupPublicationErr error
+	shutdownErr           error
 }
 
 // runTUI is the Bubble Tea front end: same wiring as the REPL, with the
@@ -415,6 +518,7 @@ func runTUI(
 		budget:      budget,
 		caches:      newCacheSet(tier.Target, loop.Cache),
 		onboarded:   onboarded,
+		lifetime:    newTUILifetime(),
 	}
 	if trustErr != nil {
 		app.trustErr = trustErr.Error()
@@ -422,9 +526,7 @@ func runTUI(
 	// The schedule ledger rides the per-workspace directory the session logs
 	// already live in. A ledger that will not load costs the feature, never
 	// the session: the commands say why, and nothing fires.
-	if dir, err := store.WorkspaceDir(workspace); err != nil {
-		app.schedulesErr = ": " + err.Error()
-	} else if ledger, err := schedule.Open(dir); err != nil {
+	if ledger, err := openWorkspaceSchedule(store, workspace); err != nil {
 		if errors.Is(err, schedule.ErrLocked) {
 			app.schedulesErr = ": another sb process in this workspace holds them"
 		} else {
@@ -452,6 +554,7 @@ func runTUI(
 	p := tea.NewProgram(m, opts...)
 	obs.p = p
 	app.p = p
+	m.trackOperationTasks = true
 	// Subagent rails render through the raw observer, not the watcher:
 	// a delegate's stumbles must never escalate the primary.
 	subagentForward.set(obs)
@@ -459,11 +562,11 @@ func runTUI(
 	// The setting outlives the process, so a rebuilt watcher inherits it.
 	app.watcher.setPaused(!cfg.RouteAutoOn())
 	loop.SetObserver(app.watcher)
-	loop.Asker = &tuiAsker{p: p}
+	loop.Asker = &tuiAsker{p: p, lifetimeDone: app.lifetime.Done()}
 	// The relay was installed as the registry's questioner before the servers
 	// connected; this is the moment it gets something to relay to, because a
 	// dialog needs the running program.
-	questions.set(&tuiQuestioner{p: p})
+	questions.set(&tuiQuestioner{p: p, lifetimeDone: app.lifetime.Done()})
 	// The injection seam is composed once and never swapped: the advisor and
 	// the watch each contribute nothing while off.
 	loop.Inject = app.inject
@@ -495,28 +598,44 @@ func runTUI(
 		m.replayHistory(sess.State())
 	}
 
-	var initial []tea.Cmd
-	if app.lspProblems != nil {
-		initial = append(initial, waitLSPProblems(app.lsp, app.lspProblems))
-	}
-	// The schedule poller starts here and re-arms itself from its handler
-	// until the program ends; a ledger that did not load has nothing to fire
-	// and gets no clock.
-	if app.schedules != nil {
-		initial = append(initial, scheduleTick())
-	}
-	if updateCheck {
-		initial = append(initial, startupUpdate(cfg))
-	}
-	// An advisor slot in the config is the standing request to watch every
-	// session; /advisor off remains the per-session override.
-	if _, bound := cfg.Slots["advisor"]; bound {
-		ctx, generation, sourceID, startErr := m.startOperation("advisor on")
-		if startErr != nil {
-			m.addNotice("error", "advisor could not start: "+startErr.Error())
-		} else {
-			initial = append(initial, startAdvisor(ctx, app, generation, sourceID))
+	backgroundStartup := func() tea.Cmd {
+		var commands []tea.Cmd
+		if app.lspProblems != nil {
+			commands = append(commands, waitLSPProblems(app.lsp, app.lspProblems))
 		}
+		// The schedule poller starts here and re-arms itself from its handler
+		// until the program ends; a ledger that did not load has nothing to fire
+		// and gets no clock.
+		if app.schedules != nil {
+			commands = append(commands, scheduleTick())
+		}
+		if updateCheck {
+			commands = append(commands, m.ownUpdateCmd(startupUpdate(cfg)))
+		}
+		// An advisor slot in the config is the standing request to watch every
+		// session; /advisor off remains the per-session override.
+		if _, bound := cfg.Slots["advisor"]; bound {
+			ctx, generation, sourceID, startErr := m.startOperation("advisor on")
+			if startErr != nil {
+				m.addNotice("error", "advisor could not start: "+startErr.Error())
+			} else {
+				commands = append(commands, m.ownOperationCmd(generation,
+					startAdvisor(ctx, app, generation, sourceID)))
+			}
+		}
+		return tea.Batch(commands...)
+	}
+	var initial []tea.Cmd
+	if m.retryRecoveryExists() {
+		// A retry handoff starts alone. Background commands are released by
+		// onTurnDone only after a provably unstarted replay resolves durably; an
+		// ambiguous/started handoff remains inert until the user decides.
+		m.deferredStartup = backgroundStartup
+		if retryCmd := pendingRetryStartup(m, store); retryCmd != nil {
+			initial = append(initial, retryCmd)
+		}
+	} else if background := backgroundStartup(); background != nil {
+		initial = append(initial, background)
 	}
 	// The tab's title answers "which terminal was that" for a user with six
 	// of them: this workspace, this tier. It goes through syncTitle so the
@@ -526,9 +645,127 @@ func runTUI(
 		initial = append(initial, cmd)
 	}
 	m.initialCmd = tea.Batch(initial...)
+	if sess.PublicationPending() {
+		// Bubble Tea can still fail while opening the terminal. Init returns only
+		// a readiness message; its command cannot execute until input, resize, and
+		// command handlers are live. The first readiness/WindowSize event commits
+		// discovery before any scheduled turn or background durable work starts.
+		m.startupPublication = sess
+	}
 
-	_, err := p.Run()
+	err := runTUIProgram(p, m)
+	// A terminal disconnect or renderer failure can end Bubble Tea without a
+	// key event. Resolve modal waiters here too, after the UI goroutine has
+	// stopped, so no provider or question goroutine is left blocked on exit.
 	return err
+}
+
+type tuiProgram interface {
+	Run() (tea.Model, error)
+}
+
+func runTUIProgram(p tuiProgram, m *tuiModel) error {
+	_, runErr := p.Run()
+	// Program.Send intentionally drops messages after Run stops. Close the
+	// independent lifetime first so an ask that lost that race cannot wait on a
+	// dialog the broker never received.
+	if m != nil && m.app != nil {
+		m.app.lifetime.stop()
+	}
+	// Bubble Tea does not wait for long-running commands when its renderer or
+	// terminal exits. Cancel the model's current turn/operation ownership now;
+	// a final watch derives its verifier context from this cancellation, so it
+	// cannot linger for the full verifier timeout after the TUI has disappeared.
+	var exitingTurn *primaryTurnRun
+	var exitingOperation *operationRun
+	var exitingUpdate *updateTaskOwner
+	var exitingBisect *bisectRun
+	var exitingRace *raceRun
+	if m != nil {
+		exitingTurn = m.primaryTurn
+		exitingOperation = m.operationOwner
+		exitingUpdate = m.updateOwner
+		if exitingUpdate != nil {
+			exitingUpdate.stop()
+		}
+		if m.turnCancel != nil {
+			m.turnCancel()
+		}
+		// Bisect and race execution own independent contexts after their setup
+		// operations hand off. Cancel them explicitly before draining dialogs;
+		// neither is covered by turnCancel once it is running.
+		exitingBisect = m.bisect
+		if exitingBisect != nil && exitingBisect.cancel != nil {
+			exitingBisect.cancelled = true
+			exitingBisect.cancel()
+		}
+		exitingRace = m.race
+		if exitingRace != nil && exitingRace.cancel != nil {
+			exitingRace.cancelled = true
+			exitingRace.cancel()
+		}
+	}
+	// A terminal disconnect or renderer failure can end Bubble Tea without a
+	// key event. Resolve modal waiters here too, after the UI goroutine has
+	// stopped, so no provider or question goroutine is left blocked on exit.
+	if m == nil {
+		return runErr
+	}
+	m.cancelDialogsForExit()
+	// The primary turn owns the active session through its final interrupted
+	// draft, budget settlement, and route record. Cancellation requests an end;
+	// this join proves the end before main's deferred session close can run.
+	m.finishPrimaryTurnForExit(exitingTurn)
+	if exitingOperation != nil {
+		if err := exitingOperation.stopAndWait(); err != nil {
+			m.shutdownErr = errors.Join(m.shutdownErr,
+				fmt.Errorf("cleaning asynchronous operation while the TUI exited: %w", err))
+		}
+		if m.operationOwner == exitingOperation {
+			m.operationOwner = nil
+			m.turnCancel = nil
+			m.turnCtx = nil
+			m.operationActive = false
+			m.operationCancelling = false
+			m.operationSourceID = ""
+			m.operationName = ""
+			m.busy = false
+		}
+	}
+	// Advisor consults are intentionally independent of the primary turn. Stop
+	// and join that lifetime before any exit-only race reconciliation can append
+	// to, adopt, or close a session; otherwise its meter settlement can arrive
+	// after the session owner has returned from the TUI.
+	if m.app != nil {
+		if adv := m.app.currentAdvisor(); adv != nil {
+			if err := adv.StopAndWait(context.Background()); err != nil {
+				m.shutdownErr = errors.Join(m.shutdownErr,
+					fmt.Errorf("stopping advisor while the TUI exited: %w", err))
+			}
+		}
+	}
+	// Cancellation keeps a check that is still downloading out of
+	// publication; joining keeps process exit out of a Windows backup exchange
+	// or Unix rename/fsync boundary that had already begun.
+	if exitingUpdate != nil {
+		exitingUpdate.stopAndWait()
+	}
+	// A bisect's join is a correctness barrier, not ordinary goroutine hygiene:
+	// Runner.Run restores the checkout in its defer. Returning to main before it
+	// finishes could let process exit preserve a historical probe state.
+	m.finishBisectForExit(exitingBisect)
+	m.finishRaceForExit(exitingRace)
+	return errors.Join(m.startupPublicationErr, m.shutdownErr, runErr)
+}
+
+func (m *tuiModel) finishPrimaryTurnForExit(run *primaryTurnRun) {
+	if run == nil {
+		return
+	}
+	<-run.done
+	if m.primaryTurn == run {
+		m.primaryTurn = nil
+	}
 }
 
 // detectDark reads COLORFGBG, whose last field is the background color index.
@@ -581,11 +818,13 @@ func newTUIModel(app *tuiApp, th *theme, md *markdown, ta textarea.Model) *tuiMo
 	if app.watchSt == nil {
 		app.watchSt = &watchState{}
 	}
+	custom, customNotes := loadCustomCommandsWithNotes(app.workspace)
 	app.runtimeMu.Lock()
 	if app.runtimeTier.ID == "" {
 		app.runtimeTier = app.tier
 	}
 	app.runtimeMu.Unlock()
+	historyMigrationErr := migrateWorkspaceHistory(app.store, app.workspace)
 	m := &tuiModel{
 		app:              app,
 		th:               th,
@@ -595,66 +834,175 @@ func newTUIModel(app *tuiApp, th *theme, md *markdown, ta textarea.Model) *tuiMo
 		tierLine:         app.tierLine(),
 		mode:             app.loop.Perms.Mode(),
 		history:          loadHistory(app.workspace),
-		custom:           loadCustomCommands(app.workspace),
+		custom:           custom,
 		sessionAt:        time.Now(),
 		workspaceRuntime: newWorkspaceRuntime(app.workspace),
+		clipboardWrite:   writeClipboard,
+		updateOwner:      newUpdateTaskOwner(),
 	}
 	m.histIdx = len(m.history)
 	m.tr = newTranscript(100, th, md)
+	m.tr.onChange = func() {
+		if m.trSearch {
+			m.rescanTranscript()
+		}
+	}
+	if historyMigrationErr != nil {
+		m.addNotice("warn", "prompt history migration was refused; existing files were left unchanged: "+historyMigrationErr.Error())
+	}
+	for _, note := range customNotes {
+		m.addNotice("warn", note)
+	}
 	m.refreshCost(app.loop.Session.State())
 	m.refreshCtxWindow()
 	return m
 }
 
-// initialCmd is set by runTUI before the program starts; Init hands it to tea.
-func (m *tuiModel) Init() tea.Cmd { return m.initialCmd }
+// initialCmd is set by runTUI before the program starts. A fresh staged session
+// first returns only a readiness message: Bubble Tea does not execute commands
+// until terminal input and event handlers are initialized, so a startup error
+// before that point leaves the stage undiscoverable.
+func (m *tuiModel) Init() tea.Cmd {
+	if m.startupPublication != nil {
+		return func() tea.Msg { return tuiStartupReadyMsg{} }
+	}
+	return m.takeInitialCmd()
+}
+
+func (m *tuiModel) takeInitialCmd() tea.Cmd {
+	cmd := m.initialCmd
+	m.initialCmd = nil
+	return cmd
+}
+
+func (m *tuiModel) finishStartupPublication() tea.Cmd {
+	if m.startupPublication == nil {
+		return m.takeInitialCmd()
+	}
+	if err := publishSessionDurably(m.startupPublication, "initialized TUI session"); err != nil {
+		// PublishDurably clears pending state for a marker that is already
+		// visible, even when its persistence barrier failed. Drop our staging
+		// pointer in that case so shutdown can never mistake adoption for a log
+		// it may discard.
+		if !m.startupPublication.PublicationPending() {
+			m.startupPublication = nil
+		}
+		m.startupPublicationErr = err
+		m.quitting = true
+		return tea.Quit
+	}
+	m.startupPublication = nil
+	return m.takeInitialCmd()
+}
 
 func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if result, ok := msg.(operationTaskResultMsg); ok {
+		if m.quitting || m.startupPublicationErr != nil || m.startupPublication != nil {
+			if err := result.task.owner.discard(result.task); err != nil {
+				m.shutdownErr = errors.Join(m.shutdownErr,
+					fmt.Errorf("cleaning an undeliverable asynchronous operation result: %w", err))
+			}
+			if m.quitting || m.startupPublicationErr != nil {
+				return m, tea.Quit
+			}
+			return m, nil
+		}
+		inner, claimed := m.claimOperationResult(result)
+		if !claimed {
+			return m, nil
+		}
+		msg = inner
+		if msg == nil {
+			owner := result.task.owner
+			current := m.operationMatches(owner.generation, owner.sourceID)
+			m.finishOperation(owner.generation, false)
+			if !current {
+				return m, nil
+			}
+			return m, m.nextQueuedTurn()
+		}
+	}
+	// A fatal adoption/publication boundary closes the authoritative session
+	// handles before returning tea.Quit. Bubble Tea may already have another
+	// input or async result queued ahead of that command's QuitMsg; once shutdown
+	// is armed, no such message may start or append work against the closed child.
+	if m.quitting {
+		return m, tea.Quit
+	}
+	if m.startupPublicationErr != nil {
+		return m, tea.Quit
+	}
+	if m.startupPublication != nil {
+		switch msg := msg.(type) {
+		case tuiStartupReadyMsg:
+			return m, m.finishStartupPublication()
+		case tea.WindowSizeMsg:
+			m.width, m.height = msg.Width, msg.Height
+			m.tr.setWidth(msg.Width)
+			m.ta.SetWidth(max(msg.Width-6, 1))
+			m.growInput()
+			return m, tea.Batch(m.finishStartupPublication(), m.syncTitle())
+		default:
+			// User input and asynchronous startup results cannot cross the
+			// publication boundary. Init work is deliberately still withheld.
+			return m, nil
+		}
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.tr.setWidth(msg.Width)
-		m.ta.SetWidth(msg.Width - 6) // margin, frame, and padding
+		// Flat-row coordinates change when prose rewraps. An active drag cannot
+		// be mapped soundly across that shape change, while search can rebuild
+		// its exact coordinates from the searchable mirror.
+		m.tr.clearSelect()
+		if m.trSearch {
+			m.rescanTranscript()
+		}
+		m.ta.SetWidth(max(msg.Width-6, 1)) // margin, frame, and padding
 		// A narrower pane rewraps what is already typed, so the prompt has to
 		// be resized against the new width rather than the one it grew under.
 		m.growInput()
 		return m, m.syncTitle()
 
 	case tea.MouseMsg:
+		// A newly-arrived approval or model question must preempt a panel that
+		// was opened earlier. The loop is blocked on the modal's answer; routing
+		// mouse input into the hidden panel would strand it indefinitely.
+		if m.dlg != nil {
+			return m, nil
+		}
 		if m.full != nil {
 			return m, m.full.mouse(msg)
 		}
-		switch msg.Button {
-		case tea.MouseButtonWheelUp:
+		switch {
+		case msg.Button == tea.MouseButtonWheelUp:
 			m.tr.scrollBy(3)
-		case tea.MouseButtonWheelDown:
+		case msg.Button == tea.MouseButtonWheelDown:
 			m.tr.scrollBy(-3)
-		case tea.MouseButtonLeft:
-			if m.dlg != nil {
-				return m, nil
-			}
-			switch msg.Action {
-			case tea.MouseActionPress:
-				// A press starts a possible selection; whether it becomes one
-				// or stays a click is the motion's call.
-				m.tr.beginSelect(m.tr.lineAt(msg.Y))
-			case tea.MouseActionMotion:
-				m.tr.extendSelect(m.tr.lineAt(msg.Y))
-			case tea.MouseActionRelease:
-				if m.tr.selOn && m.tr.selMoved {
-					cmd := m.copySelection()
-					m.tr.clearSelect()
-					return m, cmd
-				}
+		case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
+			// A press starts a possible selection; whether it becomes one
+			// or stays a click is the motion's call.
+			m.tr.beginSelect(m.tr.lineAt(msg.Y))
+		case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionMotion:
+			m.tr.extendSelect(m.tr.lineAt(msg.Y))
+		case msg.Action == tea.MouseActionRelease &&
+			(msg.Button == tea.MouseButtonLeft || msg.Button == tea.MouseButtonNone):
+			// X10 reports releases as ButtonNone while SGR retains the
+			// released button. Action is the stable fact across both encodings.
+			if m.tr.selOn && m.tr.selMoved {
+				cmd := m.copySelection()
 				m.tr.clearSelect()
-				// A click on a tool rail or a route line toggles it, the same
-				// toggle ctrl+o applies to the most recent one: the transcript
-				// is directly manipulable where it has something to show.
-				if i := m.tr.entryAt(msg.Y); i >= 0 {
-					if e := m.tr.entries[i]; e.kind == kindTool || e.kind == kindRoute {
-						e.expanded = !e.expanded
-						m.tr.invalidate(i)
-					}
+				return m, cmd
+			}
+			m.tr.clearSelect()
+			// A click on a tool rail or a route line toggles it, the same
+			// toggle ctrl+o applies to the most recent one: the transcript
+			// is directly manipulable where it has something to show.
+			if i := m.tr.entryAt(msg.Y); i >= 0 {
+				if e := m.tr.entries[i]; e.kind == kindTool || e.kind == kindRoute {
+					e.expanded = !e.expanded
+					m.tr.invalidate(i)
 				}
 			}
 		}
@@ -685,11 +1033,14 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case noticeMsg:
+		if msg.refreshProviders && m.app.providers != nil {
+			m.app.providers.reset()
+		}
 		if msg.operation != 0 {
-			return m, m.onOperationNotice(msg)
+			return m, tea.Sequence(m.onOperationNotice(msg), msg.after)
 		}
 		m.addNotice(msg.level, msg.text)
-		return m, nil
+		return m, msg.after
 
 	case auditReportMsg:
 		return m, m.onAuditReport(msg)
@@ -697,6 +1048,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case watchReportMsg:
 		m.onWatchReport(msg)
 		return m, nil
+
+	case turnEndWatchDoneMsg:
+		return m, m.onTurnEndWatchDone(msg)
 
 	case scheduleTickMsg:
 		return m, m.fireScheduled()
@@ -738,30 +1092,38 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case askMsg:
-		m.pendingAsk = msg.respond
-		m.dlg = newPermissionDialog(msg.req, msg.out, msg.respond)
+		m.openDialogFor(newPermissionDialog(msg.req, msg.out, msg.respond), msg.token)
 		m.ring()
 		return m, nil
 
+	case cancelDialogMsg:
+		return m, m.cancelDialogToken(msg.token)
+
 	case questionMsg:
-		if m.dlg != nil {
-			// Something already owns the input zone. The ask tool cannot
-			// overlap itself, but an MCP server may elicit at any moment, and
-			// replacing a permission prompt with a question would strand the
-			// answer the loop is blocked on. Closing the channel says nobody
-			// could be asked, which is the truth and is not the same as the
-			// user declining.
-			close(msg.respond)
-			return m, nil
-		}
-		m.pendingQuestion = msg.respond
-		m.dlg = newQuestionDialog(msg.q, msg.respond)
+		m.openDialogFor(newQuestionDialog(msg.q, msg.respond), msg.token)
 		m.ring()
 		return m, nil
 
 	case pickerMsg:
-		m.dlg = &pickerDialog{title: msg.title, items: msg.items, onPick: msg.action}
+		if !m.asyncResultMatches(msg.generation, msg.sessionID) {
+			return m, nil
+		}
+		action := msg.action
+		if action != nil {
+			action = func(id string) tea.Cmd {
+				if !m.asyncResultMatches(msg.generation, msg.sessionID) {
+					return noticeCmd("warn", "that picker is no longer current; reopen it after the running work finishes")
+				}
+				return msg.action(id)
+			}
+		}
+		m.openDialog(&pickerDialog{
+			title: msg.title, items: msg.items, sel: -1, requireSelection: true, onPick: action,
+		})
 		return m, nil
+
+	case mentionMatchesMsg:
+		return m, m.onMentionMatches(msg)
 
 	case workspaceOpenedMsg:
 		return m, m.onWorkspaceOpened(msg)
@@ -783,13 +1145,11 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.onWorkspaceEditorDone(msg)
 
 	case workspaceInvalidatedMsg:
-		if m.workspaceRuntime != nil {
-			m.workspaceRuntime.invalidate()
-		}
-		if view, ok := m.full.(*lspView); ok {
-			view.stale = true
-		}
-		return m, nil
+		// Workspace-derived async results share this generation. Advancing it
+		// rejects a /diff or source load that started before the just-completed
+		// tool batch, even when it returns after the durable result message.
+		invalidateRestoredWorkspace(m)
+		return m, m.refreshMentionMatches()
 
 	case lspLoadedMsg:
 		return m, m.onLSPLoaded(msg)
@@ -811,17 +1171,31 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.onWorkflowDone(msg)
 
 	case textPromptMsg:
-		m.dlg = newTextDialog(msg)
+		if !m.asyncResultMatches(msg.generation, msg.sessionID) {
+			return m, nil
+		}
+		submit := msg.submit
+		if submit != nil {
+			msg.submit = func(value string) tea.Cmd {
+				if !m.asyncResultMatches(msg.generation, msg.sessionID) {
+					return noticeCmd("warn", "that prompt is no longer current; reopen it after the running work finishes")
+				}
+				return submit(value)
+			}
+		}
+		m.openDialog(newTextDialog(msg))
 		return m, nil
 
 	case secretPromptMsg:
-		m.dlg = newSecretDialog(msg.ref, msg.storeName, func(value string) tea.Cmd {
-			store := storeSecretCmd(m.app.providers, msg.ref, msg.writer, msg.storeName, value)
-			if msg.then != nil {
-				return tea.Sequence(store, msg.then)
+		if !m.asyncResultMatches(msg.generation, msg.sessionID) {
+			return m, nil
+		}
+		m.openDialog(newSecretDialog(msg.ref, msg.storeName, func(value string) tea.Cmd {
+			if !m.asyncResultMatches(msg.generation, msg.sessionID) {
+				return noticeCmd("warn", "that credential prompt is no longer current; reopen it after the running work finishes")
 			}
-			return store
-		})
+			return storeSecretCmd(msg.ref, msg.writer, msg.storeName, value, msg.then)
+		}))
 		return m, nil
 
 	case turnDoneMsg:
@@ -943,7 +1317,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.onRaceArmDone(msg)
 
 	case expandedCustomMsg:
-		return m, m.enqueue(msg.prompt, "")
+		if !m.asyncResultMatches(msg.generation, msg.sessionID) {
+			return m, nil
+		}
+		return m, m.startExpandedTurn(msg.prompt, msg.authored)
 
 	case advisorReadyMsg:
 		return m, m.onAdvisorReady(msg)
@@ -961,34 +1338,31 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // key routes one keypress. Dialogs and the fullscreen panel get first claim;
 // what remains goes to the input area.
 func (m *tuiModel) key(msg tea.KeyMsg) tea.Cmd {
+	if m.dlg != nil {
+		// Ctrl-C drains every active and queued modal through its own safe
+		// cancellation path. If the prompt belonged to a running turn, the
+		// interrupt then cancels that turn too; a local picker merely closes.
+		if msg.String() == "ctrl+c" {
+			wasBusy := m.busy || m.turnPlanning || m.operationActive
+			cleanup := m.cancelDialogs()
+			if wasBusy && (m.busy || m.turnPlanning || m.operationActive) {
+				return tea.Batch(cleanup, m.interrupt())
+			}
+			return cleanup
+		}
+		active := m.dlg
+		m.resolvingDialog = active
+		done, cmd := active.update(msg, m.th)
+		m.resolvingDialog = nil
+		if done && m.dlg == active {
+			m.completeDialog()
+		}
+		return cmd
+	}
 	if m.full != nil {
 		close, cmd := m.full.key(msg)
 		if close {
 			m.closeFullscreen()
-		}
-		return cmd
-	}
-	if m.dlg != nil {
-		// A modal may not swallow the interrupt. Every dialog here returns
-		// before the ctrl+c case below, so a user facing an approval they do
-		// not want to grant — a subagent's, most often, since those arrive
-		// unbidden — had no way out of the turn that raised it. Answering no
-		// on the way past is what makes this safe rather than abrupt: the
-		// loop is waiting on that channel and would otherwise block.
-		if msg.String() == "ctrl+c" {
-			if m.pendingAsk != nil {
-				m.pendingAsk <- permission.Response{}
-			}
-			m.dlg = nil
-			m.pendingAsk = nil
-			m.pendingQuestion = nil
-			return m.interrupt()
-		}
-		done, cmd := m.dlg.update(msg, m.th)
-		if done {
-			m.dlg = nil
-			m.pendingAsk = nil
-			m.pendingQuestion = nil
 		}
 		return cmd
 	}
@@ -1000,6 +1374,7 @@ func (m *tuiModel) key(msg tea.KeyMsg) tea.Cmd {
 		m.transcriptSearchKey(msg)
 		return nil
 	}
+	composerEditing := m.ta.Value() != ""
 
 	switch msg.String() {
 	case "ctrl+c":
@@ -1008,6 +1383,9 @@ func (m *tuiModel) key(msg tea.KeyMsg) tea.Cmd {
 		m.startHistorySearch()
 		return nil
 	case "ctrl+f":
+		if composerEditing {
+			break
+		}
 		m.startTranscriptSearch()
 		return nil
 	case "esc":
@@ -1058,18 +1436,30 @@ func (m *tuiModel) key(msg tea.KeyMsg) tea.Cmd {
 	case "ctrl+s":
 		return m.steerKey()
 	case "ctrl+u":
+		if composerEditing {
+			break
+		}
 		m.tr.scrollBy(m.pageSize() / 2)
 		return nil
 	case "ctrl+d":
+		if composerEditing {
+			break
+		}
 		m.tr.scrollBy(-m.pageSize() / 2)
 		return nil
 	case "home":
+		if composerEditing {
+			break
+		}
 		// The endpoints of the scroll story: home is the session's opening,
 		// end is where the work is. Both are one press because reaching
 		// either by page is a chore proportional to the day's length.
 		m.tr.scrollBy(len(m.tr.flat))
 		return nil
 	case "end":
+		if composerEditing {
+			break
+		}
 		m.tr.scrollToBottom()
 		return nil
 	case "alt+1", "alt+2", "alt+3", "alt+4", "alt+5", "alt+6", "alt+7", "alt+8", "alt+9":
@@ -1085,6 +1475,21 @@ func (m *tuiModel) key(msg tea.KeyMsg) tea.Cmd {
 			return noticeCmd("warn", "a turn is running; esc to interrupt it first")
 		}
 		return m.switchTier(m.app.config.Tiers[idx].ID)
+	}
+
+	// Once history traversal has captured a live draft, its arrows keep their
+	// meaning even if the recalled entry is multiline or happens to open a
+	// slash/mention completion popup. Editing or accepting a completion resets
+	// traversal and returns the arrows to the composer or popup immediately.
+	if m.histDraftSet {
+		switch msg.String() {
+		case "up":
+			m.historyMove(-1)
+			return nil
+		case "down":
+			m.historyMove(1)
+			return nil
+		}
 	}
 
 	if m.suggestionsVisible() {
@@ -1134,28 +1539,195 @@ func (m *tuiModel) key(msg tea.KeyMsg) tea.Cmd {
 		if v := m.ta.Value(); strings.HasSuffix(v, "\\") {
 			m.ta.SetValue(strings.TrimSuffix(v, "\\") + "\n")
 			m.ta.CursorEnd()
+			m.resetHistoryNavigation()
 			m.growInput()
 			return nil
 		}
 		return m.submit()
 	case "up":
-		if !strings.Contains(m.ta.Value(), "\n") {
+		if !m.composerMultiline() {
 			m.historyMove(-1)
 			return nil
 		}
 	case "down":
-		if !strings.Contains(m.ta.Value(), "\n") {
+		if !m.composerMultiline() {
 			m.historyMove(1)
 			return nil
 		}
+	case "left", "ctrl+b", "right", "ctrl+f":
+		if cmd, moved := m.moveComposerGrapheme(msg.String() == "left" || msg.String() == "ctrl+b"); moved {
+			return cmd
+		}
+	case "backspace", "ctrl+h", "delete", "ctrl+d":
+		if cmd, changed := m.deleteComposerGrapheme(msg.String() == "backspace" || msg.String() == "ctrl+h"); changed {
+			m.resetHistoryNavigation()
+			m.sugClosed = false
+			m.sugSel = 0
+			m.growInput()
+			return tea.Batch(cmd, m.refreshMentionMatches())
+		}
 	}
 
+	before := m.ta.Value()
 	var cmd tea.Cmd
 	m.ta, cmd = m.ta.Update(msg)
+	if m.ta.Value() != before {
+		m.resetHistoryNavigation()
+	}
 	m.sugClosed = false
 	m.sugSel = 0
 	m.growInput()
-	return cmd
+	return tea.Batch(cmd, m.refreshMentionMatches())
+}
+
+// moveComposerGrapheme keeps the cursor on extended-grapheme boundaries. At a
+// logical line boundary it defers to textarea so its newline crossing remains
+// intact; within a line, one left/right press traverses one painted character
+// even when Bubbles represents that character as several runes.
+func (m *tuiModel) moveComposerGrapheme(left bool) (tea.Cmd, bool) {
+	lines := strings.Split(m.ta.Value(), "\n")
+	row := m.ta.Line()
+	if row < 0 || row >= len(lines) {
+		return nil, false
+	}
+	info := m.ta.LineInfo()
+	column := info.StartColumn + info.ColumnOffset
+	target, ok := graphemeCursorTarget(lines[row], column, left)
+	if !ok {
+		return nil, false
+	}
+
+	key := tea.KeyRight
+	steps := target - column
+	if left {
+		key = tea.KeyLeft
+		steps = column - target
+	}
+	var commands []tea.Cmd
+	for range steps {
+		var cmd tea.Cmd
+		m.ta, cmd = m.ta.Update(tea.KeyMsg{Type: key})
+		if cmd != nil {
+			commands = append(commands, cmd)
+		}
+	}
+	return tea.Batch(commands...), true
+}
+
+func graphemeCursorTarget(line string, column int, left bool) (int, bool) {
+	boundaries := graphemeBoundaries(line)
+	last := boundaries[len(boundaries)-1]
+	column = min(max(column, 0), last)
+	if left {
+		if column == 0 {
+			return 0, false
+		}
+		for i := 1; i < len(boundaries); i++ {
+			if column <= boundaries[i] {
+				return boundaries[i-1], true
+			}
+		}
+	} else {
+		if column == last {
+			return last, false
+		}
+		for i := 1; i < len(boundaries); i++ {
+			if column < boundaries[i] {
+				return boundaries[i], true
+			}
+		}
+	}
+	return column, false
+}
+
+// deleteComposerGrapheme makes Backspace/Delete operate on what the terminal
+// paints as one character. Bubbles stores and moves by rune, so a cursor can
+// land inside a combining or ZWJ sequence; in that case the whole containing
+// cluster is removed, never a dangling mark, modifier, or joiner.
+func (m *tuiModel) deleteComposerGrapheme(backward bool) (tea.Cmd, bool) {
+	lines := strings.Split(m.ta.Value(), "\n")
+	row := m.ta.Line()
+	if row < 0 || row >= len(lines) {
+		return nil, false
+	}
+	info := m.ta.LineInfo()
+	column := info.StartColumn + info.ColumnOffset
+	start, end, ok := graphemeDeletionRange(lines[row], column, backward)
+	if !ok {
+		// At a logical line boundary, let textarea retain its newline-merge
+		// behavior rather than treating the newline as part of a grapheme.
+		return nil, false
+	}
+
+	var commands []tea.Cmd
+	for range end - column {
+		var cmd tea.Cmd
+		m.ta, cmd = m.ta.Update(tea.KeyMsg{Type: tea.KeyDelete})
+		if cmd != nil {
+			commands = append(commands, cmd)
+		}
+	}
+	for range column - start {
+		var cmd tea.Cmd
+		m.ta, cmd = m.ta.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		if cmd != nil {
+			commands = append(commands, cmd)
+		}
+	}
+	return tea.Batch(commands...), true
+}
+
+func graphemeDeletionRange(line string, column int, backward bool) (int, int, bool) {
+	boundaries := graphemeBoundaries(line)
+	last := boundaries[len(boundaries)-1]
+	column = min(max(column, 0), last)
+	if backward {
+		if column == 0 {
+			return 0, 0, false
+		}
+		for i := 1; i < len(boundaries); i++ {
+			if column <= boundaries[i] {
+				return boundaries[i-1], boundaries[i], true
+			}
+		}
+	} else {
+		if column == last {
+			return 0, 0, false
+		}
+		for i := 1; i < len(boundaries); i++ {
+			if column < boundaries[i] {
+				return boundaries[i-1], boundaries[i], true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// graphemeBoundaries returns rune offsets, the coordinate textarea exposes.
+// ansi's segmenter is already the renderer's Unicode boundary authority, so
+// editing and cell-aware truncation cannot disagree about cluster shape.
+func graphemeBoundaries(s string) []int {
+	boundaries := []int{0}
+	runeOffset := 0
+	for remaining := s; remaining != ""; {
+		cluster, _ := ansi.FirstGraphemeCluster(remaining, ansi.GraphemeWidth)
+		if cluster == "" {
+			// Defensive progress for malformed input; a Go string may contain an
+			// invalid byte even though ordinary terminal input is valid UTF-8.
+			cluster = remaining[:1]
+		}
+		runeOffset += len([]rune(cluster))
+		boundaries = append(boundaries, runeOffset)
+		remaining = remaining[len(cluster):]
+	}
+	return boundaries
+}
+
+// composerMultiline includes soft wrapping: a long paragraph is visibly more
+// than one line even if the user never inserted a newline, so its arrow keys
+// belong to the editor rather than prompt history.
+func (m *tuiModel) composerMultiline() bool {
+	return strings.Contains(m.ta.Value(), "\n") || inputRows(m.ta) > 1
 }
 
 func (m *tuiModel) pageSize() int {
@@ -1200,32 +1772,34 @@ func (m *tuiModel) interrupt() tea.Cmd {
 			// Invalidate the async result before freeing the prompt. A provider
 			// probe is allowed to return after cancellation; its old generation
 			// must never bind a target or launch a model call.
+			if err := m.resolveActiveRetryIntent(); err != nil {
+				return m.stopAfterRetryIntentResolutionFailure(err, context.Canceled)
+			}
 			m.turnGeneration++
 			m.turnPlanning = false
 			m.busy = false
 			m.turnCancel = nil
 			m.turnCtx = nil
 			m.addNotice("", "routing cancelled; nothing was sent")
-			return m.nextQueuedTurn()
+			if m.retryRecoveryExists() {
+				m.addNotice("warn", retryRecoveryGuardText)
+				return nil
+			}
+			return m.releaseDeferredStartup(m.nextQueuedTurn)
 		}
 		m.addNotice("", "cancelling the turn; the session stays resumable")
 		return nil
 	}
 	if m.ta.Value() != "" {
 		m.ta.Reset()
+		m.resetHistoryNavigation()
 		m.growInput()
 		m.quitArmed = false
 		return nil
 	}
 	if m.quitArmed {
-		if m.pendingAsk != nil {
-			m.pendingAsk <- permission.Response{}
-		}
-		if m.pendingQuestion != nil {
-			m.pendingQuestion <- tools.Answer{Declined: true}
-		}
-		m.quitting = true
-		return tea.Quit
+		cleanup := m.cancelDialogsForExit()
+		return tea.Sequence(cleanup, tea.Quit)
 	}
 	m.quitArmed = true
 	m.addNotice("", "ctrl-c again to exit")
@@ -1239,17 +1813,20 @@ func (m *tuiModel) submit() tea.Cmd {
 	if v == "" {
 		return nil
 	}
+	if m.retryRecoveryExists() && strings.HasPrefix(v, "!") {
+		return noticeCmd("warn", retryRecoveryGuardText)
+	}
+	if m.retryRecoveryBlocksNewWork() && !strings.HasPrefix(v, "/") {
+		return noticeCmd("warn", retryRecoveryGuardText)
+	}
 	m.ta.Reset()
 	m.growInput()
 	m.sugClosed = false
 	m.sugSel = 0
-	// Consecutive duplicates collapse: resubmitting "go on" five times is one
-	// history entry, not five up-arrow presses of the same thing.
-	if len(m.history) == 0 || m.history[len(m.history)-1] != v {
-		m.history = append(m.history, v)
-		appendHistory(m.app.workspace, v)
-	}
-	m.histIdx = len(m.history)
+	// Consecutive duplicates collapse, and recognized credentials are redacted
+	// before either the in-memory or durable history sees them. The outbound
+	// gate below governs the provider and session copy, not prompt history.
+	m.rememberPrompt(v)
 	m.quitArmed = false
 
 	if strings.HasPrefix(v, "!") {
@@ -1265,6 +1842,9 @@ func (m *tuiModel) submit() tea.Cmd {
 // counts as running: a turn whose route is still being probed is a turn about
 // to exist, and a second start would race it.
 func (m *tuiModel) enqueue(prompt, override string) tea.Cmd {
+	if m.retryRecoveryBlocksNewWork() {
+		return noticeCmd("warn", retryRecoveryGuardText)
+	}
 	if m.busy || m.turnPlanning {
 		m.queue = append(m.queue, prompt)
 		m.addNotice("", "queued; it runs when the current turn finishes")
@@ -1274,6 +1854,22 @@ func (m *tuiModel) enqueue(prompt, override string) tea.Cmd {
 }
 
 func (m *tuiModel) startTurn(prompt, override string) tea.Cmd {
+	return m.startTurnWithOrigin(prompt, override, false, false)
+}
+
+func (m *tuiModel) startSyntheticTurn(prompt string) tea.Cmd {
+	return m.startTurnWithOrigin(prompt, "", true, false)
+}
+
+func (m *tuiModel) startPostCompactTurn(prompt string, synthetic bool) tea.Cmd {
+	return m.startTurnWithOrigin(prompt, "", synthetic, true)
+}
+
+func (m *tuiModel) startTurnWithOrigin(prompt, override string, synthetic, suppressAutoCompact bool) tea.Cmd {
+	if m.retryRecoveryExists() {
+		return noticeCmd("warn", retryRecoveryGuardText)
+	}
+	typed := prompt
 	var overrideTier config.Tier
 	if override != "" {
 		var ok bool
@@ -1286,18 +1882,32 @@ func (m *tuiModel) startTurn(prompt, override string) tea.Cmd {
 	// The transcript shows what was typed; the model gets that plus what the
 	// @mentions attach and what recent ! commands produced. Expansion happens
 	// here, not at submit, so a queued prompt reads its files when it runs.
-	m.addUser(prompt)
-	expanded, images := m.expandMentions(prompt)
+	// The user card is added only inside launch: a secret-bearing prompt that
+	// is redacted or dropped must not be painted raw before the choice.
+	expanded, images := m.expandMentions(typed)
 	prompt = m.watchContext(m.adviceContext(m.shellContext(expanded)))
+	leaks := credential.ScanPrompt(prompt)
 	launch := func(p string) tea.Cmd {
-		if override != "" {
-			return m.launchOverrideTurn(p, images, overrideTier)
+		display := typed
+		if len(leaks) > 0 && p != prompt {
+			display = credential.Redact(display, leaks)
 		}
-		return m.launchTurn(p, images)
+		if synthetic {
+			m.addNotice("", "Switchboard automatic continuation")
+		} else {
+			m.addUser(display)
+		}
+		if override != "" {
+			return m.launchOverrideTurnAuthoredMode(p, display, images, overrideTier, suppressAutoCompact)
+		}
+		if synthetic {
+			return m.launchSyntheticTurnMode(p, images, suppressAutoCompact)
+		}
+		return m.launchTurnAuthoredMode(p, display, images, suppressAutoCompact)
 	}
 	// The scan runs on the expanded prompt, because an @mentioned .env or a
 	// `!env` transcript is exactly the outbound copy a key rides in on.
-	if leaks := credential.ScanPrompt(prompt); len(leaks) > 0 {
+	if len(leaks) > 0 {
 		return m.openSecretGate(leaks, prompt, launch)
 	}
 	return launch(prompt)
@@ -1306,43 +1916,76 @@ func (m *tuiModel) startTurn(prompt, override string) tea.Cmd {
 // launchOverrideTurn uses the same fully expanded opening as an automatically
 // routed turn, but pins feasibility to the requested rung for this turn only.
 func (m *tuiModel) launchOverrideTurn(prompt string, images []provider.Image, tier config.Tier) tea.Cmd {
+	return m.launchOverrideTurnAuthored(prompt, prompt, images, tier)
+}
+
+func (m *tuiModel) launchOverrideTurnAuthored(prompt, authored string, images []provider.Image, tier config.Tier) tea.Cmd {
+	return m.launchOverrideTurnAuthoredMode(prompt, authored, images, tier, false)
+}
+
+func (m *tuiModel) launchOverrideTurnAuthoredMode(prompt, authored string, images []provider.Image, tier config.Tier, suppressAutoCompact bool) tea.Cmd {
 	ctx, generation := m.startPlanning()
 	sticky := m.app.sticky
-	unstamped := turnOpening(prompt, images)
+	unstamped := turnOpeningAuthored(prompt, authored, images)
 	return func() tea.Msg {
-		result := overrideProbeMsg{generation: generation, prompt: prompt, images: images}
 		if err := ctx.Err(); err != nil {
-			result.err = err
-			return result
+			return overrideProbeMsg{generation: generation, prompt: prompt, images: images,
+				suppressAutoCompact: suppressAutoCompact, err: err}
 		}
 		opening, err := stampTurnOpening(m.app.loop.Session, unstamped)
 		if err != nil {
-			result.err = err
-			return result
+			return overrideProbeMsg{generation: generation, prompt: prompt, images: images,
+				suppressAutoCompact: suppressAutoCompact, err: err}
 		}
-		result.opening = opening
-		plan := prospectiveTurnPlan(m.app.loop, sticky, opening, m.app.workspace)
-		result.plan = plan
-		rank := m.app.rankOf(tier)
-		if rank < 0 {
-			result.err = fmt.Errorf("the requested tier %s is not on the configured ladder", tier.ID)
-			return result
-		}
-		probed, client, note, err := m.app.providers.probeTierFallbackFeasible(ctx, tier, func(candidate config.Tier) error {
-			return checkTurnFeasible(m.app.loop, m.app.catalog, m.app.providers, m.app.budget, m.app.config.Destinations, candidate, rank, plan, opening)
-		})
-		if err != nil {
-			result.err = fmt.Errorf("the requested tier %s cannot serve the turn: %w", tier.ID, err)
-			return result
-		}
-		if err := ctx.Err(); err != nil {
-			result.err = err
-			return result
-		}
-		retargetTurnPlan(&plan, m.app.loop, m.app.catalog, m.app.caches, probed, rank, opening)
-		result.plan = plan
-		result.tier, result.client, result.note = probed, client, note
+		return m.resolveOverrideOpening(ctx, generation, opening, prompt, images, tier, sticky, suppressAutoCompact, 0)
+	}
+}
+
+func (m *tuiModel) resolveOverrideOpening(ctx context.Context, generation uint64, opening provider.Message,
+	prompt string, images []provider.Image, tier config.Tier, sticky *route.Sticky, suppressAutoCompact bool, retries int,
+) overrideProbeMsg {
+	result := overrideProbeMsg{
+		generation: generation, providerRetries: retries, opening: opening,
+		prompt: prompt, images: images, suppressAutoCompact: suppressAutoCompact,
+	}
+	if err := ctx.Err(); err != nil {
+		result.err = err
 		return result
+	}
+	plan := prospectiveTurnPlan(m.app.loop, sticky, opening, m.app.workspace)
+	result.plan = plan
+	rank := m.app.rankOf(tier)
+	if rank < 0 {
+		result.err = fmt.Errorf("the requested tier %s is not on the configured ladder", tier.ID)
+		return result
+	}
+	probed, client, note, err := m.app.providers.probeTierFallbackFeasible(ctx, tier, func(candidate config.Tier) error {
+		return checkTurnFeasible(m.app.loop, m.app.catalog, m.app.providers, m.app.budget, m.app.config.Destinations, candidate, rank, plan, opening)
+	})
+	if err != nil {
+		result.err = fmt.Errorf("the requested tier %s cannot serve the turn: %w", tier.ID, err)
+		return result
+	}
+	if err := ctx.Err(); err != nil {
+		result.err = err
+		return result
+	}
+	retargetTurnPlan(&plan, m.app.loop, m.app.catalog, m.app.caches, probed, rank, opening)
+	result.plan = plan
+	result.tier, result.client, result.note = probed, client, note
+	return result
+}
+
+func (m *tuiModel) replanOverrideOpening(msg overrideProbeMsg) tea.Cmd {
+	ctx := m.turnCtx
+	sticky := m.app.sticky
+	requested, ok := m.app.config.Tier(msg.tier.ID)
+	if !ok {
+		requested = msg.tier
+	}
+	return func() tea.Msg {
+		return m.resolveOverrideOpening(ctx, msg.generation, msg.opening, msg.prompt, msg.images,
+			requested, sticky, msg.suppressAutoCompact, msg.providerRetries+1)
 	}
 }
 
@@ -1350,11 +1993,16 @@ func (m *tuiModel) launchOverrideTurn(prompt string, images []provider.Image, ti
 // stays with the model turn if planning succeeds.
 func (m *tuiModel) startPlanning() (context.Context, uint64) {
 	ctx, cancel := context.WithCancel(context.Background())
+	// A delayed picker or text prompt was assembled for the idle session. Once
+	// execution claims it, that UI result may neither open nor publish a config
+	// or credential mutation beside the loop goroutine.
+	m.asyncResultGeneration++
 	m.turnGeneration++
 	m.turnCtx = ctx
 	m.turnCancel = cancel
 	m.turnPlanning = true
 	m.busy = true
+	m.started = time.Now()
 	return ctx, m.turnGeneration
 }
 
@@ -1379,6 +2027,7 @@ func (m *tuiModel) startOperation(name string) (context.Context, uint64, string,
 		return nil, 0, "", fmt.Errorf("there is no active session")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	m.asyncResultGeneration++
 	m.operationGeneration++
 	m.operationActive = true
 	m.operationCancelling = false
@@ -1386,7 +2035,9 @@ func (m *tuiModel) startOperation(name string) (context.Context, uint64, string,
 	m.operationName = name
 	m.turnCtx = ctx
 	m.turnCancel = cancel
+	m.operationOwner = newOperationRun(m.operationGeneration, m.operationSourceID, cancel)
 	m.busy = true
+	m.started = time.Now()
 	return ctx, m.operationGeneration, m.operationSourceID, nil
 }
 
@@ -1405,6 +2056,13 @@ func (m *tuiModel) finishOperation(generation uint64, keepBusy bool) bool {
 	}
 	if m.turnCancel != nil {
 		m.turnCancel()
+	}
+	if m.operationOwner != nil && m.operationOwner.generation == generation {
+		if err := m.operationOwner.retire(); err != nil {
+			m.shutdownErr = errors.Join(m.shutdownErr,
+				fmt.Errorf("cleaning asynchronous operation %d: %w", generation, err))
+		}
+		m.operationOwner = nil
 	}
 	m.turnCancel = nil
 	m.turnCtx = nil
@@ -1427,60 +2085,132 @@ func (m *tuiModel) onOperationNotice(msg noticeMsg) tea.Cmd {
 	return m.nextQueuedTurn()
 }
 
+// bindAsyncResult is called on the Bubble Tea goroutine immediately before an
+// asynchronous command is launched. Commands carry the returned immutable
+// ticket and never read model state from their worker goroutine.
+func (m *tuiModel) bindAsyncResult() asyncResultBinding {
+	m.asyncResultGeneration++
+	return asyncResultBinding{
+		generation: m.asyncResultGeneration,
+		sessionID:  currentSessionID(m),
+	}
+}
+
+func (m *tuiModel) asyncResultMatches(generation uint64, sessionID string) bool {
+	// tuiModel always has a live session, so an unbound result fails closed.
+	// The standalone onboarding model consumes its own picker messages and does
+	// not cross this boundary.
+	return generation != 0 && generation == m.asyncResultGeneration &&
+		sessionID != "" && sessionID == currentSessionID(m)
+}
+
 // launchTurn is startTurn's tail, split off so the secret gate can hold a
 // turn while the user decides what leaves the machine.
 func (m *tuiModel) launchTurn(prompt string, images []provider.Image) tea.Cmd {
+	return m.launchTurnAuthored(prompt, prompt, images)
+}
+
+func (m *tuiModel) launchTurnAuthored(prompt, authored string, images []provider.Image) tea.Cmd {
+	return m.launchTurnAuthoredMode(prompt, authored, images, false)
+}
+
+func (m *tuiModel) launchTurnAuthoredMode(prompt, authored string, images []provider.Image, suppressAutoCompact bool) tea.Cmd {
+	return m.launchTurnOpeningMode(prompt, images, turnOpeningAuthored(prompt, authored, images), suppressAutoCompact)
+}
+
+func (m *tuiModel) launchSyntheticTurn(prompt string, images []provider.Image) tea.Cmd {
+	return m.launchSyntheticTurnMode(prompt, images, false)
+}
+
+func (m *tuiModel) launchSyntheticTurnMode(prompt string, images []provider.Image, suppressAutoCompact bool) tea.Cmd {
+	return m.launchTurnOpeningMode(prompt, images, syntheticTurnOpening(prompt, images), suppressAutoCompact)
+}
+
+func (m *tuiModel) launchTurnOpening(prompt string, images []provider.Image, unstamped provider.Message) tea.Cmd {
+	return m.launchTurnOpeningMode(prompt, images, unstamped, false)
+}
+
+func (m *tuiModel) launchTurnOpeningMode(prompt string, images []provider.Image, unstamped provider.Message, suppressAutoCompact bool) tea.Cmd {
 	ctx, generation := m.startPlanning()
 	currentTier := m.app.tier
 	binding := m.app.loop.Binding()
 	sticky := m.app.sticky
-	unstamped := turnOpening(prompt, images)
 	return func() tea.Msg {
-		result := turnPlanMsg{generation: generation, prompt: prompt, images: images}
 		if err := ctx.Err(); err != nil {
-			result.err = err
-			return result
+			return turnPlanMsg{generation: generation, prompt: prompt, images: images,
+				suppressAutoCompact: suppressAutoCompact, err: err}
 		}
 		opening, err := stampTurnOpening(m.app.loop.Session, unstamped)
 		if err != nil {
-			result.err = err
-			return result
+			return turnPlanMsg{generation: generation, prompt: prompt, images: images,
+				suppressAutoCompact: suppressAutoCompact, err: err}
 		}
-		result.opening = opening
-		if _, onLadder := m.app.config.Tier(currentTier.ID); !onLadder {
-			result.plan = prospectiveTurnPlan(m.app.loop, sticky, opening, m.app.workspace)
-			probed, client := currentTier, binding.Provider
-			if m.app.providers != nil {
-				var err error
-				probed, client, err = m.app.providers.probeTier(ctx, currentTier)
-				if err != nil {
-					result.err = fmt.Errorf("the current target cannot serve the turn: %w", err)
-					return result
-				}
-			}
-			if err := checkTurnFeasible(m.app.loop, m.app.catalog, m.app.providers, m.app.budget, m.app.config.Destinations,
-				probed, 0, result.plan, opening); err != nil {
+		return m.resolveTurnOpening(ctx, generation, opening, prompt, images, currentTier, binding, sticky, suppressAutoCompact, 0)
+	}
+}
+
+const maxProviderReplans = 3
+
+// resolveTurnOpening plans and probes an already-stamped opening. Keeping this
+// separate from launchTurnOpening is what lets a credential/address reset
+// invalidate an async probe without reconstructing the message from display
+// text, re-reading @mentions, or changing continuity metadata.
+func (m *tuiModel) resolveTurnOpening(ctx context.Context, generation uint64, opening provider.Message,
+	prompt string, images []provider.Image, currentTier config.Tier, binding agent.Binding,
+	sticky *route.Sticky, suppressAutoCompact bool, retries int,
+) turnPlanMsg {
+	result := turnPlanMsg{
+		generation: generation, providerRetries: retries, opening: opening,
+		prompt: prompt, images: images, suppressAutoCompact: suppressAutoCompact,
+	}
+	if err := ctx.Err(); err != nil {
+		result.err = err
+		return result
+	}
+	if _, onLadder := m.app.config.Tier(currentTier.ID); !onLadder {
+		result.plan = prospectiveTurnPlan(m.app.loop, sticky, opening, m.app.workspace)
+		probed, client := currentTier, binding.Provider
+		if m.app.providers != nil {
+			var err error
+			probed, client, err = m.app.providers.probeTier(ctx, currentTier)
+			if err != nil {
 				result.err = fmt.Errorf("the current target cannot serve the turn: %w", err)
 				return result
 			}
-			result.tier = probed
-			result.client = client
-			result.err = ctx.Err()
+		}
+		if err := checkTurnFeasible(m.app.loop, m.app.catalog, m.app.providers, m.app.budget, m.app.config.Destinations,
+			probed, 0, result.plan, opening); err != nil {
+			result.err = fmt.Errorf("the current target cannot serve the turn: %w", err)
 			return result
 		}
-		tier, client, note, plan, err := resolveUserTurn(ctx, m.app.loop, m.app.config, m.app.catalog,
-			m.app.providers, m.app.budget, m.app.caches, sticky, currentTier, binding.Provider, opening, m.app.workspace)
-		result.plan = plan
-		if err != nil {
-			result.err = err
-			return result
-		}
-		if err := ctx.Err(); err != nil {
-			result.err = err
-			return result
-		}
-		result.tier, result.client, result.note = tier, client, note
+		result.tier = probed
+		result.client = client
+		result.err = ctx.Err()
 		return result
+	}
+	tier, client, note, plan, err := resolveUserTurn(ctx, m.app.loop, m.app.config, m.app.catalog,
+		m.app.providers, m.app.budget, m.app.caches, sticky, currentTier, binding.Provider, opening, m.app.workspace)
+	result.plan = plan
+	if err != nil {
+		result.err = err
+		return result
+	}
+	if err := ctx.Err(); err != nil {
+		result.err = err
+		return result
+	}
+	result.tier, result.client, result.note = tier, client, note
+	return result
+}
+
+func (m *tuiModel) replanTurnOpening(msg turnPlanMsg) tea.Cmd {
+	ctx := m.turnCtx
+	currentTier := m.app.tier
+	binding := m.app.loop.Binding()
+	sticky := m.app.sticky
+	return func() tea.Msg {
+		return m.resolveTurnOpening(ctx, msg.generation, msg.opening, msg.prompt, msg.images,
+			currentTier, binding, sticky, msg.suppressAutoCompact, msg.providerRetries+1)
 	}
 }
 
@@ -1495,13 +2225,24 @@ func (m *tuiModel) onTurnPlan(msg turnPlanMsg) tea.Cmd {
 		}
 		return m.nextQueuedTurn()
 	}
-	if msg.tier.ID != m.app.tier.ID || msg.tier.Target.ID() != m.app.tier.Target.ID() {
-		pinned := m.app.sticky != nil && m.app.sticky.Pinned()
-		if err := persistRuntimeBinding(m.app.loop.Session, msg.tier, pinned); err != nil {
+	if m.app.providers != nil && !m.app.providers.preparedClientCurrent(msg.client) {
+		if msg.providerRetries >= maxProviderReplans {
+			m.finishPlanning()
+			m.addNotice("error", "provider settings kept changing while routing; the exact turn was not sent")
+			return m.nextQueuedTurn()
+		}
+		return m.replanTurnOpening(msg)
+	}
+	changed := msg.tier.ID != m.app.tier.ID || msg.tier.Target.ID() != m.app.tier.Target.ID()
+	pinned := m.app.sticky != nil && m.app.sticky.Pinned()
+	if changed || msg.note != "" {
+		if err := persistRuntimeBindingFallback(m.app.loop.Session, msg.tier, pinned, msg.note); err != nil {
 			m.finishPlanning()
 			m.addNotice("error", "automatic tier selection was not saved: "+err.Error())
 			return m.nextQueuedTurn()
 		}
+	}
+	if changed {
 		_, oldBinding := m.app.runtimeSnapshot()
 		abandoned := ""
 		if oldBinding.Target.ID() != msg.tier.Target.ID() {
@@ -1517,10 +2258,16 @@ func (m *tuiModel) onTurnPlan(msg turnPlanMsg) tea.Cmd {
 		m.tierLine = m.app.tierLine()
 		m.refreshCtxWindow()
 		m.recordMove(m.app.rankOf(msg.tier))
+	} else {
+		// The live route probe prepared a client against the provider settings as
+		// they stand now. /setup and /login deliberately reset the registry, so
+		// target identity alone cannot prove the sitting binding still owns the
+		// right endpoint or credential. Install the prepared client even when the
+		// tier and target did not move.
+		m.app.bindRuntime(msg.tier, msg.client)
 	}
 	if msg.note != "" {
 		m.addNotice("warn", msg.note)
-		m.app.loop.Session.AppendNote("warn", msg.note)
 	}
 	if msg.plan.Decision.Source != "" {
 		m.app.route = &msg.plan.Decision
@@ -1539,7 +2286,7 @@ func (m *tuiModel) onTurnPlan(msg turnPlanMsg) tea.Cmd {
 	}
 	m.turnPlanning = false
 	m.beginTurn(msg.opening.AuthoredText())
-	m.launchModelTurn(msg.opening)
+	m.launchModelTurnMode(msg.opening, msg.suppressAutoCompact)
 	return m.spin.Tick
 }
 
@@ -1550,16 +2297,48 @@ func (m *tuiModel) onOverrideProbe(msg overrideProbeMsg) tea.Cmd {
 		return nil
 	}
 	if msg.err != nil {
+		if err := m.resolveActiveRetryIntent(); err != nil {
+			return m.stopAfterRetryIntentResolutionFailure(err, msg.err)
+		}
 		m.finishPlanning()
 		if !errors.Is(msg.err, context.Canceled) {
 			m.addNotice("error", msg.err.Error())
 		}
-		return m.nextQueuedTurn()
+		return m.releaseDeferredStartup(m.nextQueuedTurn)
+	}
+	if m.app.providers != nil && !m.app.providers.preparedClientCurrent(msg.client) {
+		if msg.providerRetries >= maxProviderReplans {
+			planningErr := errors.New("provider settings kept changing while preparing the tier override; the exact turn was not sent")
+			if err := m.resolveActiveRetryIntent(); err != nil {
+				return m.stopAfterRetryIntentResolutionFailure(err, planningErr)
+			}
+			m.finishPlanning()
+			m.addNotice("error", planningErr.Error())
+			return m.releaseDeferredStartup(m.nextQueuedTurn)
+		}
+		return m.replanOverrideOpening(msg)
+	}
+	if msg.note != "" {
+		if err := m.app.loop.Session.AppendNote("warn", msg.note); err != nil {
+			refusal := fmt.Errorf("the fallback substitution was not recorded, so the turn was not sent: %w", err)
+			if m.activeRetryIntent != "" {
+				if resolveErr := m.resolveActiveRetryIntent(); resolveErr != nil {
+					return m.stopAfterRetryIntentResolutionFailure(resolveErr, refusal)
+				}
+			}
+			m.finishPlanning()
+			m.addNotice("error", refusal.Error())
+			if m.retryRecoveryExists() {
+				return nil
+			}
+			return m.releaseDeferredStartup(m.nextQueuedTurn)
+		}
+		m.addNotice("warn", msg.note)
 	}
 	m.applyOverrideBinding(msg)
 	m.turnPlanning = false
 	m.beginTurn(msg.opening.AuthoredText())
-	m.launchModelTurn(msg.opening)
+	m.launchModelTurnMode(msg.opening, msg.suppressAutoCompact)
 	return m.spin.Tick
 }
 
@@ -1577,6 +2356,12 @@ func (m *tuiModel) applyOverrideBinding(msg overrideProbeMsg) {
 		m.app.bindRuntime(msg.tier, msg.client)
 		m.tierLine = m.app.tierLine()
 		m.refreshCtxWindow()
+	} else {
+		// Keep the post-override restore on the freshly prepared client too. If a
+		// provider reset rebuilt this same target, restoring the snapshot's old
+		// client would undo the refresh as soon as the borrowed turn ended.
+		m.restoreBinding.Provider = msg.client
+		m.app.bindRuntime(msg.tier, msg.client)
 	}
 	rank := m.app.rankOf(msg.tier)
 	if m.app.sticky != nil && rank >= 0 {
@@ -1591,6 +2376,9 @@ func (m *tuiModel) applyOverrideBinding(msg overrideProbeMsg) {
 }
 
 func (m *tuiModel) nextQueuedTurn() tea.Cmd {
+	if m.quitting {
+		return nil
+	}
 	// Turn exits that bypass the verdict — a refused route, a cancelled plan —
 	// come through here; a steer caught in one still leads what runs next.
 	if !m.busy && !m.turnPlanning {
@@ -1620,10 +2408,14 @@ func (m *tuiModel) beginTurn(prompt string) {
 	m.turnStarted = m.app.tier
 	m.turnBefore = m.app.loop.Session.State()
 	m.tr.scrollToBottom()
-	m.app.watchSt.beginTurn(m.turnCtx)
+	m.app.watchSt.beginTurn(m.turnCtx, currentSessionID(m))
 }
 
 func (m *tuiModel) launchModelTurn(opening provider.Message) {
+	m.launchModelTurnMode(opening, false)
+}
+
+func (m *tuiModel) launchModelTurnMode(opening provider.Message, suppressAutoCompact bool) {
 	decision := m.app.route
 	if decision != nil {
 		copy := *decision
@@ -1632,22 +2424,37 @@ func (m *tuiModel) launchModelTurn(opening provider.Message) {
 	features := m.app.routeFeatures
 	features.RepoLanguages = append([]string(nil), features.RepoLanguages...)
 	run := turnExecution{
-		generation: m.turnGeneration,
-		watcher:    m.app.watcher,
-		advisor:    m.app.currentAdvisor(),
-		startedOn:  m.turnStarted,
-		before:     m.turnBefore,
-		usage:      m.app.loop.Session.BeginUsageWindow(),
-		started:    m.started,
-		decision:   decision,
-		features:   features,
+		generation:          m.turnGeneration,
+		suppressAutoCompact: suppressAutoCompact,
+		watcher:             m.app.watcher,
+		advisor:             m.app.currentAdvisor(),
+		startedOn:           m.turnStarted,
+		before:              m.turnBefore,
+		usage:               m.app.loop.Session.BeginUsageWindow(),
+		started:             m.started,
+		decision:            decision,
+		features:            features,
+		retryIntent:         m.activeRetryIntent,
+		resumeRetry:         m.resumeRetryOpening,
 	}
-	go m.runTurn(m.turnCtx, opening, run)
+	m.resumeRetryOpening = false
+	owner := &primaryTurnRun{generation: run.generation, done: make(chan struct{})}
+	m.primaryTurn = owner
+	go func() {
+		msg := m.runTurn(m.turnCtx, opening, run)
+		// Publish completion before handing the result to Bubble Tea. The TUI
+		// can disappear between those two operations; shutdown needs the durable
+		// turn boundary, not delivery into a renderer that has already stopped.
+		close(owner.done)
+		if m.app.p != nil {
+			m.app.p.Send(msg)
+		}
+	}()
 }
 
 // runTurn drives one turn on its own goroutine. Everything it reports arrives
 // as messages; the session stays the only thing it writes.
-func (m *tuiModel) runTurn(ctx context.Context, opening provider.Message, run turnExecution) {
+func (m *tuiModel) runTurn(ctx context.Context, opening provider.Message, run turnExecution) turnDoneMsg {
 	prompt := opening.AuthoredText()
 	if run.watcher != nil {
 		run.watcher.StartTurn()
@@ -1655,7 +2462,15 @@ func (m *tuiModel) runTurn(ctx context.Context, opening provider.Message, run tu
 	if run.advisor != nil {
 		run.advisor.StartTurn(prompt)
 	}
-	err := m.app.loop.TurnMessage(ctx, opening)
+	var err error
+	switch {
+	case run.resumeRetry:
+		err = m.app.loop.ResumeRetryTurn(ctx, run.retryIntent)
+	case run.retryIntent != "":
+		err = m.app.loop.RetryTurnMessage(ctx, opening, run.retryIntent)
+	default:
+		err = m.app.loop.TurnMessage(ctx, opening)
+	}
 
 	after := m.app.loop.Session.State()
 	moves := 0
@@ -1664,14 +2479,23 @@ func (m *tuiModel) runTurn(ctx context.Context, opening provider.Message, run tu
 	}
 	endedOn, _ := m.app.runtimeSnapshot()
 	if rerr := appendRouteRecord(m.app.loop.Session, prompt, run.startedOn, endedOn, run.before, run.usage, run.started, err, run.decision, run.features, moves); rerr != nil {
-		m.app.p.Send(noticeMsg{level: "warn", text: "the routing record for this turn was not saved: " + rerr.Error()})
+		if m.app.p != nil {
+			m.app.p.Send(noticeMsg{level: "warn", text: "the routing record for this turn was not saved: " + rerr.Error()})
+		}
 	}
-	m.app.p.Send(turnDoneMsg{generation: run.generation, err: err, after: after})
+	return turnDoneMsg{generation: run.generation, err: err, after: after,
+		suppressAutoCompact: run.suppressAutoCompact}
 }
 
 func (m *tuiModel) onTurnDone(msg turnDoneMsg) tea.Cmd {
 	if msg.generation != m.turnGeneration {
 		return nil
+	}
+	if m.primaryTurn != nil && m.primaryTurn.generation == msg.generation {
+		m.primaryTurn = nil
+	}
+	if err := m.resolveActiveRetryIntent(); err != nil {
+		return m.stopAfterRetryIntentResolutionFailure(err, msg.err)
 	}
 	m.busy = false
 	if m.turnCancel != nil {
@@ -1680,10 +2504,6 @@ func (m *tuiModel) onTurnDone(msg turnDoneMsg) tea.Cmd {
 	m.turnCancel = nil
 	m.turnCtx = nil
 	m.turnPlanning = false
-	// The final round's edits have no later round boundary; this is theirs.
-	// Batched into every exit path, because a tier restore or a queued
-	// prompt does not unhappen the edits.
-	watchCmd := m.watchTurnEnd()
 	m.tr.finalizeAll()
 	m.refreshCost(msg.after)
 	// Keep the completed turn's opening decision inspectable through /why.
@@ -1727,28 +2547,163 @@ func (m *tuiModel) onTurnDone(msg turnDoneMsg) tea.Cmd {
 	// swap, and a folded steer is an ordinary queued prompt by then.
 	m.foldSteers()
 
+	// The final round's edits have no later round boundary; this is theirs.
+	// Claim an exclusive asynchronous operation so the UI remains responsive
+	// while no queued, scheduled, deferred, or auto-compact continuation can
+	// mutate the tree the verifier is observing. Its completion handles the
+	// report (and therefore its fold) before assembling the next opening.
+	if watchCmd := m.startTurnEndWatch(msg.suppressAutoCompact); watchCmd != nil {
+		return watchCmd
+	}
+	return m.continueAfterTurnEnd(msg.suppressAutoCompact)
+}
+
+func (m *tuiModel) continueAfterTurnEnd(suppressAutoCompact bool) tea.Cmd {
+	if m.retryRecoveryExists() {
+		m.addNotice("error", retryRecoveryGuardText)
+		return nil
+	}
+	if m.deferredStartup != nil {
+		deferred := m.deferredStartup
+		m.deferredStartup = nil
+		background := deferred()
+		if !m.busy && len(m.queue) > 0 {
+			next := m.queue[0]
+			m.queue = m.queue[1:]
+			return tea.Batch(background, m.startTurn(next, ""))
+		}
+		return background
+	}
+
 	// Auto-compaction runs ahead of the queue: a queued prompt sent into a
 	// nearly-full window would inherit the failure this exists to prevent,
 	// and the queue survives the swap (onSessionSwap drains it).
-	if m.shouldAutoCompact() {
-		pct := m.callTokens * 100 / m.ctxWindow
-		m.addNotice("", fmt.Sprintf("context at %d%% of %s tokens; compacting automatically (/compact auto off disables this)",
-			pct, compact(m.ctxWindow)))
-		return tea.Batch(watchCmd, compactCmd(m, "", true))
+	if !suppressAutoCompact && m.shouldAutoCompact() {
+		if err := validateCompactScope(m.app.loop.Session.State().Messages, ""); err != nil {
+			// A legacy-only record has no honest scope for an automatic summary.
+			// Say how to recover, then leave queued work reachable; the next modern
+			// opening is itself the verified authority a later boundary needs.
+			m.addNotice("error", "automatic compact stopped before summarizing, session unchanged: "+err.Error())
+		} else {
+			pct := m.callTokens * 100 / m.ctxWindow
+			m.addNotice("", fmt.Sprintf("context at %d%% of %s tokens; compacting automatically (/compact auto off disables this)",
+				pct, compact(m.ctxWindow)))
+			return compactCmd(m, "", true)
+		}
 	}
 
 	if len(m.queue) > 0 {
 		next := m.queue[0]
 		m.queue = m.queue[1:]
-		return tea.Batch(watchCmd, m.startTurn(next, ""))
+		return m.startTurn(next, "")
 	}
-	return watchCmd
+	return nil
+}
+
+func (m *tuiModel) resolveActiveRetryIntent() error {
+	id := m.activeRetryIntent
+	if id == "" {
+		if m.retryRecoveryExists() {
+			return errors.New("an unresolved retry handoff has no active execution owner")
+		}
+		return nil
+	}
+	state := m.app.loop.Session.State()
+	intent := state.RetryIntent
+	if intent == nil {
+		m.activeRetryIntent = ""
+		return nil
+	}
+	if intent.ID != id {
+		return fmt.Errorf("active retry intent %s does not match durable handoff %s", id, intent.ID)
+	}
+	var err error
+	switch intent.Status {
+	case session.RetryIntentPending:
+		err = m.app.loop.Session.AbandonRetryIntent(id)
+	case session.RetryIntentStarted:
+		err = m.app.loop.Session.CompleteRetryIntent(id)
+	default:
+		err = fmt.Errorf("retry intent has unexpected status %q", intent.Status)
+	}
+	if err != nil {
+		return err
+	}
+	m.activeRetryIntent = ""
+	return nil
+}
+
+// stopAfterRetryIntentResolutionFailure is the last fail-closed boundary of a
+// retry execution. Planning may have refused or been cancelled before a call,
+// or the provider turn may have succeeded, failed, or observed cancellation;
+// none of those outcomes authorizes later work while the append-only handoff
+// still says pending/started. In particular, automatic compaction is itself
+// another provider call, so it must be suppressed beside queued and deferred
+// continuations.
+func (m *tuiModel) stopAfterRetryIntentResolutionFailure(resolveErr, executionErr error) tea.Cmd {
+	if m.turnCancel != nil {
+		m.turnCancel()
+	}
+	m.turnCancel = nil
+	m.turnCtx = nil
+	m.turnPlanning = false
+	m.busy = false
+	m.deferredStartup = nil
+	m.initialCmd = nil
+	if m.app != nil && m.app.lifetime != nil {
+		m.app.lifetime.stop()
+	}
+
+	cause := resolveErr
+	if executionErr != nil {
+		cause = errors.Join(resolveErr, fmt.Errorf("retry execution outcome: %w", executionErr))
+	}
+	fatalErr := fmt.Errorf("the retry's durable recovery handoff could not be cleared; Switchboard stopped before any queued, automatic, or background continuation. Restart Switchboard in this workspace to recover without duplicating provider or tool work: %w", cause)
+	m.shutdownErr = errors.Join(m.shutdownErr, fatalErr)
+	if m.app != nil && m.app.loop != nil && m.app.loop.Session != nil {
+		if closeErr := m.app.loop.Session.CloseDiscardingStaged(); closeErr != nil {
+			m.shutdownErr = errors.Join(m.shutdownErr, fmt.Errorf("closing retry session after handoff failure: %w", closeErr))
+		}
+	}
+	m.addNotice("error", fatalErr.Error())
+	cleanup := m.cancelDialogsForExit()
+	if cleanup == nil {
+		return tea.Quit
+	}
+	return tea.Sequence(cleanup, tea.Quit)
+}
+
+// releaseDeferredStartup opens the background-startup gate only after a
+// recovered retry has durably resolved. The deferred function runs first: an
+// advisor startup may claim operation ownership, in which case queued work
+// remains queued until that operation reports completion.
+func (m *tuiModel) releaseDeferredStartup(next func() tea.Cmd) tea.Cmd {
+	var commands []tea.Cmd
+	if m.deferredStartup != nil {
+		deferred := m.deferredStartup
+		m.deferredStartup = nil
+		if cmd := deferred(); cmd != nil {
+			commands = append(commands, cmd)
+		}
+	}
+	if next != nil {
+		if cmd := next(); cmd != nil {
+			commands = append(commands, cmd)
+		}
+	}
+	if len(commands) == 0 {
+		return nil
+	}
+	if len(commands) == 1 {
+		return commands[0]
+	}
+	return tea.Batch(commands...)
 }
 
 // foldSteers moves undrained steers to the head of the prompt queue. It runs
 // at turn end, before the queue is consulted.
 func (m *tuiModel) foldSteers() {
-	if steers := m.app.takeSteers(); len(steers) > 0 {
+	if steers := m.app.takeSteerAuthored(); len(steers) > 0 {
 		m.queue = append(steers, m.queue...)
 	}
 }
@@ -1759,11 +2714,7 @@ func (m *tuiModel) foldSteers() {
 // definitions, plus the conversation that grows.
 func (m *tuiModel) estimatedOccupancy() int {
 	state := m.app.loop.Session.State()
-	return prefix.RequestTokens(provider.Request{
-		System:   m.app.loop.System,
-		Tools:    m.app.loop.Tools.Definitions(),
-		Messages: state.Messages,
-	})
+	return prefix.RequestTokens(m.app.loop.Request(state.Messages))
 }
 
 // shouldAutoCompact decides at turn end. callTokens is the size of the last
@@ -1820,8 +2771,25 @@ func (m *tuiModel) onTierSwitch(msg tierSwitchMsg) tea.Cmd {
 		}
 		return m.nextQueuedTurn()
 	}
-	if !msg.silent {
-		if err := persistRuntimeBinding(m.app.loop.Session, msg.tier, true); err != nil {
+	if m.app.providers != nil && !m.app.providers.preparedClientCurrent(msg.client) {
+		if msg.providerRetries >= maxProviderReplans {
+			m.finishOperation(msg.operation, false)
+			m.addNotice("error", "provider settings kept changing while switching tiers; no switch was made")
+			return m.nextQueuedTurn()
+		}
+		requested := msg.requested
+		if requested.ID == "" {
+			requested = msg.tier
+		}
+		return m.ownOperationCmd(msg.operation,
+			m.probeTierSwitch(m.turnCtx, msg.operation, msg.sourceID, requested, msg.silent, msg.providerRetries+1))
+	}
+	if !msg.silent || msg.note != "" {
+		pinned := true
+		if msg.silent {
+			pinned = m.app.loop.Session.State().RuntimeBinding.Pinned
+		}
+		if err := persistRuntimeBindingFallback(m.app.loop.Session, msg.tier, pinned, msg.note); err != nil {
 			m.finishOperation(msg.operation, false)
 			m.addNotice("error", "tier switch was not saved: "+err.Error())
 			return m.nextQueuedTurn()
@@ -1834,7 +2802,6 @@ func (m *tuiModel) onTierSwitch(msg tierSwitchMsg) tea.Cmd {
 	// abandonment is conditional on the target identity changing.
 	if msg.note != "" {
 		m.addNotice("warn", msg.note)
-		m.app.loop.Session.AppendNote("warn", msg.note)
 	}
 	// What the old target held warm is priced before the bind discards its
 	// tracker: afterwards there is nothing left to ask. A spoken note goes
@@ -1907,51 +2874,184 @@ func (m *tuiModel) cacheSwitchNote(tier config.Tier, abandoned string) {
 	}
 }
 
+// reprobeSessionSwap keeps a staged session and any advisor/retry barrier in
+// place while replacing stale probe authority. No session record or file
+// transaction is published until the refreshed result returns to
+// onSessionSwap. Resume is the one operation that may re-evaluate its ordered
+// outage path; fork, clear, compact, retry, and race keep their exact concrete
+// target and merely refresh that target's credential/endpoint evidence.
+func (m *tuiModel) reprobeSessionSwap(ctx context.Context, msg sessionSwapMsg) tea.Cmd {
+	app := m.app
+	return func() tea.Msg {
+		result := msg
+		result.providerRetries++
+		if err := ctx.Err(); err != nil {
+			result.err = err
+			return result
+		}
+
+		requested := msg.tier
+		if msg.reprobeFallbacks {
+			if configured, ok := app.config.Tier(msg.tier.ID); ok {
+				requested = tierWithActiveTargetFirst(configured, msg.tier.Target)
+			}
+		}
+		probed, client, note, err := probeResumeTarget(ctx, msg.sess, app.loop, app.catalog, app.providers, app.budget,
+			app.config.Destinations, requested, msg.reprobeFallbacks, app.rankOf(requested))
+		if err != nil {
+			result.err = fmt.Errorf("the session target could not be refreshed after provider settings changed: %w", err)
+			return result
+		}
+		if err := ctx.Err(); err != nil {
+			result.err = err
+			return result
+		}
+		result.tier, result.client = probed, client
+		if msg.reprobeFallbacks {
+			result.note, result.warnNote = note, note != ""
+		}
+		return result
+	}
+}
+
 func (m *tuiModel) onSessionSwap(msg sessionSwapMsg) tea.Cmd {
+	retainForReprobe := false
+	publishAfterSettled := msg.publishAfter == nil
+	defer func() {
+		if !retainForReprobe && !publishAfterSettled {
+			_ = msg.publishAfter.CloseDiscardingStaged()
+		}
+	}()
 	if msg.release != nil {
-		defer msg.release()
+		defer func() {
+			if !retainForReprobe {
+				msg.release()
+			}
+		}()
+	}
+	abortRetry := func(cause error) error {
+		if err := msg.retry.abortPrepared(); err != nil {
+			cause = errors.Join(cause, fmt.Errorf("discarding the unused retry recovery journal: %w", err))
+		}
+		return cause
+	}
+	stopForRetryRecovery := func(err error) tea.Cmd {
+		if !errors.Is(err, checkpoint.ErrDurableUndoRecoveryRequired) {
+			return nil
+		}
+		m.addNotice("error", "retry recovery is still pending; Switchboard is stopping before another workspace mutation. Restart to recover safely: "+err.Error())
+		m.quitting = true
+		return tea.Quit
 	}
 	if msg.operation != 0 {
 		if !m.operationMatches(msg.operation, msg.sourceID) {
+			cleanupErr := abortRetry(nil)
 			if msg.sess != nil && msg.sess != m.app.loop.Session {
-				_ = msg.sess.Close()
+				_ = msg.sess.CloseDiscardingStaged()
+			}
+			if cleanupErr != nil {
+				m.addNotice("error", "stale retry cleanup failed; restart before retrying again: "+cleanupErr.Error())
+			}
+			if stop := stopForRetryRecovery(cleanupErr); stop != nil {
+				return stop
 			}
 			return nil
 		}
 		if m.operationCancelling {
+			cleanupErr := abortRetry(nil)
 			if msg.sess != nil && msg.sess != m.app.loop.Session {
-				_ = msg.sess.Close()
+				_ = msg.sess.CloseDiscardingStaged()
 			}
 			m.finishOperation(msg.operation, false)
+			if cleanupErr != nil {
+				m.addNotice("error", "cancelled retry cleanup failed; restart before retrying again: "+cleanupErr.Error())
+			}
+			if stop := stopForRetryRecovery(cleanupErr); stop != nil {
+				return stop
+			}
 			return m.nextQueuedTurn()
 		}
 	} else if m.busy || m.turnPlanning || m.operationActive {
 		// Synchronous swaps (currently a finished race) are valid only while
 		// idle. This final guard prevents a future caller from closing the log
 		// underneath a live turn.
+		cleanupErr := abortRetry(nil)
 		if msg.sess != nil && msg.sess != m.app.loop.Session {
-			_ = msg.sess.Close()
+			_ = msg.sess.CloseDiscardingStaged()
 		}
-		m.addNotice("error", "session change refused while another operation is running")
+		refusal := errors.Join(errors.New("session change refused while another operation is running"), cleanupErr)
+		m.addNotice("error", refusal.Error())
+		if stop := stopForRetryRecovery(refusal); stop != nil {
+			return stop
+		}
 		return nil
 	}
+	if msg.err == nil && msg.sess != nil && m.app.providers != nil &&
+		!m.app.providers.preparedClientCurrent(msg.client) {
+		if msg.providerRetries >= maxProviderReplans {
+			msg.err = errors.New("provider settings kept changing while preparing the session change; the staged session was not adopted")
+		} else {
+			if msg.operation == 0 {
+				ctx, operation, sourceID, err := m.startOperation("session provider refresh")
+				if err != nil {
+					msg.err = err
+				} else {
+					msg.operation, msg.sourceID = operation, sourceID
+					retainForReprobe = true
+					return m.ownOperationCmdWithAbandon(msg.operation, m.reprobeSessionSwap(ctx, msg), func() error {
+						return cleanupDroppedOperationResult(msg)
+					})
+				}
+			} else {
+				retainForReprobe = true
+				return m.ownOperationCmdWithAbandon(msg.operation, m.reprobeSessionSwap(m.turnCtx, msg), func() error {
+					return cleanupDroppedOperationResult(msg)
+				})
+			}
+		}
+	}
 	if msg.err != nil {
+		msg.err = abortRetry(msg.err)
+		if msg.sess != nil && msg.sess != m.app.loop.Session {
+			_ = msg.sess.CloseDiscardingStaged()
+		}
 		if msg.operation != 0 {
 			m.finishOperation(msg.operation, false)
 		}
 		m.addNotice("error", msg.err.Error())
+		if stop := stopForRetryRecovery(msg.err); stop != nil {
+			return stop
+		}
 		return m.nextQueuedTurn()
 	}
 	if msg.sess == nil {
+		cleanupErr := abortRetry(nil)
 		if msg.operation != 0 {
 			m.finishOperation(msg.operation, false)
 		}
-		m.addNotice("error", "session change returned no session")
+		refusal := errors.Join(errors.New("session change returned no session"), cleanupErr)
+		m.addNotice("error", refusal.Error())
+		if stop := stopForRetryRecovery(refusal); stop != nil {
+			return stop
+		}
 		return m.nextQueuedTurn()
 	}
-	m.closeFullscreen()
-	m.workspaceGeneration++
 	old := m.app.loop.Session
+	if msg.retry != nil && msg.retry.source != old {
+		cleanupErr := abortRetry(nil)
+		if msg.operation != 0 {
+			m.finishOperation(msg.operation, false)
+		}
+		if msg.sess != old {
+			_ = msg.sess.CloseDiscardingStaged()
+		}
+		refusal := errors.Join(errors.New("retry source changed before adoption; source session and files were left untouched"), cleanupErr)
+		m.addNotice("error", refusal.Error())
+		if stop := stopForRetryRecovery(refusal); stop != nil {
+			return stop
+		}
+		return m.nextQueuedTurn()
+	}
 	runtimeBinding := session.RuntimeBinding{Tier: msg.tier.ID, Target: msg.tier.Target.ID(), Pinned: msg.pinned}
 	if msg.preserveRuntimeTarget {
 		// A fork or retry may cut before the source's latest binding record.
@@ -1972,35 +3072,287 @@ func (m *tuiModel) onSessionSwap(msg sessionSwapMsg) tea.Cmd {
 			runtimeBinding = durable
 		}
 	}
-	if err := msg.sess.AppendRuntimeBinding(runtimeBinding.Tier, runtimeBinding.Target, runtimeBinding.Pinned); err != nil {
+	var runtimeBindingErr error
+	if msg.warnNote {
+		runtimeBindingErr = msg.sess.AppendRuntimeBindingNote(runtimeBinding.Tier, runtimeBinding.Target, runtimeBinding.Pinned, "warn", msg.note)
+	} else {
+		runtimeBindingErr = msg.sess.AppendRuntimeBinding(runtimeBinding.Tier, runtimeBinding.Target, runtimeBinding.Pinned)
+	}
+	if err := runtimeBindingErr; err != nil {
+		err = abortRetry(err)
 		if msg.operation != 0 {
 			m.finishOperation(msg.operation, false)
 		}
 		if msg.sess != m.app.loop.Session {
-			_ = msg.sess.Close()
+			_ = msg.sess.CloseDiscardingStaged()
 		}
 		m.addNotice("error", "session runtime binding was not saved: "+err.Error())
+		if stop := stopForRetryRecovery(err); stop != nil {
+			return stop
+		}
 		return m.nextQueuedTurn()
 	}
 	if err := m.app.loop.BindSession(msg.sess); err != nil {
+		err = abortRetry(err)
 		if msg.operation != 0 {
 			m.finishOperation(msg.operation, false)
 		}
 		if msg.sess != old {
-			_ = msg.sess.Close()
+			_ = msg.sess.CloseDiscardingStaged()
 		}
 		m.addNotice("error", "session context was not restored: "+err.Error())
+		if stop := stopForRetryRecovery(err); stop != nil {
+			return stop
+		}
 		return m.nextQueuedTurn()
 	}
+	retryInfo, retryWarning := "", ""
+	retryRecoveryRequired := false
+	adoptionStopRequired := false
+	adoptionWarning := ""
+	stopAfterUncertainPublication := func(err error) {
+		adoptionStopRequired = true
+		adoptionWarning = err.Error()
+		m.shutdownErr = errors.Join(m.shutdownErr, err)
+		// Visibility commits this child, but no later presentation or cleanup
+		// step may append to it. Closing the authoritative handle here makes the
+		// restart requirement an immediate mutation barrier; Close never removes
+		// a visible log or marker.
+		if closeErr := msg.sess.Close(); closeErr != nil {
+			m.shutdownErr = errors.Join(m.shutdownErr, fmt.Errorf("closing durability-uncertain session: %w", closeErr))
+		}
+		if old != nil && old != msg.sess {
+			if closeErr := old.Close(); closeErr != nil {
+				m.shutdownErr = errors.Join(m.shutdownErr, fmt.Errorf("closing source after durability-uncertain publication: %w", closeErr))
+			}
+		}
+		if !publishAfterSettled {
+			if closeErr := msg.publishAfter.CloseDiscardingStaged(); closeErr != nil {
+				m.shutdownErr = errors.Join(m.shutdownErr, fmt.Errorf("discarding unpublished race sibling: %w", closeErr))
+			}
+			publishAfterSettled = true
+		}
+	}
+	stopAfterRollbackFailure := func(message string, cause, rollbackErr error) tea.Cmd {
+		if msg.operation != 0 {
+			m.finishOperation(msg.operation, false)
+		}
+		fatalErr := fmt.Errorf("%s: %w", message, errors.Join(cause, rollbackErr))
+		m.shutdownErr = errors.Join(m.shutdownErr, fatalErr)
+		m.quitting = true
+		// BindSession already made the staged child the loop's in-memory
+		// authority. The failed rollback means neither it nor the old source is
+		// safe for another append. An unpublished child is closed and retained
+		// invisibly for bounded maintenance; a marker discovered during that
+		// identity-checked close still makes a contradictory outcome fail closed.
+		if closeErr := msg.sess.CloseDiscardingStaged(); closeErr != nil {
+			m.shutdownErr = errors.Join(m.shutdownErr, fmt.Errorf("closing failed-adoption child: %w", closeErr))
+		}
+		if old != nil && old != msg.sess {
+			if closeErr := old.Close(); closeErr != nil {
+				m.shutdownErr = errors.Join(m.shutdownErr, fmt.Errorf("closing source after failed session rollback: %w", closeErr))
+			}
+		}
+		if !publishAfterSettled {
+			if closeErr := msg.publishAfter.CloseDiscardingStaged(); closeErr != nil {
+				m.shutdownErr = errors.Join(m.shutdownErr, fmt.Errorf("discarding unpublished race sibling after failed session rollback: %w", closeErr))
+			}
+			publishAfterSettled = true
+		}
+		m.addNotice("error", fatalErr.Error())
+		return tea.Quit
+	}
+	publish := func() (publicationDisposition, error) {
+		if !msg.sess.PublicationPending() {
+			return publicationDurable, nil
+		}
+		outcome, err := publishDurablyWith(msg.sess, msg.publishDurably)
+		return publicationResult(outcome, err, "session change "+msg.sess.ID())
+	}
+	publishDurably := func() (checkpoint.DurableCommitOutcome, error) {
+		outcome, err := publishDurablyWith(msg.sess, msg.publishDurably)
+		return checkpoint.DurableCommitOutcome{Published: outcome.Visible, Durable: outcome.Durable}, err
+	}
+	publicationCommitted := false
+	if tx := msg.retry; tx != nil {
+		if tx.undo != nil {
+			result, err := tx.undo.ApplyAndCommitDurably(publishDurably)
+			if err != nil {
+				// BindSession is the last fallible adoption step, so the file
+				// transaction runs after it. A stale or failed restore rolls its
+				// publications forward internally; return the loop to the still-open
+				// source before exposing the failure to the event loop.
+				if rollbackErr := m.app.loop.BindSession(old); rollbackErr != nil {
+					return stopAfterRollbackFailure("retry restore failed and source-session rollback also failed", err, rollbackErr)
+				}
+				if msg.sess != old {
+					_ = msg.sess.CloseDiscardingStaged()
+				}
+				if msg.operation != 0 {
+					m.finishOperation(msg.operation, false)
+				}
+				if stop := stopForRetryRecovery(err); stop != nil {
+					m.addNotice("error", "retry could not restore a safe post-turn workspace; recovery journal retained")
+					return stop
+				}
+				m.addNotice("error", "retry aborted; source session and post-turn files were kept: "+err.Error())
+				return m.nextQueuedTurn()
+			}
+			publicationCommitted = true
+			if result.RecoveryRequired != nil {
+				retryRecoveryRequired = true
+				retryWarning = "retry was adopted, but publication durability is uncertain; Switchboard will stop before another workspace mutation and recover on restart: " + result.RecoveryRequired.Error()
+				stopAfterUncertainPublication(result.RecoveryRequired)
+			}
+			if result.CleanupWarning != nil {
+				warning := "retry succeeded, but its recovery journal could not be cleared; restart before another retry: " + result.CleanupWarning.Error()
+				if retryWarning == "" {
+					retryWarning = warning
+				} else {
+					retryWarning += "; " + warning
+				}
+			}
+			changed := append(append([]string(nil), result.Restored...), result.Removed...)
+			if !tx.checkpointKnown {
+				retryInfo = "the turn's files were left as they are (its exact checkpoint is unavailable or /undo already took it back)"
+			} else if len(changed) == 0 {
+				retryInfo = "the turn's files were left as they are (it changed none)"
+			} else {
+				m.app.loop.Tools.ForgetVersions(changed)
+				invalidateRestoredWorkspace(m)
+				retryInfo = fmt.Sprintf("took back the turn's file changes (%d restored, %d removed); what commands did stays done",
+					len(result.Restored), len(result.Removed))
+			}
+		} else if !tx.checkpointKnown {
+			retryInfo = "the turn's files were left as they are (its exact checkpoint is unavailable or /undo already took it back)"
+		}
+		if !publicationCommitted {
+			outcome, err := publishDurablyWith(msg.sess, msg.publishDurably)
+			if !outcome.Visible {
+				if err == nil {
+					err = errors.New("retry publication returned no visible commit")
+				}
+				if rollbackErr := m.app.loop.BindSession(old); rollbackErr != nil {
+					return stopAfterRollbackFailure("retry publication failed and source-session rollback also failed", err, rollbackErr)
+				}
+				if msg.sess != old {
+					_ = msg.sess.CloseDiscardingStaged()
+				}
+				if msg.operation != 0 {
+					m.finishOperation(msg.operation, false)
+				}
+				m.addNotice("error", "retry aborted before publication; source session and files were kept: "+err.Error())
+				return m.nextQueuedTurn()
+			}
+			publicationCommitted = true
+			if !outcome.Durable {
+				retryRecoveryRequired = true
+				if err == nil {
+					err = errors.New("publication became visible before its durability was proven")
+				}
+				retryWarning = "retry was adopted, but publication durability is uncertain; Switchboard will stop before another workspace mutation and verify the child on restart: " + err.Error()
+				stopAfterUncertainPublication(err)
+			}
+		}
+		// The source outcome becomes true only now: the child is bound and every
+		// checkpointed file is at its pre-turn image. A failed label cannot undo
+		// that completed adoption, so surface it without pretending it landed.
+		if !adoptionStopRequired {
+			if err := tx.source.AppendNote("info", fmt.Sprintf(
+				"retry: the last answer was set aside (outcome user_corrected); rerunning on %s", tx.destination)); err != nil {
+				labelWarning := "retry succeeded, but the source answer could not be labelled user_corrected: " + err.Error()
+				if retryWarning == "" {
+					retryWarning = labelWarning
+				} else {
+					retryWarning += "; " + labelWarning
+				}
+			}
+		}
+	} else {
+		disposition, err := publish()
+		switch disposition {
+		case publicationUnpublished:
+			if rollbackErr := m.app.loop.BindSession(old); rollbackErr != nil {
+				return stopAfterRollbackFailure("session publication failed and source-session rollback also failed", err, rollbackErr)
+			}
+			if msg.sess != old {
+				_ = msg.sess.CloseDiscardingStaged()
+			}
+			if msg.operation != 0 {
+				m.finishOperation(msg.operation, false)
+			}
+			m.addNotice("error", "session change was not published; the source session was kept: "+err.Error())
+			return m.nextQueuedTurn()
+		case publicationVisibleUncertain:
+			// Visibility commits adoption. Rolling the loop back now would leave two
+			// authoritative sessions, while continuing could append work to a child
+			// whose marker is lost on power failure. Finish the in-memory adoption,
+			// then stop before any continuation or queued turn can run.
+			stopAfterUncertainPublication(err)
+		}
+	}
+	// A kept race's alternative is audit evidence, not part of adoption. It is
+	// allowed to attempt publication only after the winner's discovery commit;
+	// failure here cannot roll back a winner already made authoritative.
+	if msg.publishAfter != nil && !adoptionStopRequired {
+		outcome, rawErr := publishDurablyWith(msg.publishAfter, msg.publishDurably)
+		disposition, err := publicationResult(outcome, rawErr, "race alternative "+msg.publishAfter.ID())
+		switch disposition {
+		case publicationUnpublished:
+			m.addNotice("warn", "the race winner was adopted, but the other answer stayed hidden: "+err.Error())
+		case publicationVisibleUncertain:
+			_ = msg.publishAfter.Close()
+			publishAfterSettled = true
+			stopAfterUncertainPublication(err)
+		case publicationDurable:
+			_ = msg.publishAfter.Close()
+			publishAfterSettled = true
+			msg.note += msg.publishAfterNote
+		}
+	}
+	// Dialogs are projections of the old session. Drain both the visible dialog
+	// and anything queued behind it only after the swap has committed, so an
+	// async picker cannot act on the newly adopted conversation.
+	dialogCleanup := m.cancelDialogs()
+	withDialogCleanup := func(next tea.Cmd) tea.Cmd {
+		if dialogCleanup == nil {
+			return next
+		}
+		if next == nil {
+			return dialogCleanup
+		}
+		return tea.Sequence(dialogCleanup, next)
+	}
+	// Presentation state follows the same commit point as the session and
+	// workspace. A failed runtime bind or retry restore must not close the
+	// source's panel or advance its workspace generation.
+	m.asyncResultGeneration++
+	m.closeFullscreen()
+	m.workspaceGeneration++
+	// Advice may survive an ordinary turn boundary so the next round can use
+	// it, but it may not survive a session boundary. The advisor barrier held
+	// by session-changing operations has already settled any in-flight consult;
+	// clear the old log's pending evidence only after adoption committed and
+	// before an automatic or queued continuation can assemble its opening.
+	if advisor := m.app.currentAdvisor(); advisor != nil {
+		advisor.ResetSession()
+	}
+	// These injection ledgers describe the adopted log, not the application.
+	// A compaction intentionally carries its watch fold, but it still starts a
+	// fresh request history and path-rule budget, so these reset on every
+	// committed swap. Settings, schedules, and the armed watch remain app-wide.
+	m.app.resetPressureSession()
+	m.app.rules.resetSession()
 	if m.app.caches != nil {
 		m.app.caches.Reset(msg.tier.Target, cacheFor(msg.tier.Target, m.app.catalog))
 	}
 	m.app.bind(msg.tier, msg.client, runtimeBinding.Pinned)
+	// A verifier observation is session-owned even though /watch itself is an
+	// app-wide declaration. Ordinary adoption invalidates and cancels old work;
+	// compaction and a kept race arm deliberately carry the same conversation.
+	m.app.watchSt.sessionBoundary(msg.sess.ID(), msg.keepFold)
 	if old != nil && old != msg.sess {
 		old.Close()
-	}
-	if !msg.keepFold {
-		m.app.watchSt.takeFold()
 	}
 	// BindSession made the context switch indivisible: it restored the new
 	// session's todos and dropped every prior-session file-read token before
@@ -2009,6 +3361,13 @@ func (m *tuiModel) onSessionSwap(msg sessionSwapMsg) tea.Cmd {
 	// A new log is a new day for the routing dots and the clock; a resumed
 	// session's earlier moves live in its record, not the bar.
 	m.moves = nil
+	// /why and the one-time /bisect lesson are projections of this log. Keeping
+	// their prior process state would attribute another session's races/routes
+	// to the adopted one and suppress a hint its checkpoint history has not seen.
+	m.routeLog = nil
+	m.raceLog = nil
+	m.bisectHinted = false
+	m.resetHistoryNavigation()
 	m.sessionAt = time.Now()
 	m.addBanner(msg.sess, !msg.fresh)
 	if !msg.fresh {
@@ -2016,11 +3375,19 @@ func (m *tuiModel) onSessionSwap(msg sessionSwapMsg) tea.Cmd {
 	}
 	if msg.note != "" {
 		level := ""
-		if msg.warnNote {
+		if msg.warnNote && !adoptionStopRequired {
 			level = "warn"
-			_ = m.app.loop.Session.AppendNote("warn", msg.note)
 		}
 		m.addNotice(level, msg.note)
+	}
+	if retryInfo != "" {
+		m.addInfo("  " + retryInfo)
+	}
+	if retryWarning != "" {
+		m.addNotice("warn", retryWarning)
+	}
+	if adoptionWarning != "" {
+		m.addNotice("error", adoptionWarning)
 	}
 	m.tierLine = m.app.tierLine()
 	m.mode = m.app.loop.Perms.Mode()
@@ -2038,30 +3405,40 @@ func (m *tuiModel) onSessionSwap(msg sessionSwapMsg) tea.Cmd {
 	if msg.operation != 0 {
 		m.finishOperation(msg.operation, false)
 	}
+	if retryRecoveryRequired || adoptionStopRequired {
+		m.quitting = true
+		return withDialogCleanup(tea.Quit)
+	}
 
 	// A swap that carries its own continuation runs it now; /retry's replay
 	// belongs to the fork it just landed in, ahead of anything queued.
 	if msg.andThen != nil {
 		if !msg.continueTurn {
-			return msg.andThen
+			return withDialogCleanup(msg.andThen)
 		}
 		_, generation := m.startPlanning()
 		continuation := msg.andThen
-		return func() tea.Msg {
+		return withDialogCleanup(func() tea.Msg {
 			next := continuation()
 			if retry, ok := next.(retryStartMsg); ok {
 				retry.generation = generation
 				return retry
 			}
 			return next
-		}
+		})
 	}
 
 	// A compacted session does not wait to be told what it already knows:
 	// with nothing queued, the continuation opens the new session's first
 	// turn. Queued prompts are themselves the continuation when they exist.
+	// The one-shot threshold bypass travels into whichever launch wins here;
+	// it is not stored on the model, so a refused or cancelled launch consumes
+	// it rather than silently exempting a later turn.
 	if msg.continuePrompt != "" && len(m.queue) == 0 {
-		return m.startTurn(msg.continuePrompt, "")
+		if msg.suppressAutoCompactOnce {
+			return withDialogCleanup(m.startPostCompactTurn(msg.continuePrompt, true))
+		}
+		return withDialogCleanup(m.startSyntheticTurn(msg.continuePrompt))
 	}
 
 	// Prompts queued behind the turn that triggered an auto-compaction run
@@ -2069,23 +3446,56 @@ func (m *tuiModel) onSessionSwap(msg sessionSwapMsg) tea.Cmd {
 	if len(m.queue) > 0 && !m.busy {
 		next := m.queue[0]
 		m.queue = m.queue[1:]
-		return m.startTurn(next, "")
+		if msg.suppressAutoCompactOnce {
+			return withDialogCleanup(m.startPostCompactTurn(next, false))
+		}
+		return withDialogCleanup(m.startTurn(next, ""))
 	}
-	return nil
+	return withDialogCleanup(nil)
 }
 
 // replayHistory draws a resumed session's recorded conversation, so picking up
 // a session looks like continuing it rather than opening an empty window.
 func (m *tuiModel) replayHistory(state session.State) {
+	results := make(map[string]provider.ToolResult)
+	var resultOrder []string
+	for _, msg := range state.Messages {
+		for _, block := range msg.Content {
+			if result, ok := block.(provider.ToolResult); ok {
+				if _, exists := results[result.ToolUseID]; !exists {
+					resultOrder = append(resultOrder, result.ToolUseID)
+				}
+				results[result.ToolUseID] = result
+			}
+		}
+	}
+	matchedResults := make(map[string]bool)
 	for _, msg := range state.Messages {
 		if msg.Role == provider.RoleUser {
-			// A continuity capsule is provider-visible metadata, not something
-			// the user typed. Render the authored projection once so a stamped
-			// opening neither leaks the hidden block nor splits multi-text input
-			// into several apparent turns.
-			if text := msg.AuthoredText(); text != "" {
-				m.addUser(text)
+			if msg.Synthetic {
+				m.addNotice("", syntheticReplayNotice(msg))
+			} else if msg.Injected {
+				// Injected context is machine-authored evidence. It is useful in a
+				// resumed transcript, but it must never wear the user's card style.
+				if text := msg.Text(); text != "" {
+					m.addNotice("", "injected round-boundary context · "+text)
+				}
+			} else if session.OpensTurn(msg) {
+				// New logs carry the exact pre-expansion projection. Legacy logs do
+				// not, and their wire text may include files, shell output, or
+				// advisor/watch folds. Withhold that ambiguous text visibly rather
+				// than attribute machine-added content to the user.
+				if text, known := msg.AuthoredProjection(); known {
+					if text != "" {
+						m.addUser(text)
+					}
+				} else {
+					m.addNotice("warn", "authored wording is unavailable for this legacy turn; its provider-expanded opening is hidden")
+				}
 			}
+		}
+		if msg.Role == provider.RoleAssistant && msg.Incomplete {
+			m.addNotice("warn", "interrupted model output follows; it is kept for diagnosis and excluded from future provider requests")
 		}
 		for _, b := range msg.Content {
 			switch b := b.(type) {
@@ -2102,8 +3512,23 @@ func (m *tuiModel) replayHistory(state session.State) {
 			case provider.ToolUse:
 				// A replayed session does not record which rung ran each
 				// call, so history renders neutral rather than guessing.
-				m.tr.add(&entry{kind: kindTool, tool: toolEntry{name: b.Name, done: true}, rank: -1})
+				tool := toolEntry{id: b.ID, name: b.Name, done: true}
+				if result, ok := results[b.ID]; ok {
+					tool.failed = result.IsError
+					tool.detail = result.Content
+					matchedResults[b.ID] = true
+				} else {
+					tool.failed = true
+					tool.detail = "no durable tool result was recorded; outcome unknown, inspect before retrying"
+				}
+				m.tr.add(&entry{kind: kindTool, tool: tool, rank: -1})
 			}
+		}
+	}
+	for _, id := range resultOrder {
+		result := results[id]
+		if !matchedResults[id] {
+			m.addNotice("warn", "orphaned tool result "+result.Name+" ("+id+") was preserved in the log but has no recorded call")
 		}
 	}
 	m.tr.scrollToBottom()
@@ -2295,6 +3720,24 @@ func (m *tuiModel) refreshCost(state session.State) {
 	}
 }
 
+func syntheticReplayNotice(message provider.Message) string {
+	text := strings.TrimSpace(message.AuthoredText())
+	if strings.HasPrefix(text, compactSeedHead) {
+		if _, summary, ok := strings.Cut(text, "\n\n"); ok {
+			label := redactCredentialTextBeforeTruncate(strings.Join(strings.Fields(compactOpeningLabel(summary)), " "), 160)
+			if label != "" {
+				return "Switchboard compaction handoff · " + label
+			}
+		}
+		return "Switchboard compaction handoff"
+	}
+	label := redactCredentialTextBeforeTruncate(strings.Join(strings.Fields(text), " "), 160)
+	if label == "" {
+		return "Switchboard automatic continuation"
+	}
+	return "Switchboard automatic continuation · " + label
+}
+
 // refreshCtxWindow settles how much room this target has, from the most
 // direct source that has an answer.
 //
@@ -2309,22 +3752,7 @@ func (m *tuiModel) refreshCost(state session.State) {
 // window that does not exist.
 func (m *tuiModel) refreshCtxWindow() {
 	target := m.app.loop.Binding().Target
-	probed, enforced := m.app.providers.probedContextWindow(target)
-	declared := m.app.config.ProviderForTarget(target.Provider, target.Surface).ContextWindow
-	switch {
-	case declared > 0 && !enforced:
-		m.ctxWindow = declared
-	case probed > 0:
-		m.ctxWindow = probed
-	case declared > 0:
-		m.ctxWindow = declared
-	default:
-		if info, _, ok := m.app.catalog.Lookup(target); ok {
-			m.ctxWindow = info.ContextWindow
-			return
-		}
-		m.ctxWindow = 0
-	}
+	m.ctxWindow = effectiveContextWindow(m.app.config, m.app.providers, m.app.catalog, target)
 }
 
 // --- view ------------------------------------------------------------------
@@ -2333,33 +3761,73 @@ func (m *tuiModel) View() string {
 	if m.quitting {
 		return ""
 	}
-	if m.full != nil {
+	height := max(m.height, 0)
+	if height == 0 {
+		return ""
+	}
+	// Modals outrank fullscreen panels. An approval can arrive while /diff or
+	// another panel is open, and hiding the only answer surface deadlocks the
+	// running turn.
+	if m.full != nil && m.dlg == nil {
 		return m.full.view(m.width, m.height, m.th)
 	}
 
-	inputZone := m.inputZoneView()
-	chrome := 1 // status line
-	if m.busy {
+	modal := m.dlg != nil
+	showWorking := m.busy && !modal
+	// A blocking answer surface outranks passive status. Giving a modal the
+	// whole pane also lets a six-row terminal retain identity, consequence,
+	// safe default, and the selected action at once.
+	showStatus := !modal
+	chrome := 0
+	if showStatus {
 		chrome++
 	}
-	rail := m.height >= 15 // a short pane spends its rows on content
+	if showWorking {
+		chrome++
+	}
+	rail := height >= 15 && !modal // a short pane spends its rows on content
 	if rail {
 		chrome++
 	}
-	transH := m.height - lipgloss.Height(inputZone) - chrome
-	if transH < 1 {
-		transH = 1
+	available := max(height-chrome, 0)
+	inputBudget := available
+	if !modal && available > 3 {
+		// Once the three-row composer fits, preserve one row of conversational
+		// context. A modal instead owns every row above status: its answer can be
+		// blocking a provider goroutine and must not disappear behind transcript.
+		inputBudget--
 	}
+	inputZone := m.inputZoneViewWithin(inputBudget)
+	transH := max(height-lipgloss.Height(inputZone)-chrome, 0)
 
-	parts := []string{m.tr.view(transH), inputZone}
-	if m.busy {
+	var parts []string
+	if transH > 0 {
+		parts = append(parts, m.tr.view(transH))
+	} else {
+		m.tr.height = 0
+	}
+	if inputZone != "" {
+		parts = append(parts, inputZone)
+	}
+	if showWorking {
 		parts = append(parts, m.workingLine())
 	}
 	if rail {
 		parts = append(parts, m.ctxRail())
 	}
-	parts = append(parts, m.statusLine())
-	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+	if showStatus {
+		parts = append(parts, m.statusLine())
+	}
+	view := lipgloss.JoinVertical(lipgloss.Left, parts...)
+	rows := strings.Split(view, "\n")
+	if len(rows) > height {
+		// Keep the control surface and status at the bottom if a future renderer
+		// violates its declared height. This is a paint-boundary backstop; every
+		// current component receives its real budget above.
+		rows = rows[len(rows)-height:]
+		view = strings.Join(rows, "\n")
+	}
+	return view
 }
 
 // inputZoneView is the composer: a rounded frame one shade off the page,
@@ -2369,8 +3837,33 @@ func (m *tuiModel) View() string {
 // is visible at the exact place the next instruction is typed. Popups dock
 // above the frame.
 func (m *tuiModel) inputZoneView() string {
+	height := m.height
+	if height <= 0 {
+		height = dialogUnlimitedHeight
+	}
+	return m.inputZoneViewWithin(height)
+}
+
+func (m *tuiModel) inputZoneViewWithin(height int) string {
+	if height <= 0 {
+		return ""
+	}
 	if m.dlg != nil {
-		return m.dlg.view(m.width, m.th)
+		waiting := len(m.dialogQueue)
+		showWaiting := waiting > 0 && height >= 7
+		dialogHeight := height
+		if showWaiting {
+			dialogHeight--
+		}
+		view := renderDialogWithin(m.dlg, m.width, dialogHeight, m.th)
+		if showWaiting {
+			label := fmt.Sprintf(" %d more prompt", waiting)
+			if waiting != 1 {
+				label += "s"
+			}
+			view += "\n" + m.th.faint.Render(workspaceFit(label+" waiting", max(m.width, 1)))
+		}
+		return view
 	}
 
 	m.ta.FocusedStyle.Prompt = m.th.faint
@@ -2395,7 +3888,7 @@ func (m *tuiModel) inputZoneView() string {
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(frame).
 		Padding(0, 1).
-		Width(max(m.width-4, 20))
+		Width(max(m.width-4, 1))
 
 	var parts []string
 	switch {
@@ -2408,11 +3901,20 @@ func (m *tuiModel) inputZoneView() string {
 	case m.mentionsVisible():
 		parts = append(parts, m.mentionsView())
 	}
-	parts = append(parts, box.Render(m.ta.View()))
+	parts = append(parts, box.Render(safeTextareaView(m.ta, max(m.width-6, 1))))
 
 	lines := strings.Split(lipgloss.JoinVertical(lipgloss.Left, parts...), "\n")
 	for i, l := range lines {
-		lines[i] = " " + l
+		// Popups include repository paths, persisted prompts, and arbitrary
+		// search text. Bound the composed row after the page gutter so none of
+		// those surfaces can create a terminal-side physical wrap that shifts
+		// the composer or mouse geometry.
+		lines[i] = fitCells(" "+l, max(m.width, 1))
+	}
+	if len(lines) > height {
+		// Popups yield before the composer: at a short height the editable field
+		// and its border remain visible while suggestions above it are clipped.
+		lines = lines[len(lines)-height:]
 	}
 	return strings.Join(lines, "\n")
 }
@@ -2427,20 +3929,57 @@ var workVerbs = []string{"patching through", "on the line", "connecting", "holdi
 // then the way out. Color answers "who is working" before text does. Token
 // counts live in the completion line and /cost.
 func (m *tuiModel) workingLine() string {
+	width := max(m.width, 0)
+	if width == 0 {
+		return ""
+	}
 	verb := workVerbs[int(time.Since(m.started).Seconds()/4)%len(workVerbs)]
 	who := m.spin.View() + " " + verb
-	mid := ""
 	if rank := m.activeRank(); rank >= 0 {
 		who = m.th.rung(rank).Render(who)
-		mid = m.th.dim.Render(" · " + m.app.tier.ID)
+	}
+	line := " " + who
+	type segment struct {
+		text string
+		drop int
+	}
+	var segments []segment
+	if rank := m.activeRank(); rank >= 0 {
+		segments = append(segments, segment{
+			text: m.th.dim.Render(" · " + terminaltext.Escape(m.app.tier.ID)), drop: 70,
+		})
 	}
 	elapsed := time.Since(m.started).Round(time.Second)
-	line := " " + who + mid + m.th.dim.Render(" · "+elapsed.String())
-	line += m.th.faint.Render("  esc interrupts · ctrl+s steers")
+	segments = append(segments,
+		segment{text: m.th.dim.Render(" · " + elapsed.String()), drop: 80},
+		segment{text: m.th.faint.Render(" · esc interrupts"), drop: 20},
+		segment{text: m.th.faint.Render(" · ctrl+s steers"), drop: 100},
+	)
 	if len(m.queue) > 0 {
-		line += m.th.faint.Render(fmt.Sprintf("  %d queued", len(m.queue)))
+		segments = append(segments, segment{
+			text: m.th.faint.Render(fmt.Sprintf(" · %d queued", len(m.queue))), drop: 10,
+		})
 	}
-	return line
+	lineWidth := func() int {
+		cells := lipgloss.Width(line)
+		for _, segment := range segments {
+			cells += lipgloss.Width(segment.text)
+		}
+		return cells
+	}
+	for lineWidth() > width && len(segments) > 0 {
+		drop := 0
+		for index := 1; index < len(segments); index++ {
+			if segments[index].drop > segments[drop].drop {
+				drop = index
+			}
+		}
+		segments = append(segments[:drop], segments[drop+1:]...)
+	}
+	for _, segment := range segments {
+		line += segment.text
+	}
+	return fitCells(line, width)
 }
 
 // recordMove appends a landed switch to the session's routing history, the
@@ -2497,9 +4036,11 @@ func (m *tuiModel) syncTitle() tea.Cmd {
 }
 
 func (m *tuiModel) titleText() string {
-	title := "sb · " + filepath.Base(m.app.workspace) + " · " + m.app.tier.ID
+	workspace := terminaltext.Escape(filepath.Base(m.app.workspace))
+	tier := terminaltext.Escape(m.app.tier.ID)
+	title := workspaceFit("sb · "+workspace+" · "+tier, 120)
 	if m.busy {
-		title = "● " + title
+		title = workspaceFit("● "+title, 120)
 	}
 	return title
 }

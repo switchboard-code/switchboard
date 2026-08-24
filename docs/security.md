@@ -48,7 +48,10 @@ unless an explicit rule or remembered human answer covers them.
 
 Human approval views escape terminal controls. A very large command is visibly
 shortened while retaining its executable and early flags, its tail, and an
-omitted-character count; the shortening is display-only.
+omitted-character count; the shortening is display-only. All modal prompts use
+one FIFO broker, approvals start on No, and cancelling the terminal interaction
+denies or declines every queued waiter. Narrow-terminal rendering keeps the
+warning and safe choice visible rather than clipping the decision.
 
 `yolo` is deliberately unconfined and exempts nothing: writes, commands,
 sensitive commands, and external tools all run without asking. It does not
@@ -83,13 +86,17 @@ limit.
 
 ## Workspace trust
 
-A checkout can declare MCP servers and hooks under `.switchboard/`, and its
-build graph can control a language server. None of those processes start until
-the workspace is trusted.
+A checkout can declare MCP servers and hooks under `.switchboard/`, its build
+graph can control a language server, and Git status can invoke repository
+filters or hooks while constructing `/diff`. None of those processes start
+until the workspace is trusted. `/diff` therefore refuses before its first Git
+command unless the checkout has a standing grant; `/review` remains the
+Git-free recorded-turn view.
 
 `/trust` previews the exact declared MCP servers, hook commands and tool
 filters, and language-server candidate without starting them. `/trust grant`
-records permission for the resolved checkout. `/trust revoke` removes it.
+records permission for the resolved checkout, including Git's repository
+execution behavior. `/trust revoke` removes it.
 
 User files under `~/.switchboard` are treated as the user's own configuration.
 Native Codex and Claude project MCP entries still require Switchboard trust;
@@ -106,14 +113,15 @@ order:
 2. a configured credential helper;
 3. an OAuth login;
 4. the OS credential service, using Keychain on macOS or Secret Service on
-   Linux.
+   Linux. Windows builds currently have no native credential-store backend.
 
 `/login`, `sb auth`, and first-run setup read secrets from a masked prompt or
 stdin. Secrets are not accepted on the command line and are not written to
 configuration, session logs, or errors. Status output uses placeholders.
 
-There is no encrypted-file fallback. A mode-0600 file controls access but does
-not encrypt its contents. On a machine without a credential service, use an
+There is no encrypted-file fallback. An owner-only file (0600 on Unix; a
+protected current-user DACL on Windows) controls access but does not encrypt
+its contents. On Windows, or any machine without a credential service, use an
 environment variable or helper:
 
 ```toml
@@ -132,6 +140,11 @@ prefixes. The scan includes file attachments and output injected by `!cmd`.
 It uses known issuer formats rather than entropy guesses so a match has a clear
 meaning.
 
+TUI `@path` attachments are opened at submit time through a capability bound to
+the canonical workspace. A path that escapes that root, a replaced
+root, parent, or file, a non-regular file, or a file that exceeds its bound is
+not attached; the prompt receives an explicit omission note instead.
+
 In the TUI, a match offers three choices: redact it, send the original text, or
 drop the prompt. Redaction tells the model where a credential was removed. A
 headless `sb -p` run cannot ask, so it refuses the send unless
@@ -146,6 +159,22 @@ redirect to a different host is refused. No permission mode skips this check.
 Computer-use text is scanned before it is typed into another application, and
 text read from applications is redacted before it enters the session. See
 [Computer use](computer.md).
+
+Prompt history is an owner-private, per-workspace JSONL record: mode 0600 on
+Unix and a protected DACL with exactly one current-user allow entry on Windows.
+The program verifies that protection through the open file handle before every
+write and after atomic publication; a filesystem that cannot enforce it loses
+persistent history rather than receiving a weaker copy. Legacy plaintext
+history is accepted once and rewritten in the bounded format. Credential-shaped
+text is redacted before persistence, so choosing “send as typed” for one
+outbound turn does not silently create another durable copy in history.
+
+The cross-agent boundary is scanned separately. Tasks, steering, workflow
+carry, failures, and child results are redacted before they cross; every child
+receives a final runtime contract after any repository-defined agent prompt.
+Child reports return inside an explicit untrusted-evidence frame. A worker can
+specialize its assignment, but its report cannot widen the parent's task,
+permissions, or trust decisions.
 
 ## Configured processes
 
@@ -175,3 +204,14 @@ been actioned for using it. OpenAI's terms govern the account.
 
 A client you register under `[auth.openai.oauth]` takes precedence over the
 bundled client.
+
+## Update integrity
+
+Startup release checks are notice-only by default. Manual `/update` and
+`sb update`, or an explicit `/update auto on`, download one platform archive
+and verify its exact SHA-256 digest against `checksums.txt` from the same
+GitHub release before replacing an executable. This detects corruption and
+mismatched assets, but it is not independent publisher authentication: a
+release-account compromise could replace both the binary and its checksum.
+Switchboard does not silently opt users into that trust model, and it does not
+replace package-manager-owned installations.

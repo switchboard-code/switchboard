@@ -367,6 +367,27 @@ func TestActiveTierOverrideDoesNotInventMoveOrAbandonCache(t *testing.T) {
 	}
 }
 
+func TestSameTargetOverrideRefreshesProviderThroughRestore(t *testing.T) {
+	m := testModel(t)
+	stale := &racedProvider{}
+	fresh := &racedProvider{}
+	binding := m.app.loop.Binding()
+	binding.Provider = stale
+	m.app.loop.Bind(binding)
+
+	m.applyOverrideBinding(overrideProbeMsg{tier: m.app.tier, client: fresh})
+	if got := m.app.loop.Binding().Provider; got != fresh {
+		t.Fatalf("same-target override kept stale provider %p; want prepared client %p", got, fresh)
+	}
+	if m.restoreBinding.Provider != fresh {
+		t.Fatal("override restore snapshot retained the discarded provider")
+	}
+	m.restoreOverride()
+	if got := m.app.loop.Binding().Provider; got != fresh {
+		t.Fatalf("override restore reinstated stale provider %p; want prepared client %p", got, fresh)
+	}
+}
+
 func TestResumeUsesConfiguredFallbackAndPersistsSubstitution(t *testing.T) {
 	m := testModel(t)
 	server := fakeOllama(t, "resume-backup")
@@ -796,13 +817,15 @@ func TestNewerVersion(t *testing.T) {
 }
 
 func TestChecksumFor(t *testing.T) {
-	sums := []byte("abc123  sb_0.3.0_darwin_arm64.tar.gz\ndef456 *sb_0.3.0_linux_amd64.tar.gz\n")
+	darwinSum := strings.Repeat("a", 64)
+	linuxSum := strings.Repeat("B", 64)
+	sums := []byte(darwinSum + "  sb_0.3.0_darwin_arm64.tar.gz\n" + linuxSum + " *sb_0.3.0_linux_amd64.tar.gz\n")
 	got, err := checksumFor(sums, "sb_0.3.0_darwin_arm64.tar.gz")
-	if err != nil || got != "abc123" {
+	if err != nil || got != darwinSum {
 		t.Fatalf("got %q, %v", got, err)
 	}
 	got, err = checksumFor(sums, "sb_0.3.0_linux_amd64.tar.gz")
-	if err != nil || got != "def456" {
+	if err != nil || got != strings.ToLower(linuxSum) {
 		t.Fatalf("binary-mode entry: got %q, %v", got, err)
 	}
 	if _, err := checksumFor(sums, "missing"); err == nil {

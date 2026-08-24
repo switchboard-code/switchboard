@@ -19,6 +19,8 @@ import (
 	"github.com/switchboard-code/switchboard/internal/credential"
 	"github.com/switchboard-code/switchboard/internal/provider"
 	"github.com/switchboard-code/switchboard/internal/provider/anthropic"
+	"github.com/switchboard-code/switchboard/internal/provider/kimi"
+	"github.com/switchboard-code/switchboard/internal/provider/openai"
 	route "github.com/switchboard-code/switchboard/internal/router"
 )
 
@@ -56,6 +58,154 @@ func TestProviderClientCacheIsConcurrentAndCoherent(t *testing.T) {
 				t.Fatalf("surface %s constructed duplicate clients", targets[index].Surface)
 			}
 		}
+	}
+}
+
+func TestProviderRegistryScopesMessagesClientsByServingSurface(t *testing.T) {
+	for _, tc := range []struct {
+		name, providerName, defaultSurface string
+	}{
+		{name: "anthropic", providerName: anthropic.Name, defaultSurface: anthropic.Surface},
+		{name: "kimi", providerName: kimi.Name, defaultSurface: kimi.Surface},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := func(model string) *httptest.Server {
+				ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != "/v1/models" {
+						http.NotFound(w, r)
+						return
+					}
+					_, _ = fmt.Fprintf(w, `{"data":[{"id":%q}]}`, model)
+				}))
+				t.Cleanup(ts.Close)
+				return ts
+			}
+			first, second := server("model-a"), server("model-b")
+			customSurface := "private-gateway"
+			cfg := &config.Config{}
+			cfg.SetProviderBaseURL(config.ProviderSurfaceKey(tc.providerName, tc.defaultSurface), first.URL)
+			cfg.SetProviderBaseURL(config.ProviderSurfaceKey(tc.providerName, customSurface), second.URL)
+			registry := newProviders("", cfg)
+			firstTier := config.Tier{ID: "t1", Target: provider.RouteTarget{
+				Provider: tc.providerName, Surface: tc.defaultSurface, ModelID: "model-a",
+			}}
+			secondTier := config.Tier{ID: "t2", Target: provider.RouteTarget{
+				Provider: tc.providerName, Surface: customSurface, ModelID: "model-b",
+			}}
+			_, firstClient, err := registry.probeTier(context.Background(), firstTier)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, secondClient, err := registry.probeTier(context.Background(), secondTier)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if firstClient == secondClient {
+				t.Fatal("two serving surfaces shared one Messages client")
+			}
+		})
+	}
+}
+
+func TestProvidersRejectUnknownOpenAISurfaceBeforeNetwork(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
+	t.Cleanup(server.Close)
+	cfg := &config.Config{}
+	cfg.SetProviderBaseURL(config.ProviderSurfaceKey(openai.Name, "firstparty"), server.URL)
+	registry := newProviders("", cfg)
+	tier := config.Tier{ID: "t1", Target: provider.RouteTarget{
+		Provider: openai.Name, Surface: "firstparty", ModelID: "gpt-test",
+	}}
+	if _, _, err := registry.probeTier(context.Background(), tier); err == nil || !strings.Contains(err.Error(), "not a tested") {
+		t.Fatalf("unknown OpenAI surface error = %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("unknown OpenAI surface made %d network calls", calls)
+	}
+}
+
+func TestProviderResetInvalidatesLiveEvidence(t *testing.T) {
+	p := newProviders("http://127.0.0.1:11434", &config.Config{})
+	target := provider.RouteTarget{Provider: "ollama", Surface: "local", ModelID: "moving"}
+	p.mu.Lock()
+	p.probes[target.ID()] = provider.ProbeResult{Reachable: true, ModelPresent: true, Tools: provider.ToolsParallel, Vision: true}
+	p.efforts[bareTargetKey(target)] = []string{"low", "high"}
+	p.windows[bareTargetKey(target)] = probedWindow{tokens: 32_768, enforced: true}
+	p.mu.Unlock()
+
+	p.reset()
+
+	if _, known := p.probedCapabilities(target); known {
+		t.Fatal("a provider reset retained capability evidence from the discarded client")
+	}
+	if _, known := p.probedEffortLevels(target); known {
+		t.Fatal("a provider reset retained effort evidence from the discarded client")
+	}
+	if window, enforced := p.probedContextWindow(target); window != 0 || enforced {
+		t.Fatalf("a provider reset retained context evidence: window=%d enforced=%v", window, enforced)
+	}
+}
+
+func TestResetDuringProbeCannotRepublishDiscardedClientEvidence(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startOnce sync.Once
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			startOnce.Do(func() { close(started) })
+			<-release
+			_, _ = w.Write([]byte(`{"models":[{"name":"moving"}]}`))
+		case "/api/show":
+			_, _ = w.Write([]byte(`{"capabilities":["tools","vision"]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(old.Close)
+	current := fakeOllama(t, "moving") // tool capable, but no vision evidence
+
+	registry := newProviders(old.URL, &config.Config{})
+	tier := ollamaTier("t1", "moving")
+	type answer struct {
+		client provider.Provider
+		err    error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		_, client, err := registry.probeTier(context.Background(), tier)
+		done <- answer{client: client, err: err}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old provider probe did not start")
+	}
+	registry.adoptOllamaHost(current.URL)
+	close(release)
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if _, ok := got.client.(*providerRef); !ok {
+			t.Fatalf("probe returned %T, want registry-owned provider reference", got.client)
+		}
+		if !registry.preparedClientCurrent(got.client) {
+			t.Fatal("probe returned authority from the client generation discarded by reset")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("probe did not retry against the replacement provider")
+	}
+	probe, known := registry.probedCapabilities(tier.Target)
+	if !known {
+		t.Fatal("replacement provider evidence was not recorded")
+	}
+	if probe.Vision {
+		t.Fatal("discarded provider's vision evidence survived the reset")
 	}
 }
 
@@ -106,7 +256,7 @@ func TestProbeCancellationInterruptsCredentialResolution(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("cancelled credential lookup did not return promptly")
 	}
-	if registry.anthropic != nil {
+	if len(registry.anthropic) != 0 {
 		t.Fatal("cancelled credential lookup installed a provider client")
 	}
 	if _, ok := registry.probedCapabilities(target); ok {
@@ -114,7 +264,7 @@ func TestProbeCancellationInterruptsCredentialResolution(t *testing.T) {
 	}
 }
 
-func TestProbeEvidenceSeparatesExplicitInferenceParameters(t *testing.T) {
+func TestProbeEvidenceFollowsServingIdentityAcrossInferenceParameters(t *testing.T) {
 	server := fakeOllama(t, "same-model")
 	registry := newProviders(server.URL, &config.Config{})
 	base := provider.RouteTarget{Provider: "ollama", Surface: "local", ModelID: "same-model"}
@@ -131,14 +281,41 @@ func TestProbeEvidenceSeparatesExplicitInferenceParameters(t *testing.T) {
 	}
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
-	if len(registry.probes) != 2 {
-		t.Fatalf("parameter variants produced %d probe entries, want 2", len(registry.probes))
+	if len(registry.probes) != 1 {
+		t.Fatalf("parameter variants produced %d probe entries, want one serving identity", len(registry.probes))
 	}
-	if _, ok := registry.probes[withMax.ID()]; !ok {
-		t.Fatalf("max-output probe was lost: %#v", registry.probes)
+	if _, ok := registry.probes[provider.RouteTargetID(bareTargetKey(base))]; !ok {
+		t.Fatalf("serving-identity probe was lost: %#v", registry.probes)
 	}
-	if _, ok := registry.probes[withTemperature.ID()]; !ok {
-		t.Fatalf("temperature probe was lost: %#v", registry.probes)
+}
+
+func TestProbeCapabilitiesSurviveThinkAndMaxOutputRebindsUntilReset(t *testing.T) {
+	server := fakeOllama(t, "custom-unpriced")
+	registry := newProviders(server.URL, &config.Config{})
+	base := provider.RouteTarget{Provider: "ollama", Surface: "local", ModelID: "custom-unpriced"}
+	if _, _, err := registry.probeTier(context.Background(), config.Tier{ID: "t1", Target: base}); err != nil {
+		t.Fatal(err)
+	}
+
+	variants := []provider.RouteTarget{base}
+	withThink := base
+	withThink.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "high"}
+	variants = append(variants, withThink)
+	withMax := base
+	withMax.Params.MaxOutputTokens = 4096
+	variants = append(variants, withMax)
+	for _, target := range variants {
+		probe, ok := registry.probedCapabilities(target)
+		if !ok || !probe.Reachable || !probe.ModelPresent || probe.Tools == provider.ToolsNone {
+			t.Fatalf("parameterized target %s lost live capabilities: %+v known=%v", target.ID(), probe, ok)
+		}
+	}
+
+	registry.reset()
+	for _, target := range variants {
+		if _, ok := registry.probedCapabilities(target); ok {
+			t.Fatalf("provider generation reset retained evidence for %s", target.ID())
+		}
 	}
 }
 
@@ -194,6 +371,46 @@ func TestProbeTierFallbackServesTheFirstAnswer(t *testing.T) {
 	}
 }
 
+func TestProbeTierFallbackRejectsMismatchedRungCap(t *testing.T) {
+	ts := fakeOllama(t, "primary", "backup")
+	p := newProviders(ts.URL, &config.Config{})
+	tier := ollamaTier("t1", "primary", "backup")
+	tier.Target.Params.MaxOutputTokens = 4096
+	tier.Fallbacks[0].Params.MaxOutputTokens = 2048
+
+	_, _, _, err := p.probeTierFallback(context.Background(), tier)
+	if err == nil || !strings.Contains(err.Error(), "fallback 1 has max_output 2048") ||
+		!strings.Contains(err.Error(), "rung's 4096") {
+		t.Fatalf("mismatched rung cap error = %v", err)
+	}
+}
+
+func TestDelegateFallbackMustPassDestinationPolicy(t *testing.T) {
+	local := fakeOllama(t) // the approved primary is unavailable
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":[{"id":"claude-opus-5"}]}`))
+	}))
+	t.Cleanup(remote.Close)
+
+	primary := provider.RouteTarget{Provider: "ollama", Surface: "local", ModelID: "missing"}
+	fallback := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "claude-opus-5"}
+	cfg := &config.Config{
+		Tiers:        []config.Tier{{ID: "t1", Target: primary, Fallbacks: []provider.RouteTarget{fallback}}},
+		Destinations: []string{"ollama"},
+	}
+	cfg.SetProviderBaseURL(config.ProviderSurfaceKey("anthropic", "first-party"), remote.URL)
+	registry := newProviders(local.URL, cfg)
+
+	got, _, _, err := probeDelegateTier(context.Background(), cfg, registry, "t1")
+	if err == nil || !strings.Contains(err.Error(), "not an approved destination") {
+		t.Fatalf("delegate fallback resolved to %s with error %v; want destination refusal", got.Target.Display(), err)
+	}
+}
+
 func TestProbeTierFallbackStaysQuietWhenThePrimaryServes(t *testing.T) {
 	ts := fakeOllama(t, "primary")
 	p := newProviders(ts.URL, &config.Config{})
@@ -205,6 +422,22 @@ func TestProbeTierFallbackStaysQuietWhenThePrimaryServes(t *testing.T) {
 	if tier.Target.ModelID != "primary" || note != "" {
 		t.Errorf("served %s with note %q; the fallback list must not be consulted when the primary answers",
 			tier.Target.ID(), note)
+	}
+}
+
+func TestReachablePrimaryFeasibilityFailureDoesNotActivateFallback(t *testing.T) {
+	ts := fakeOllama(t, "primary", "backup")
+	p := newProviders(ts.URL, &config.Config{})
+
+	got, _, note, err := p.probeTierFallbackFeasible(context.Background(),
+		ollamaTier("t1", "primary", "backup"), func(candidate config.Tier) error {
+			if candidate.Target.ModelID == "primary" {
+				return errors.New("context window is too small")
+			}
+			return nil
+		})
+	if err == nil || !strings.Contains(err.Error(), "context window is too small") {
+		t.Fatalf("reachable infeasible primary resolved to %s (%q), err=%v; fallback is availability-only", got.Target.Display(), note, err)
 	}
 }
 

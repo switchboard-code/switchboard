@@ -42,10 +42,15 @@ type todoState struct {
 	working continuity.Working
 }
 
-func (s *todoState) set(items []TodoItem) {
+// restore replaces the durable task and working snapshots together. Unlike a
+// model-authored todo update, restoration must not merge omitted fields: an
+// empty value belongs to the session being restored and clears whatever the
+// previously bound session left in memory.
+func (s *todoState) restore(items []TodoItem, working continuity.Working) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.items = append([]TodoItem(nil), items...)
+	s.working = working
 }
 
 // setWorking replaces the list and folds in whatever the model said about the
@@ -82,17 +87,24 @@ func (r *Registry) Todos() []TodoItem {
 	return append([]TodoItem(nil), r.todos.items...)
 }
 
-// RestoreTodos hydrates the registry from a validated durable continuity
-// capsule. Passing nil explicitly clears the old session's in-memory list,
-// which is as important as restoring a present one during an in-process
-// session swap.
-func (r *Registry) RestoreTodos(items []TodoItem) error {
+// RestoreContinuity hydrates the registry from a validated durable continuity
+// capsule. The task list and working context are replaced under one lock after
+// validation succeeds, so a failed restore changes neither. Passing nil tasks
+// and a zero Working explicitly clears the old session's in-memory state.
+func (r *Registry) RestoreContinuity(items []TodoItem, working continuity.Working) error {
 	prepared, err := prepareTodoItems(items)
 	if err != nil {
 		return err
 	}
-	r.todos.set(prepared)
+	r.todos.restore(prepared, working)
 	return nil
+}
+
+// RestoreTodos is the task-only compatibility form. A caller with no durable
+// working fields must clear them rather than inherit them from another
+// session; callers restoring a full capsule should use RestoreContinuity.
+func (r *Registry) RestoreTodos(items []TodoItem) error {
+	return r.RestoreContinuity(items, continuity.Working{})
 }
 
 const maxTodoItems = 50

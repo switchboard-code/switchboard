@@ -192,6 +192,43 @@ func TestReadFileEditsIgnoresInjectedMessages(t *testing.T) {
 	}
 }
 
+func TestReadFileEditsWithholdsLegacyExpansionAndIgnoresMachineUserRoles(t *testing.T) {
+	store, workspace := newStore(t)
+	target := provider.RouteTargetID("ollama/local/qwen3:4b")
+	sess, err := store.Create(workspace, target, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	const expanded = "write @private.txt\nEXPANDED_FILE_BYTES"
+	legacy := provider.Message{Role: provider.RoleUser, Content: []provider.Block{provider.Text{Text: expanded}}}
+	injected := provider.Message{Role: provider.RoleUser, Injected: true, Content: []provider.Block{
+		provider.Text{Text: "[advisor] INJECTED_OUTPUT"},
+	}}
+	appendAll(t, sess, legacy, injected, provider.Message{Role: provider.RoleAssistant, Content: []provider.Block{
+		provider.ToolUse{ID: "w1", Name: "write", Input: json.RawMessage(`{"path":"a.go","content":"safe\n"}`)},
+	}})
+	if err := sess.AppendUsage(Usage{Target: string(target)}); err != nil {
+		t.Fatal(err)
+	}
+	// Anthropic-compatible histories may carry tool results in a user-role
+	// message. That protocol carrier is not a second authored opening.
+	appendAll(t, sess, provider.Message{Role: provider.RoleUser, Content: []provider.Block{
+		provider.ToolResult{ToolUseID: "w1", Name: "write", Content: "TOOL_RESULT_OUTPUT"},
+	}})
+
+	edits, err := ReadFileEdits(sess.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(edits) != 1 {
+		t.Fatalf("successful legacy write replay = %+v", edits)
+	}
+	if edits[0].Turn != 1 || edits[0].Prompt != "" || edits[0].PromptAuthoredKnown || edits[0].PromptSynthetic {
+		t.Fatalf("legacy expanded prompt escaped edit provenance: %+v", edits[0])
+	}
+}
+
 func appendAll(t *testing.T, sess *Session, messages ...provider.Message) {
 	t.Helper()
 	for _, m := range messages {

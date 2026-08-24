@@ -44,6 +44,14 @@ type watcher struct {
 	mu    sync.Mutex
 	moves int
 
+	// lastUsage is the most recent provider receipt in the current turn. The
+	// REPL has no event loop of its own to retain TurnUsage, so it reads this at
+	// the turn boundary when deciding whether the last request filled the context
+	// window. Resetting it with the detector prevents a call from the prior turn
+	// being mistaken for a zero-usage or locally refused current one.
+	lastUsage session.Usage
+	usageSeen bool
+
 	// paused stops the policy moving the primary, without stopping the
 	// observation behind it. Signals keep being detected and recorded, so /why
 	// still answers what the router would have done, and the advisor still has
@@ -85,6 +93,8 @@ func (w *watcher) StartTurn() {
 	w.sticky.StartTurn()
 	w.mu.Lock()
 	w.moves = 0
+	w.lastUsage = session.Usage{}
+	w.usageSeen = false
 	w.mu.Unlock()
 }
 
@@ -92,6 +102,15 @@ func (w *watcher) MoveCount() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.moves
+}
+
+// LastUsage returns the final provider receipt observed in the current turn.
+// A true second result with zero input is meaningful: the endpoint completed
+// but reported no occupancy, so the caller must use its local request estimate.
+func (w *watcher) LastUsage() (session.Usage, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.lastUsage, w.usageSeen
 }
 
 func (w *watcher) ThinkingDelta(text string) { w.inner.ThinkingDelta(text) }
@@ -136,6 +155,10 @@ func (w *watcher) VerifierFailures(ctx context.Context, sigs []string) {
 
 func (w *watcher) TurnUsage(u session.Usage) {
 	w.inner.TurnUsage(u)
+	w.mu.Lock()
+	w.lastUsage = u
+	w.usageSeen = true
+	w.mu.Unlock()
 	w.sticky.CallServed()
 }
 

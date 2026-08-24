@@ -21,7 +21,9 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/switchboard-code/switchboard/internal/credential"
 	"github.com/switchboard-code/switchboard/internal/execution"
 	"github.com/switchboard-code/switchboard/internal/permission"
 )
@@ -164,12 +166,22 @@ func renderProcRead(status execution.BackgroundStatus, text string, truncated bo
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s  %s\n", status.ID, describeProc(status))
 	if truncated {
-		b.WriteString("(earlier output was dropped: the capture keeps a bounded tail)\n")
+		b.WriteString("Output was withheld because it exceeded the bounded capture; an incomplete stream cannot be checked safely.")
+		return b.String()
 	}
+	// Scan the complete captured component before selecting the recent tail.
+	// Cutting first can shorten a credential below the scanner's issuer length
+	// floor while leaving most of it visible to the next provider.
+	text = credential.Redact(text, credential.ScanPrompt(text))
+	text = strings.ToValidUTF8(text, "�")
 	if len(text) > maxProcOutput {
 		// The tail, not the head: what a running process just printed is what
 		// the reader wants, and the head of a server log is its banner.
-		text = "…" + text[len(text)-maxProcOutput:]
+		start := len(text) - maxProcOutput
+		for start < len(text) && !utf8.ValidString(text[start:]) {
+			start++
+		}
+		text = "…" + text[start:]
 	}
 	if strings.TrimSpace(text) == "" {
 		b.WriteString("It has printed nothing yet.")

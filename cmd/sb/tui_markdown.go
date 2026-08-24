@@ -5,7 +5,9 @@ import (
 
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/glamour/styles"
-	"github.com/muesli/reflow/wordwrap"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 )
 
 // markdown renders completed assistant blocks. It is deliberately only for
@@ -15,7 +17,11 @@ import (
 type markdown struct {
 	width int
 	dark  bool
-	r     *glamour.TermRenderer
+	// profile is the profile used to build r. Glamour 1.0 still emits text
+	// attributes such as bold under its Ascii profile, so render strips those
+	// controls at the boundary below.
+	profile termenv.Profile
+	r       *glamour.TermRenderer
 }
 
 func newMarkdown(width int, dark bool) *markdown {
@@ -29,9 +35,11 @@ func (m *markdown) rebuild() {
 	if width < 20 {
 		width = 20
 	}
+	m.profile = lipgloss.ColorProfile()
 	r, err := glamour.NewTermRenderer(
 		glamour.WithWordWrap(width),
 		glamour.WithPreservedNewLines(),
+		glamour.WithColorProfile(m.profile),
 		styleFor(m.dark),
 	)
 	if err == nil {
@@ -85,6 +93,9 @@ func (m *markdown) setDark(dark bool) {
 func (m *markdown) render(text string) []string {
 	if m.r != nil {
 		if out, err := m.r.Render(text); err == nil {
+			if m.profile == termenv.Ascii {
+				out = ansi.Strip(out)
+			}
 			return trimBlankLines(strings.Split(strings.TrimRight(out, "\n"), "\n"))
 		}
 	}
@@ -93,9 +104,7 @@ func (m *markdown) render(text string) []string {
 
 // wrapPlain is the in-flight fast path: word wrap and nothing else.
 func wrapPlain(text string, width int) []string {
-	if width < 20 {
-		width = 20
-	}
+	width = max(width, 1)
 	var lines []string
 	for para := range strings.Lines(text) {
 		para = strings.TrimRight(para, "\n")
@@ -103,7 +112,12 @@ func wrapPlain(text string, width int) []string {
 			lines = append(lines, "")
 			continue
 		}
-		lines = append(lines, strings.Split(wordwrap.String(para, width), "\n")...)
+		// The transcript's viewport is measured in terminal cells. Wordwrap's
+		// rune-oriented width let CJK, emoji, combining marks, and long tokens
+		// produce rows wider than the terminal, which in turn invalidated the
+		// scroll and mouse-selection row map. wrapCells preserves graphemes and
+		// ANSI state, then hard-wraps the tokens that have no breakpoint.
+		lines = append(lines, strings.Split(wrapCells(para, width), "\n")...)
 	}
 	return trimBlankLines(lines)
 }

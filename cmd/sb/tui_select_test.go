@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func selectTranscript(t *testing.T) *transcript {
@@ -86,6 +88,8 @@ func TestSelectionPaintLeavesTheRenderCacheAlone(t *testing.T) {
 // bare click keeps the expand toggle its gesture.
 func TestReleaseCopiesOnlyADrag(t *testing.T) {
 	m := testModel(t)
+	var copied string
+	m.clipboardWrite = func(text string) { copied = text }
 	m.tr = selectTranscript(t)
 	m.tr.view(10)
 
@@ -98,5 +102,36 @@ func TestReleaseCopiesOnlyADrag(t *testing.T) {
 	msg, ok := cmd().(clipboardMsg)
 	if !ok || msg.lines != 5 {
 		t.Fatalf("copy reported %#v, want 5 lines", msg)
+	}
+	if !strings.Contains(copied, "first line") || !strings.Contains(copied, "third line") {
+		t.Fatalf("clipboard sink received %q", copied)
+	}
+}
+
+func TestMouseDragReleaseWorksForX10AndSGR(t *testing.T) {
+	for _, releaseButton := range []tea.MouseButton{tea.MouseButtonNone, tea.MouseButtonLeft} {
+		t.Run(map[tea.MouseButton]string{tea.MouseButtonNone: "x10", tea.MouseButtonLeft: "sgr"}[releaseButton], func(t *testing.T) {
+			m := testModel(t)
+			m.tr = selectTranscript(t)
+			m.tr.view(10)
+			var copied string
+			m.clipboardWrite = func(text string) { copied = text }
+
+			m.Update(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionPress, Y: 0})
+			m.Update(tea.MouseMsg{Button: tea.MouseButtonLeft, Action: tea.MouseActionMotion, Y: 4})
+			_, cmd := m.Update(tea.MouseMsg{Button: releaseButton, Action: tea.MouseActionRelease, Y: 4})
+			if cmd == nil {
+				t.Fatal("release produced no clipboard command")
+			}
+			if msg, ok := cmd().(clipboardMsg); !ok || msg.lines != 5 {
+				t.Fatalf("release result = %#v, want five copied lines", msg)
+			}
+			if !strings.Contains(copied, "first line") || !strings.Contains(copied, "third line") {
+				t.Fatalf("clipboard received %q", copied)
+			}
+			if m.tr.selOn {
+				t.Fatal("release left the drag selection armed")
+			}
+		})
 	}
 }

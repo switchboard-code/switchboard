@@ -89,6 +89,53 @@ func TestBlameAttributesLinesAndNamesWhatItCannot(t *testing.T) {
 	}
 }
 
+func TestBlameWithholdsLegacyExpandedPromptAndMachineUserRoles(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	target := provider.RouteTargetID("ollama/local/qwen3:4b")
+	sess, err := store.Create(workspace, target, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const expanded = "write @private.txt\nEXPANDED_FILE_BYTES"
+	legacy := provider.Message{Role: provider.RoleUser, Content: []provider.Block{provider.Text{Text: expanded}}}
+	injected := provider.Message{Role: provider.RoleUser, Injected: true, Content: []provider.Block{
+		provider.Text{Text: "[watch] INJECTED_TOOL_OUTPUT"},
+	}}
+	appendMessages(t, sess, legacy, injected, provider.Message{Role: provider.RoleAssistant, Content: []provider.Block{
+		provider.ToolUse{ID: "legacy-write", Name: "write", Input: json.RawMessage(`{"path":"legacy.go","content":"safe\n"}`)},
+	}})
+	if err := sess.AppendUsage(session.Usage{Target: string(target)}); err != nil {
+		t.Fatal(err)
+	}
+	appendMessages(t, sess, provider.Message{Role: provider.RoleUser, Content: []provider.Block{
+		provider.ToolResult{ToolUseID: "legacy-write", Name: "write", Content: "TOOL_RESULT_OUTPUT"},
+	}})
+	if err := sess.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	abs := filepath.Join(workspace, "legacy.go")
+	if err := os.WriteFile(abs, []byte("safe\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for name, out := range map[string]string{
+		"map":   strings.Join(blameLines(store, nil, workspace, abs, "legacy.go"), "\n"),
+		"story": strings.Join(blameLineLines(store, nil, workspace, abs, "legacy.go", 1), "\n"),
+	} {
+		if strings.Contains(out, "private.txt") || strings.Contains(out, "EXPANDED_FILE_BYTES") ||
+			strings.Contains(out, "INJECTED_TOOL_OUTPUT") || strings.Contains(out, "TOOL_RESULT_OUTPUT") {
+			t.Fatalf("legacy provider-visible content escaped blame %s:\n%s", name, out)
+		}
+		if !strings.Contains(out, "authored wording unavailable for this legacy turn") {
+			t.Fatalf("blame %s did not explain withheld legacy wording:\n%s", name, out)
+		}
+	}
+}
+
 func TestBlameWithNoRecordSaysWhatItCovers(t *testing.T) {
 	store, err := session.NewStore(t.TempDir())
 	if err != nil {

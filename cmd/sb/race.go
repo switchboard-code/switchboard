@@ -80,17 +80,17 @@ func assembleRaceArm(app *tuiApp, tier config.Tier, client provider.Provider, ob
 	var sess *session.Session
 	var err error
 	if n := len(state.Messages); n > 0 {
-		sess, err = app.store.ForkSessionOnto(app.loop.Session, n, tier.Target.ID())
+		sess, err = app.store.ForkSessionOntoStaged(app.loop.Session, n, tier.Target.ID())
 	} else {
 		// The conversation prefix is empty, but its accounting lineage may not
 		// be (for example, a first-turn retry whose routing failed). Carry it.
-		sess, err = app.store.ForkSessionAccountingOnto(app.loop.Session, tier.Target.ID())
+		sess, err = app.store.ForkSessionAccountingOntoStaged(app.loop.Session, tier.Target.ID())
 	}
 	if err != nil {
 		return nil, err
 	}
 	if err := sess.MarkRaceBranchPending(state.ID); err != nil {
-		_ = sess.Close()
+		_ = sess.CloseDiscardingStaged()
 		return nil, err
 	}
 
@@ -109,16 +109,18 @@ func assembleRaceArm(app *tuiApp, tier config.Tier, client provider.Provider, ob
 			"delegate": "delegate is unavailable in a race branch: an errand spawned here would outlive the pick; the branch that wins can delegate after it continues",
 			"ask":      "ask is unavailable in a race branch: both arms answer unattended so they can be compared, and the pick at the end is the user's answer",
 		}),
-		Perms:    permission.NewEngineWithExecution(permission.ModePlan, app.loop.Tools.Execution()),
-		Session:  sess,
-		Catalog:  app.catalog,
-		Cache:    cacheFor(tier.Target, app.catalog),
-		System:   app.loop.System,
-		Observer: obs,
-		Hooks:    app.loop.Hooks,
+		Perms:           permission.NewEngineWithExecution(permission.ModePlan, app.loop.Tools.Execution()),
+		Session:         sess,
+		Catalog:         app.catalog,
+		Cache:           cacheFor(tier.Target, app.catalog),
+		System:          app.loop.System,
+		Observer:        obs,
+		Hooks:           app.loop.Hooks,
+		ContextWindow:   app.loop.ContextWindow,
+		OutputAllowance: app.loop.OutputAllowance,
 	}
 	if err := arm.loop.BindSession(sess); err != nil {
-		_ = sess.Close()
+		_ = sess.CloseDiscardingStaged()
 		return nil, fmt.Errorf("restore race branch context: %w", err)
 	}
 	return arm, nil
@@ -145,8 +147,8 @@ func raceGates(bs *budgetState, cat *catalog.Catalog, origin *session.Session, b
 	// The pre-race session is the sole live ledger while both arms run. A
 	// verdict later transfers one cumulative delta to a chosen branch; no
 	// attempt is partially replicated across three logs.
-	wireBudget(a.loop, budgetGate(bs, cat, func() provider.RouteTarget { return a.loop.Binding().Target }, spent, scope).withLedger(persisted, begin, settle, true))
-	wireBudget(b.loop, budgetGate(bs, cat, func() provider.RouteTarget { return b.loop.Binding().Target }, spent, scope).withLedger(persisted, begin, settle, true))
+	wireBudget(a.loop, budgetGate(bs, cat, func() provider.RouteTarget { return a.loop.Binding().Target }, spent, scope).withLedger(persisted, begin, settle, true).withOutputAllowance(a.loop.OutputAllowance))
+	wireBudget(b.loop, budgetGate(bs, cat, func() provider.RouteTarget { return b.loop.Binding().Target }, spent, scope).withLedger(persisted, begin, settle, true).withOutputAllowance(b.loop.OutputAllowance))
 }
 
 // racePreflight refuses a race the ceiling cannot hold. §15's rule applied
@@ -156,16 +158,20 @@ func raceGates(bs *budgetState, cat *catalog.Catalog, origin *session.Session, b
 // ceiling governs dollars only.
 func racePreflight(bs *budgetState, cat *catalog.Catalog, before session.State,
 	system []provider.Block, defs []provider.ToolDefinition, opening provider.Message,
-	a, b config.Tier) (string, bool) {
-	tokens := prefix.RequestTokenCeiling(provider.Request{
+	a, b config.Tier, allowances ...func(provider.RouteTarget, int) int) (string, bool) {
+	tokens := prefix.RequestTokenCeiling(provider.ReplayRequest(provider.Request{
 		System:   system,
 		Tools:    defs,
 		Messages: append(append([]provider.Message(nil), before.Messages...), opening),
-	})
+	}))
 	var bound catalog.Money
 	for _, tier := range []config.Tier{a, b} {
 		if info, _, ok := cat.Lookup(tier.Target); ok {
-			armBound := preflightBoundForTarget(info, tier.Target, tokens)
+			output := reservedOutputTokens(tier.Target, info)
+			if len(allowances) > 0 && allowances[0] != nil {
+				output = allowances[0](tier.Target, info.MaxOutput)
+			}
+			armBound := preflightBoundWithOutput(info, tokens, output)
 			if armBound <= 0 && info.Metering != catalog.Local && info.Metering != catalog.Plan && !info.Free() {
 				return fmt.Sprintf("%s has no positive conservative cost bound in the catalog, so its race arm cannot be authorized",
 					tier.Target.Display()), true

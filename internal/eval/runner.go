@@ -12,6 +12,7 @@ import (
 	"github.com/switchboard-code/switchboard/internal/breakpoint"
 	"github.com/switchboard-code/switchboard/internal/cachestate"
 	"github.com/switchboard-code/switchboard/internal/catalog"
+	"github.com/switchboard-code/switchboard/internal/checkpoint"
 	"github.com/switchboard-code/switchboard/internal/execution"
 	"github.com/switchboard-code/switchboard/internal/permission"
 	"github.com/switchboard-code/switchboard/internal/provider"
@@ -27,6 +28,12 @@ type Arm struct {
 	Target   provider.RouteTarget
 	Provider provider.Provider
 
+	// ContextWindow is the user-declared limit for this target's serving
+	// surface. It has the same precedence as production configuration: an
+	// enforced live limit wins, this declaration beats an unenforced metadata
+	// hint, and the catalog is the final fallback.
+	ContextWindow int
+
 	// Fallbacks are availability substitutes for the routed arm only, in user
 	// policy order. Fixed baselines deliberately ignore them: a baseline must
 	// remain the one pinned target it claims to measure.
@@ -37,6 +44,11 @@ type Arm struct {
 	// cache-unaware router excludes zero: same model, same corpus, same tools,
 	// and the one difference is whether §6 runs at all.
 	CacheAware bool
+
+	// resolvedContextWindow is immutable evidence captured by the probe that
+	// admitted this concrete target. It travels with a routed primary/fallback
+	// so the loop enforces the same number the opening or move scored.
+	resolvedContextWindow int
 }
 
 // Fallback is one concrete target/provider binding inside a routed tier.
@@ -44,6 +56,9 @@ type Fallback struct {
 	Target     provider.RouteTarget
 	Provider   provider.Provider
 	CacheAware bool
+
+	// ContextWindow has the same meaning and precedence as Arm.ContextWindow.
+	ContextWindow int
 }
 
 // Runner executes tasks.
@@ -148,8 +163,15 @@ type selectArm func(context.Context, Task, *preparedAttempt) (armSelection, erro
 
 func (r Runner) run(ctx context.Context, task Task, arm Arm, seed int, esc escalation) Run {
 	return r.runSelected(ctx, task, arm.Name, arm.Target.ID(), seed,
-		func(context.Context, Task, *preparedAttempt) (armSelection, error) {
-			return armSelection{arm: arm, escalation: esc}, nil
+		func(ctx context.Context, _ Task, _ *preparedAttempt) (armSelection, error) {
+			if arm.Provider == nil {
+				return armSelection{arm: arm, escalation: esc}, nil
+			}
+			resolved, _, err := resolveArmEvidence(ctx, r.Catalog, arm)
+			if err != nil {
+				return armSelection{}, fmt.Errorf("probing fixed target %s: %w", arm.Target.Display(), err)
+			}
+			return armSelection{arm: resolved, escalation: esc}, nil
 		})
 }
 
@@ -197,8 +219,13 @@ func (r Runner) runSelected(
 	selection, err := selectTarget(attemptCtx, task, prepared)
 	if err != nil {
 		out.Duration = time.Since(started)
-		out.Detail = "routed evaluation fidelity failed: " + err.Error()
-		out.Failure = FailureFidelity
+		if reportArm == RoutedArm {
+			out.Detail = "routed evaluation fidelity failed: " + err.Error()
+			out.Failure = FailureFidelity
+		} else {
+			out.Detail = "the turn failed: " + err.Error()
+			out.Failure = FailureTurn
+		}
 		return out
 	}
 	if selection.arm.Provider == nil {
@@ -273,10 +300,20 @@ func (r Runner) runSelected(
 		return out
 	}
 
-	solved, detail, verifyErr := task.Verify(dir)
+	solved, detail, verifyErr := task.Verify(attemptCtx, dir)
+	out.Duration = time.Since(started)
 	if verifyErr != nil {
-		out.Detail = "the verifier failed to run: " + verifyErr.Error()
-		out.Failure = FailureVerifier
+		switch {
+		case errors.Is(verifyErr, context.DeadlineExceeded):
+			out.Detail = "the verifier timed out: " + verifyErr.Error()
+			out.Failure = FailureTimeout
+		case errors.Is(verifyErr, context.Canceled):
+			out.Detail = "the verifier was cancelled: " + verifyErr.Error()
+			out.Failure = FailureCancelled
+		default:
+			out.Detail = "the verifier failed to run: " + verifyErr.Error()
+			out.Failure = FailureVerifier
+		}
 		return out
 	}
 	out.Solved = solved
@@ -312,10 +349,24 @@ func (r Runner) attempt(ctx context.Context, arm Arm, prepared *preparedAttempt,
 	if prepared == nil || prepared.registry == nil {
 		return attemptStats{}, fmt.Errorf("evaluation request was not assembled")
 	}
-	store, err := session.NewStore(prepared.dir + "/.sessions")
+	controlDir, err := os.MkdirTemp("", "sb-eval-sessions-")
 	if err != nil {
 		return attemptStats{}, err
 	}
+	defer os.RemoveAll(controlDir)
+	store, err := session.NewStore(controlDir)
+	if err != nil {
+		return attemptStats{}, err
+	}
+	checkpointDir, err := store.WorkspaceDir(prepared.dir)
+	if err != nil {
+		return attemptStats{}, err
+	}
+	recorder := checkpoint.NewRecorder()
+	if err := recorder.ConfigureRestoreCleanup(checkpointDir, prepared.dir); err != nil {
+		return attemptStats{}, err
+	}
+	prepared.registry.SetCheckpoints(recorder)
 	revision := ""
 	if r.Catalog != nil {
 		revision = r.Catalog.Revision
@@ -349,7 +400,9 @@ func (r Runner) attempt(ctx context.Context, arm Arm, prepared *preparedAttempt,
 		Catalog:       r.Catalog,
 		System:        prepared.system,
 		MaxToolRounds: r.rounds(),
+		Checkpoints:   recorder,
 	}
+	installEvalResolvers(loop, arm, r.Catalog)
 
 	collector.loop = loop
 	if arm.CacheAware {
@@ -373,6 +426,41 @@ func (r Runner) attempt(ctx context.Context, arm Arm, prepared *preparedAttempt,
 		rounds:     collector.rounds,
 		toolErrors: collector.toolErrors,
 	}, err
+}
+
+// installEvalResolvers makes the execution guard consume the same concrete
+// evidence as selection. Output allowance follows the live binding so a routed
+// move cannot retain the previous adapter's wire policy; context starts with
+// the probe-resolved opening target and the escalator extends it transactionally
+// for each prepared destination.
+func installEvalResolvers(loop *agent.Loop, arm Arm, cat *catalog.Catalog) {
+	if loop == nil {
+		return
+	}
+	openingWindow := arm.resolvedContextWindow
+	if openingWindow <= 0 && cat != nil {
+		if info, _, ok := cat.Lookup(arm.Target); ok {
+			openingWindow = info.ContextWindow
+		}
+	}
+	loop.ContextWindow = func(target provider.RouteTarget) int {
+		if target.ID() == arm.Target.ID() {
+			return openingWindow
+		}
+		if cat != nil {
+			if info, _, ok := cat.Lookup(target); ok {
+				return info.ContextWindow
+			}
+		}
+		return 0
+	}
+	loop.OutputAllowance = func(target provider.RouteTarget, catalogMax int) int {
+		binding := loop.Binding()
+		if binding.Target.ID() == target.ID() {
+			return provider.EffectiveOutputTokenAllowance(binding.Provider, target, catalogMax)
+		}
+		return provider.EffectiveOutputTokenAllowance(nil, target, catalogMax)
+	}
 }
 
 // usageCollector attributes each turn's usage to the target that served it,

@@ -15,13 +15,17 @@ func TestAgentsCommandListsDefinitionsAndNotes(t *testing.T) {
 	m.app.agents = []delegate.Agent{
 		{Name: "reviewer", Description: "reviews a diff", Tier: "t2", Tools: []string{"read", "grep"}},
 		{Name: "scout", Description: "finds things", FromHome: true},
+		{Name: "native", Description: "from Claude", Origin: delegate.AgentOrigin{
+			Dialect: delegate.AgentDialectClaude, Scope: delegate.AgentScopeWorkspace,
+			LogicalPath: filepath.Join(m.app.workspace, ".claude", "agents", "native.md"),
+		}},
 	}
 	m.app.agentNotes = []string{"agent bad.md: grants \"bash\""}
 
 	m.ta.SetValue("/agents")
 	m.submit()
 	joined := strings.Join(m.tr.flat, "\n")
-	for _, want := range []string{"reviewer", "t2", "read, grep", "scout", "the full core suite", "~/.switchboard/agents", `grants "bash"`} {
+	for _, want := range []string{"reviewer", "t2", "read, grep", "scout", "the full core suite", "~/.switchboard/agents", "claude .claude/agents/native.md", `grants "bash"`} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("/agents missing %q:\n%s", want, joined)
 		}
@@ -141,6 +145,100 @@ func TestForkCommandBranchesAndLeavesTurnsBehind(t *testing.T) {
 		t.Errorf("the swap did not say where the fork came from:\n%s", joined)
 	}
 	got.Close()
+}
+
+func TestForkCommandCountsAuthoredTurnsNotInjectedUserMessages(t *testing.T) {
+	m := testModel(t)
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := store.Create(t.TempDir(), "ollama/local/test:7b", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.app.store = store
+	m.app.loop.Session = sess
+	say := func(msg provider.Message) {
+		t.Helper()
+		if err := sess.AppendMessage(msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	say(provider.UserText("first turn"))
+	say(provider.Message{Role: provider.RoleAssistant, Content: []provider.Block{provider.Text{Text: "first answer"}}})
+	say(provider.UserText("second turn"))
+	say(provider.Message{Role: provider.RoleAssistant, Content: []provider.Block{
+		provider.ToolUse{ID: "call-1", Name: "read", Input: []byte(`{"path":"main.go"}`)},
+	}})
+	say(provider.Message{Role: provider.RoleTool, Content: []provider.Block{
+		provider.ToolResult{ToolUseID: "call-1", Name: "read", Content: "package main"},
+	}})
+	injected := provider.UserText("[watch] tests are red")
+	injected.Injected = true
+	say(injected)
+	say(provider.Message{Role: provider.RoleAssistant, Content: []provider.Block{provider.Text{Text: "second answer"}}})
+
+	sourceID := sess.ID()
+	cmd := cmdFork(m, "1")
+	if cmd == nil {
+		t.Fatal("/fork 1 produced no command")
+	}
+	m.Update(cmd())
+
+	forked := m.app.loop.Session
+	if forked.ID() == sourceID {
+		t.Fatal("/fork 1 did not install the fork")
+	}
+	t.Cleanup(func() { _ = forked.Close() })
+	msgs := forked.State().Messages
+	if len(msgs) != 2 || msgs[0].AuthoredText() != "first turn" || msgs[1].Text() != "first answer" {
+		t.Fatalf("fork kept a mid-turn prefix instead of the first authored turn: %+v", msgs)
+	}
+}
+
+func TestForkOneKeepsSyntheticCompactLineageBeforeTheOnlyAuthoredTurn(t *testing.T) {
+	m := testModel(t)
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := store.Create(t.TempDir(), "ollama/local/test:7b", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.app.store = store
+	m.app.loop.Session = sess
+	seed := provider.Message{Role: provider.RoleUser, Synthetic: true, Content: []provider.Block{
+		provider.Text{Text: compactSeed("source", testCompactHandoff("finish the parser"))},
+	}}
+	for _, message := range []provider.Message{
+		seed,
+		{Role: provider.RoleAssistant, Content: []provider.Block{provider.Text{Text: compactAcknowledgment}}},
+		provider.UserText("one authored follow-up"),
+		{Role: provider.RoleAssistant, Content: []provider.Block{provider.Text{Text: "follow-up answer"}}},
+	} {
+		if err := sess.AppendMessage(message); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sourceID := sess.ID()
+	cmd := cmdFork(m, "1")
+	if cmd == nil {
+		t.Fatal("/fork 1 produced no command")
+	}
+	m.Update(cmd())
+	forked := m.app.loop.Session
+	if forked.ID() == sourceID {
+		t.Fatal("/fork 1 did not install the fork")
+	}
+	t.Cleanup(func() { _ = forked.Close() })
+	messages := forked.State().Messages
+	if len(messages) != 2 || !messages[0].Synthetic || messages[0].Text() != seed.Text() ||
+		messages[1].Text() != compactAcknowledgment {
+		t.Fatalf("fork lost the compact lineage prefix: %+v", messages)
+	}
 }
 
 func TestForkCommandRefusesDroppingEverything(t *testing.T) {

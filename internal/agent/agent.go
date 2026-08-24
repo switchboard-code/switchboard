@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"strings"
 	"sync"
@@ -91,6 +92,14 @@ const (
 const maxReliefsPerTurn = 2
 
 func (e *ContextWindowError) Error() string {
+	if e.ReservedOutput == math.MaxInt {
+		if target, err := provider.ParseRouteTargetID(e.Target); err == nil && target.Params.MaxOutputTokens > 0 {
+			return fmt.Sprintf("target %s has no valid finite output allowance for its %d-token context window: configured max_output %d conflicts with the reasoning settings; raise max_output or lower or disable reasoning",
+				provider.DisplayRouteTargetID(e.Target), e.Window, target.Params.MaxOutputTokens)
+		}
+		return fmt.Sprintf("target %s has no finite output bound for its %d-token context window; set a positive tier max_output with /models or in config",
+			provider.DisplayRouteTargetID(e.Target), e.Window)
+	}
 	return fmt.Sprintf("target %s holds %d tokens, but this call may need up to %d input plus %d reserved output tokens",
 		provider.DisplayRouteTargetID(e.Target), e.Window, e.InputTokens, e.ReservedOutput)
 }
@@ -156,7 +165,9 @@ type Loop struct {
 	// Checkpoints, when non-nil, opens an undo scope per turn; the registry
 	// captures into it before each mutation. The interface keeps the
 	// recorder's package out of the loop's imports.
-	Checkpoints interface{ Begin(label string) }
+	Checkpoints interface {
+		BeginTurn(sessionID string, openingMessage int, label string)
+	}
 
 	// Budget, when non-nil, is asked before each model call whether the call
 	// may go out, given the request's conservative token ceiling. An error ends
@@ -177,6 +188,18 @@ type Loop struct {
 	// It is deliberately separate from Budget so embedders that only need a
 	// preflight gate can omit settlement handling.
 	BudgetResult func(promptTokens, attempt int, usage session.Usage, err error) error
+
+	// ContextWindow resolves the enforced input+output limit for a concrete
+	// target. The surface owns live probes and user declarations, so the core
+	// receives the settled number rather than importing configuration or
+	// provider registries. Nil preserves the catalog-only fallback.
+	ContextWindow func(provider.RouteTarget) int
+
+	// OutputAllowance resolves the exact generation limit the bound adapter
+	// will send for a target and catalog maximum. Surfaces set it when bindings
+	// are assembled through a provider registry; nil asks the bound adapter
+	// directly through provider.OutputTokenAllower.
+	OutputAllowance func(provider.RouteTarget, int) int
 
 	// runtimeMu guards the pieces of a loop that a surface may replace between
 	// turns or at an explicit model-call boundary. A turn snapshots its observer
@@ -206,6 +229,18 @@ func (l *Loop) Binding() Binding {
 	return Binding{Provider: l.Provider, Target: l.Target, Cache: l.Cache}
 }
 
+// Request constructs the exact provider-visible request shape shared by turn
+// routing, feasibility checks, cache planning, and the model call itself.
+// Session state stays append-only; ReplayRequest is the projection boundary
+// that withholds interrupted assistant output from every downstream consumer.
+func (l *Loop) Request(messages []provider.Message) provider.Request {
+	return provider.ReplayRequest(provider.Request{
+		System:   redactSystemBlocks(l.System),
+		Tools:    l.Tools.Definitions(),
+		Messages: redactHistoricalToolResults(messages),
+	})
+}
+
 // Bind replaces provider, target, and cache atomically. It is safe while idle
 // or from ToolBatchEnd, after the preceding model call and tools are durable.
 func (l *Loop) Bind(binding Binding) {
@@ -219,7 +254,8 @@ func (l *Loop) Bind(binding Binding) {
 // BindSession switches to a context that did not inherit the current
 // transcript byte-for-byte: resume, clear, compaction, or an ordinary session
 // swap. It drops all file-read evidence before exposing the new session, and a
-// session with no live capsule explicitly clears the previous todos.
+// session with no live capsule explicitly clears the previous task and working
+// context.
 func (l *Loop) BindSession(sess *session.Session) error {
 	l.sessionMu.Lock()
 	defer l.sessionMu.Unlock()
@@ -229,7 +265,10 @@ func (l *Loop) BindSession(sess *session.Session) error {
 	if l.Tools == nil {
 		return fmt.Errorf("bind session: nil tool registry")
 	}
-	items, err := todoItemsFromContinuity(sess.CurrentContinuity())
+	if _, err := sess.ReconcileInterruptedToolCalls(); err != nil {
+		return fmt.Errorf("bind session: reconcile interrupted tool calls: %w", err)
+	}
+	items, working, err := todoStateFromContinuity(sess.ResumableContinuity())
 	if err != nil {
 		return fmt.Errorf("bind session: %w", err)
 	}
@@ -242,8 +281,8 @@ func (l *Loop) BindSession(sess *session.Session) error {
 	// never asked, and delivering them into it would be evidence from a
 	// context that is gone.
 	l.Tools.ForgetToolImages()
-	if err := l.Tools.RestoreTodos(items); err != nil {
-		return fmt.Errorf("bind session: restore todos: %w", err)
+	if err := l.Tools.RestoreContinuity(items, working); err != nil {
+		return fmt.Errorf("bind session: restore continuity: %w", err)
 	}
 	l.Session = sess
 	return nil
@@ -279,19 +318,47 @@ func (l *Loop) price(target provider.RouteTarget, record session.Usage) session.
 	return record
 }
 
-func (l *Loop) checkContext(target provider.RouteTarget, inputTokens int) error {
-	if l.Catalog == nil {
+func (l *Loop) checkContext(binding Binding, inputTokens int) error {
+	outputTokens, err := l.resolveOutputAllowance(binding)
+	if err != nil {
+		return err
+	}
+	return l.checkContextWithAllowance(binding, inputTokens, outputTokens)
+}
+
+func (l *Loop) resolveOutputAllowance(binding Binding) (int, error) {
+	target := binding.Target
+	var info catalog.ModelInfo
+	if l.Catalog != nil {
+		info, _, _ = l.Catalog.Lookup(target)
+	}
+	outputTokens, err := provider.ResolveOutputTokenAllowance(binding.Provider, target, info.MaxOutput)
+	if err != nil {
+		return 0, err
+	}
+	if l.OutputAllowance != nil {
+		outputTokens = l.OutputAllowance(target, info.MaxOutput)
+	}
+	return outputTokens, nil
+}
+
+func (l *Loop) checkContextWithAllowance(binding Binding, inputTokens, outputTokens int) error {
+	target := binding.Target
+	var info catalog.ModelInfo
+	if l.Catalog != nil {
+		info, _, _ = l.Catalog.Lookup(target)
+	}
+	window := info.ContextWindow
+	if l.ContextWindow != nil {
+		window = l.ContextWindow(target)
+	}
+	if window <= 0 {
 		return nil
 	}
-	info, _, ok := l.Catalog.Lookup(target)
-	if !ok || info.ContextWindow <= 0 {
-		return nil
-	}
-	outputTokens := provider.EffectiveOutputTokenReserve(target, info.MaxOutput)
-	if inputTokens < 0 || outputTokens < 0 || outputTokens > info.ContextWindow ||
-		inputTokens > info.ContextWindow-outputTokens {
+	if inputTokens < 0 || outputTokens < 0 || outputTokens > window ||
+		inputTokens > window-outputTokens {
 		return &ContextWindowError{
-			Target: target.ID(), Window: info.ContextWindow,
+			Target: target.ID(), Window: window,
 			InputTokens: inputTokens, ReservedOutput: outputTokens,
 		}
 	}
@@ -323,23 +390,81 @@ func (l *Loop) Turn(ctx context.Context, input string) error {
 // and complete: it opens the turn, so it is the boundary /fork cuts on and
 // the message every later request replays.
 func (l *Loop) TurnMessage(ctx context.Context, opening provider.Message) error {
+	return l.turnMessage(ctx, opening, "", false)
+}
+
+// RetryTurnMessage is TurnMessage with a durable execution handoff. The
+// opening is appended normally, but the intent stays pending until the exact
+// seam immediately before the first Provider.Stream invocation.
+func (l *Loop) RetryTurnMessage(ctx context.Context, opening provider.Message, retryIntentID string) error {
+	if retryIntentID == "" {
+		return errors.New("retry turn has no durable intent id")
+	}
+	return l.turnMessage(ctx, opening, retryIntentID, false)
+}
+
+// ResumeRetryTurn continues a pending retry whose opening record was durable
+// before a crash but whose execution-start record was not. It never stamps or
+// appends that opening twice.
+func (l *Loop) ResumeRetryTurn(ctx context.Context, retryIntentID string) error {
+	if retryIntentID == "" {
+		return errors.New("resumed retry turn has no durable intent id")
+	}
+	return l.turnMessage(ctx, provider.Message{}, retryIntentID, true)
+}
+
+func (l *Loop) turnMessage(ctx context.Context, opening provider.Message, retryIntentID string, openingRecorded bool) error {
 	l.sessionMu.Lock()
 	defer l.sessionMu.Unlock()
 	observer := l.observer()
-	var err error
-	opening, _, err = l.Session.StampContinuityOpening(opening)
-	if err != nil {
-		return err
+	state := l.Session.State()
+	openingMessage := len(state.Messages)
+	if openingRecorded {
+		intent := state.RetryIntent
+		if intent == nil || intent.ID != retryIntentID || intent.Status != session.RetryIntentPending ||
+			intent.OpeningMessage < 0 || intent.OpeningMessage != len(state.Messages)-1 ||
+			state.Messages[intent.OpeningMessage].RetryIntentID != retryIntentID {
+			return errors.New("recorded retry opening does not match a pending durable handoff")
+		}
+		opening = provider.CloneMessage(state.Messages[intent.OpeningMessage])
+		matches, err := session.RetryIntentOpeningMatches(*intent, opening)
+		if err != nil || !matches {
+			return errors.New("recorded retry opening does not match its durable digest")
+		}
+		openingMessage = intent.OpeningMessage
+	} else {
+		// Caller-supplied metadata never grants recovery authority. A retry gets
+		// the exact active capability below; every ordinary opening is stripped.
+		opening.RetryIntentID = ""
+		var err error
+		opening, _, err = l.Session.StampContinuityOpening(opening)
+		if err != nil {
+			return err
+		}
+		if retryIntentID != "" {
+			intent := state.RetryIntent
+			if intent == nil || intent.ID != retryIntentID || intent.Status != session.RetryIntentPending ||
+				intent.OpeningMessage != openingMessage {
+				return errors.New("retry opening does not match its pending durable handoff")
+			}
+			matches, matchErr := session.RetryIntentOpeningMatches(*intent, opening)
+			if matchErr != nil || !matches {
+				return errors.New("retry opening does not match its pending durable handoff")
+			}
+			opening.RetryIntentID = retryIntentID
+		}
 	}
 	// The turn is the undo unit: everything this input causes the tools to
 	// change restores together. A subagent's loop leaves this nil and its
 	// registry shares the primary recorder, so a delegate's edits file under
 	// the turn that delegated.
 	if l.Checkpoints != nil {
-		l.Checkpoints.Begin(messageLabel(opening))
+		l.Checkpoints.BeginTurn(l.Session.ID(), openingMessage, messageLabel(opening))
 	}
-	if err := l.Session.AppendMessage(opening); err != nil {
-		return err
+	if !openingRecorded {
+		if err := l.Session.AppendMessage(opening); err != nil {
+			return err
+		}
 	}
 
 	reliefs := 0
@@ -364,7 +489,7 @@ func (l *Loop) TurnMessage(ctx context.Context, opening provider.Message) error 
 				}
 			}
 		}
-		msg, stop, usage, attempts, promptTokens, servedTarget, err := l.callModel(ctx, observer)
+		msg, stop, usage, attempts, promptTokens, servedTarget, err := l.callModel(ctx, observer, &retryIntentID)
 		if err != nil {
 			// A round that refused for a reason the ladder can answer is
 			// offered to the surface before it becomes the turn's failure.
@@ -381,8 +506,9 @@ func (l *Loop) TurnMessage(ctx context.Context, opening provider.Message) error 
 				}
 			}
 			// Content that did arrive is recorded as an interrupted turn, so the
-			// session shows what happened instead of a gap. Adapters drop
-			// incomplete messages when building the next request, which is what
+			// session shows what happened instead of a gap. The provider-level
+			// replay projection withholds incomplete assistant messages before
+			// estimation, cache planning, and adapter translation, which is what
 			// makes re-issuing safe.
 			if len(msg.Content) > 0 {
 				msg.Incomplete = true
@@ -469,35 +595,40 @@ func continuityTasks(items []tools.TodoItem) []continuity.Task {
 	return tasks
 }
 
-func todoItemsFromContinuity(capsule *continuity.Capsule) ([]tools.TodoItem, error) {
+func todoStateFromContinuity(capsule *continuity.Capsule) ([]tools.TodoItem, continuity.Working, error) {
 	if capsule == nil || capsule.Cleared {
-		return nil, nil
+		return nil, continuity.Working{}, nil
 	}
 	if err := continuity.ValidateStored(*capsule); err != nil {
-		return nil, fmt.Errorf("invalid continuity capsule: %w", err)
+		return nil, continuity.Working{}, fmt.Errorf("invalid continuity capsule: %w", err)
 	}
 	items := make([]tools.TodoItem, len(capsule.Tasks))
 	for i, task := range capsule.Tasks {
 		items[i] = tools.TodoItem{Text: task.Text, Status: tools.TodoStatus(task.Status)}
 	}
-	return items, nil
+	working := continuity.Working{
+		Objective:     capsule.Objective,
+		NextAction:    capsule.NextAction,
+		StopCondition: capsule.StopCondition,
+	}
+	return items, working, nil
 }
 
 // callModel issues one model call, retrying transient failures. It returns
 // whatever content arrived even when it ends in an error, so the caller can
 // record a partial turn.
-func (l *Loop) callModel(ctx context.Context, observer Observer) (provider.Message, provider.StopReason, provider.Usage, int, int, provider.RouteTarget, error) {
+func (l *Loop) callModel(ctx context.Context, observer Observer, retryIntentID *string) (provider.Message, provider.StopReason, provider.Usage, int, int, provider.RouteTarget, error) {
 	maxAttempts := orDefault(l.MaxAttempts, DefaultMaxAttempts)
 	binding := l.Binding()
 
-	req := provider.Request{
-		System:   l.System,
-		Tools:    l.Tools.Definitions(),
-		Messages: l.Session.State().Messages,
-	}
+	req := l.Request(l.Session.State().Messages)
 	promptTokens := prefix.RequestTokens(req)
 	contextTokens := prefix.RequestTokenCeiling(req)
-	if err := l.checkContext(binding.Target, contextTokens); err != nil {
+	outputTokenAllowance, err := l.resolveOutputAllowance(binding)
+	if err != nil {
+		return provider.Message{}, "", provider.Usage{}, 0, promptTokens, binding.Target, err
+	}
+	if err := l.checkContextWithAllowance(binding, contextTokens, outputTokenAllowance); err != nil {
 		return provider.Message{}, "", provider.Usage{}, 0, promptTokens, binding.Target, err
 	}
 	req.CachePlan = binding.Cache.plan(req.System, req.Tools, req.Messages)
@@ -517,7 +648,17 @@ func (l *Loop) callModel(ctx context.Context, observer Observer) (provider.Messa
 				return lastMsg, "", provider.Usage{}, attempt - 1, promptTokens, binding.Target, err
 			}
 		}
-		msg, stop, usage, issued, err := l.streamOnce(ctx, binding, observer, req)
+		var beforeStream func() error
+		if retryIntentID != nil && *retryIntentID != "" {
+			beforeStream = func() error {
+				if err := l.Session.StartRetryIntent(*retryIntentID); err != nil {
+					return fmt.Errorf("saving retry execution-start boundary: %w", err)
+				}
+				*retryIntentID = ""
+				return nil
+			}
+		}
+		msg, stop, usage, issued, err := l.streamOnce(ctx, binding, observer, req, outputTokenAllowance, beforeStream)
 		if err == nil {
 			err = ctx.Err()
 		}
@@ -555,13 +696,27 @@ func (l *Loop) callModel(ctx context.Context, observer Observer) (provider.Messa
 				providerCallError(&AvailabilityError{Target: binding.Target.ID(), Attempts: attempt, Err: err})
 		}
 
+		// A retry starts a distinct provider attempt. Close this attempt's
+		// durable draft as incomplete before issuing another one; otherwise the
+		// next attempt would either rewrite the first attempt's evidence or leave
+		// two active drafts at the conversation tail. Replay filters the closed
+		// message, and req remains the immutable pre-attempt request.
+		if len(msg.Content) > 0 {
+			msg.Incomplete = true
+			if appendErr := l.Session.AppendMessage(msg); appendErr != nil {
+				return msg, stop, usage, attempt, promptTokens, binding.Target, appendErr
+			}
+		}
+
 		// A dropped stream is re-issued from the last committed message rather
 		// than resumed. Ollama exposes no continuation handle, and treating a
 		// partial response as committed would mean guessing what the server
 		// had already produced (§10.3).
 		observer.Notice("warn", fmt.Sprintf("attempt %d of %d failed (%v), retrying", attempt, maxAttempts, err))
 		if err := sleep(ctx, backoff(attempt)); err != nil {
-			return msg, stop, usage, attempt, promptTokens, binding.Target, err
+			// Any content from this attempt is already durably closed above. Do
+			// not ask TurnMessage to append the same DraftID a second time.
+			return provider.Message{}, stop, usage, attempt, promptTokens, binding.Target, err
 		}
 	}
 	return lastMsg, "", provider.Usage{}, maxAttempts, promptTokens, binding.Target, providerCallError(lastErr)
@@ -608,19 +763,28 @@ func providerCallError(err error) error {
 	return fmt.Errorf("%w: %w", ErrProviderCall, err)
 }
 
-func (l *Loop) streamOnce(ctx context.Context, binding Binding, observer Observer, req provider.Request) (provider.Message, provider.StopReason, provider.Usage, bool, error) {
+func (l *Loop) streamOnce(ctx context.Context, binding Binding, observer Observer, req provider.Request, outputTokenAllowance int, beforeStream func() error) (provider.Message, provider.StopReason, provider.Usage, bool, error) {
 	var b messageBuilder
 	var stop provider.StopReason
 	var usage provider.Usage
+	draft := newStreamDraft(l.Session, observer, &b, outputTokenAllowance)
 
 	if err := ctx.Err(); err != nil {
-		return b.message(), stop, usage, false, err
+		return draft.message(), stop, usage, false, err
 	}
-	stream, err := binding.Provider.Stream(ctx, binding.Target, req)
+	if beforeStream != nil {
+		if err := beforeStream(); err != nil {
+			return draft.message(), stop, usage, false, err
+		}
+	}
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	stream, err := binding.Provider.Stream(streamCtx, binding.Target, req)
 	if err != nil {
-		return b.message(), stop, usage, provider.RequestIssued(err), err
+		cancelStream()
+		return draft.message(), stop, usage, provider.RequestIssued(err), err
 	}
 	defer stream.Close()
+	defer cancelStream()
 
 	for {
 		ev, err := stream.Next()
@@ -629,28 +793,58 @@ func (l *Loop) streamOnce(ctx context.Context, binding Binding, observer Observe
 		// event. Check before accepting either that event or EOF so a late result
 		// cannot become a completed, billed turn after the user stopped it.
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return b.message(), stop, usage, true, ctxErr
+			if err := draft.flush(); err != nil {
+				return draft.message(), stop, usage, true, err
+			}
+			return draft.message(), stop, usage, true, ctxErr
 		}
 		if errors.Is(err, io.EOF) {
-			return b.message(), stop, usage, true, nil
+			if err := draft.flush(); err != nil {
+				return draft.message(), stop, usage, true, err
+			}
+			return draft.message(), stop, usage, true, nil
 		}
 		if err != nil {
-			return b.message(), stop, usage, true, err
+			if flushErr := draft.flush(); flushErr != nil {
+				return draft.message(), stop, usage, true, flushErr
+			}
+			return draft.message(), stop, usage, true, err
 		}
 
 		switch ev.Type {
 		case provider.EventThinkingDelta:
-			b.delta(ev.Index, provider.KindThinking, ev.Text)
-			b.sign(ev.Index, ev.Signature)
-			observer.ThinkingDelta(ev.Text)
+			if err := draft.add(ev); err != nil {
+				cancelStream()
+				return draft.message(), stop, usage, true, err
+			}
 		case provider.EventTextDelta:
-			b.delta(ev.Index, provider.KindText, ev.Text)
-			observer.TextDelta(ev.Text)
+			if err := draft.add(ev); err != nil {
+				cancelStream()
+				return draft.message(), stop, usage, true, err
+			}
 		case provider.EventToolUse:
-			b.toolUse(ev.Index, *ev.ToolUse)
+			if ev.ToolUse == nil {
+				return draft.message(), stop, usage, true, &provider.ProtocolError{Provider: binding.Provider.Name(), Detail: "tool-use stream event has no call"}
+			}
+			if err := draft.add(ev); err != nil {
+				cancelStream()
+				return draft.message(), stop, usage, true, err
+			}
 		case provider.EventDone:
+			if err := draft.admitDone(ev.Usage); err != nil {
+				cancelStream()
+				return draft.message(), stop, usage, true, err
+			}
+			if err := draft.flush(); err != nil {
+				return draft.message(), stop, usage, true, err
+			}
 			stop = ev.StopReason
 			usage = ev.Usage
+		default:
+			cancelStream()
+			return draft.message(), stop, usage, true, &provider.ProtocolError{
+				Provider: binding.Provider.Name(), Detail: fmt.Sprintf("unsupported stream event %q", ev.Type),
+			}
 		}
 	}
 }
@@ -873,8 +1067,12 @@ func resultBlocks(jobs []*toolJob, unfilled string) []provider.Block {
 		out = append(out, provider.ToolResult{
 			ToolUseID: j.use.ID,
 			Name:      j.use.Name,
-			Content:   res.Content,
-			IsError:   res.IsError,
+			// Tool execution, hooks, and observers intentionally see the local
+			// result verbatim. This is the provider/session boundary: redact the
+			// complete component here, before request sizing or compaction can
+			// cut a recognized credential below its detection floor.
+			Content: redactCredentialText(res.Content),
+			IsError: res.IsError,
 		})
 	}
 	return out
@@ -885,6 +1083,7 @@ func resultBlocks(jobs []*toolJob, unfilled string) []provider.Block {
 type messageBuilder struct {
 	byIndex map[int]*blockAccum
 	order   []int
+	draftID string
 }
 
 type blockAccum struct {
@@ -926,7 +1125,7 @@ func (b *messageBuilder) toolUse(index int, use provider.ToolUse) {
 }
 
 func (b *messageBuilder) message() provider.Message {
-	msg := provider.Message{Role: provider.RoleAssistant}
+	msg := provider.Message{Role: provider.RoleAssistant, DraftID: b.draftID}
 	for _, i := range b.order {
 		a := b.byIndex[i]
 		switch a.kind {

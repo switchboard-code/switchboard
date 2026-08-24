@@ -58,9 +58,14 @@ func recapLines(store *session.Store, workspace, id, skip string) []string {
 		return []string{"  " + err.Error()}
 	}
 
-	opening, _ := session.ReadOpening(info.Path)
+	openingSummary, _ := session.ReadOpeningSummary(info.Path)
+	opening := safeOpeningText(openingSummary)
 	if opening == "" {
-		opening = "(no prompt recorded)"
+		if openingSummary.Found {
+			opening = "(authored wording unavailable for this legacy session)"
+		} else {
+			opening = "(no prompt recorded)"
+		}
 	}
 
 	var files []string
@@ -132,7 +137,7 @@ func recapLines(store *session.Store, workspace, id, skip string) []string {
 	}
 	lines = append(lines,
 		fmt.Sprintf("  %s  %s  ·  %d %s  ·  %s", info.ID, span, turns, turnWord, bill),
-		"  "+truncate(opening, 76))
+		"  "+redactCredentialTextBeforeTruncate(opening, 76))
 
 	// The route line claims only what opening tiers and move counts can
 	// carry: where a moved turn ended is a target id the record holds, but
@@ -198,7 +203,7 @@ func cmdRecap(m *tuiModel, args string) tea.Cmd {
 func runRecapCLI(w io.Writer, store *session.Store, workspace, id string) error {
 	fmt.Fprintln(w, "where you left off")
 	for _, line := range recapLines(store, workspace, id, "") {
-		fmt.Fprintln(w, strings.TrimRight(line, " "))
+		fmt.Fprintln(w, cliText(strings.TrimRight(line, " ")))
 	}
 	return nil
 }

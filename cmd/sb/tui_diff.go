@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -15,6 +16,8 @@ import (
 	"github.com/alecthomas/chroma/v2/styles"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 
 	"github.com/switchboard-code/switchboard/internal/scm"
 	"github.com/switchboard-code/switchboard/internal/terminaltext"
@@ -31,11 +34,17 @@ const (
 )
 
 // diffView is the /diff fullscreen. The diff is highlighted once when it
-// loads — §14's "rendered once and cached" — and scrolling is a slice over
-// the result.
+// loads — §14's "rendered once and cached" — then wrapped once per viewport
+// width so scrolling is a slice over the rows the terminal actually shows.
 type diffView struct {
 	lines  []string
-	offset int
+	visual []string
+	// visualWidth is the terminal-cell width used to build visual. Diff
+	// lines can contain Chroma SGR sequences and wide graphemes, so byte or
+	// rune counts are not a usable viewport boundary.
+	visualWidth int
+	offset      int
+	stale       bool
 }
 
 type diffLoadedMsg struct {
@@ -45,16 +54,20 @@ type diffLoadedMsg struct {
 	err        error
 }
 
-// openDiff diffs the workspace against HEAD. This is the harness running a
-// read-only git command, not the agent: it does not pass through the
-// permission engine.
-func openDiff(workspace string, dark bool) tea.Cmd {
+// openDiff diffs the workspace against HEAD. Git calls this a read, but status
+// may execute repository filters and hooks, so the standing workspace trust
+// authority is required before the first process. This is the harness, not the
+// agent, and therefore does not pass through the per-tool permission engine.
+func openDiff(workspace string, dark bool, authority scm.ExecutionAuthority) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		repo, err := scm.Discover(ctx, workspace)
+		repo, err := scm.Discover(ctx, workspace, authority)
 		if err != nil {
+			if errors.Is(err, scm.ErrExecutionNotTrusted) {
+				err = errors.New("/diff can execute repository Git filters and hooks; run /trust grant first")
+			}
 			return diffLoadedMsg{err: err}
 		}
 		paths, err := workspaceDiffPaths(workspace, repo.Root)
@@ -206,6 +219,10 @@ func diffStateLabel(file scm.PathState) string {
 // back to plain lines: the diff matters more than its colors.
 func highlightDiff(text string, dark bool) []string {
 	plain := strings.Split(strings.TrimRight(text, "\n"), "\n")
+	profile := lipgloss.ColorProfile()
+	if profile == termenv.Ascii {
+		return plain
+	}
 
 	lexer := lexers.Get("diff")
 	if lexer == nil {
@@ -216,7 +233,18 @@ func highlightDiff(text string, dark bool) []string {
 		styleName = "github-dark"
 	}
 	style := styles.Get(styleName)
-	formatter := formatters.Get("terminal256")
+	formatterName := ""
+	switch profile {
+	case termenv.ANSI:
+		formatterName = "terminal16"
+	case termenv.ANSI256:
+		formatterName = "terminal256"
+	case termenv.TrueColor:
+		formatterName = "terminal16m"
+	default:
+		return plain
+	}
+	formatter := formatters.Get(formatterName)
 	if style == nil || formatter == nil {
 		return plain
 	}
@@ -234,6 +262,14 @@ func highlightDiff(text string, dark bool) []string {
 // key scrolls; it reports true when the view should close. The diff has no
 // asynchronous key actions, so its command is always nil.
 func (d *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
+	if d.stale {
+		switch msg.String() {
+		case "esc", "q":
+			return true, nil
+		default:
+			return false, noticeCmd("warn", "the workspace changed; close and reopen /diff for the current patch")
+		}
+	}
 	switch msg.String() {
 	case "esc", "q":
 		return true, nil
@@ -248,13 +284,21 @@ func (d *diffView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
 	case "g":
 		d.offset = 0
 	case "G":
-		d.offset = len(d.lines)
+		// visual is available after the first paint, which is the normal key
+		// path. Keep the logical-line fallback for direct callers before then.
+		d.offset = len(d.visual)
+		if d.visual == nil {
+			d.offset = len(d.lines)
+		}
 		d.scroll(0)
 	}
 	return false, nil
 }
 
 func (d *diffView) mouse(msg tea.MouseMsg) tea.Cmd {
+	if d.stale {
+		return nil
+	}
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
 		d.scroll(-3)
@@ -272,36 +316,114 @@ func (d *diffView) scroll(n int) {
 }
 
 func (d *diffView) view(width, height int, th *theme) string {
-	header := th.bold.Render(" git diff HEAD") +
-		th.faint.Render("  ↑↓ scroll · pgup/pgdn page · g/G ends · esc close")
-
-	bodyH := height - 2
-	if bodyH < 1 {
-		bodyH = 1
+	if width < 1 || height < 1 {
+		return ""
 	}
-	if max := len(d.lines) - bodyH; d.offset > max {
-		d.offset = max
+	if th == nil {
+		th = darkTheme()
+	}
+
+	headerText := " git diff HEAD"
+	help := "  ↑↓ scroll · pgup/pgdn page · g/G ends · esc close"
+	if d.stale {
+		headerText += " · STALE"
+		help = "  workspace changed · reopen /diff · esc close"
+	}
+	header := th.bold.Render(headerText) + th.faint.Render(help)
+	header = ansi.Truncate(header, width, "")
+
+	footerRows := 0
+	if height > 2 {
+		footerRows = 1
+	}
+	bodyHeight := height - 1 - footerRows
+	visual := d.visualLines(width)
+	if maximum := max(len(visual)-bodyHeight, 0); d.offset > maximum {
+		d.offset = maximum
 	}
 	if d.offset < 0 {
 		d.offset = 0
 	}
 
-	end := d.offset + bodyH
-	if end > len(d.lines) {
-		end = len(d.lines)
-	}
-	visible := append([]string(nil), d.lines[d.offset:end]...)
-	for len(visible) < bodyH {
+	end := min(d.offset+bodyHeight, len(visual))
+	visible := append([]string(nil), visual[d.offset:end]...)
+	for len(visible) < bodyHeight {
 		visible = append(visible, "")
 	}
 
-	footer := ""
-	if len(d.lines) > bodyH {
-		pct := (d.offset + bodyH) * 100 / len(d.lines)
-		if pct > 100 {
-			pct = 100
+	rows := append([]string{header}, visible...)
+	if footerRows == 1 {
+		footer := ""
+		if d.stale {
+			footer = th.warn.Render(workspaceFit(" stale snapshot: workspace changed after this diff loaded", width))
+		} else if len(visual) > bodyHeight && len(visual) > 0 {
+			pct := min((d.offset+bodyHeight)*100/len(visual), 100)
+			footer = th.faint.Render(workspaceFit(" "+itoa(pct)+"%", width))
 		}
-		footer = th.faint.Render(" " + itoa(pct) + "%")
+		rows = append(rows, footer)
 	}
-	return header + "\n" + lipgloss.JoinVertical(lipgloss.Left, visible...) + "\n" + footer
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+}
+
+// visualLines converts logical diff lines to viewport rows. Hardwrap knows
+// about ANSI state and grapheme cell widths; rendering tabs as two printable
+// cells avoids delegating their width to terminal tab-stop configuration.
+func (d *diffView) visualLines(width int) []string {
+	width = max(width, 1)
+	if d.visual != nil && d.visualWidth == width {
+		return d.visual
+	}
+	visual := make([]string, 0, len(d.lines))
+	for _, line := range d.lines {
+		line = strings.ReplaceAll(line, "\t", `\t`)
+		wrapped := strings.Split(ansi.Hardwrap(line, width, true), "\n")
+		styled := strings.Contains(line, "\x1b[")
+		activeStyle := ""
+		for _, row := range wrapped {
+			rowStyle := activeStyle
+			activeStyle = diffSGRState(activeStyle, row)
+			// A grapheme can itself be wider than a one-cell viewport. It cannot
+			// be represented there, but it must not make the frame wider.
+			row = ansi.Truncate(row, width, "")
+			if styled {
+				// Make every row independently renderable: scrolling can begin or
+				// end in the middle of a wrapped Chroma token.
+				row = ansi.ResetStyle + rowStyle + row + ansi.ResetStyle
+			}
+			visual = append(visual, row)
+		}
+	}
+	d.visual = visual
+	d.visualWidth = width
+	return d.visual
+}
+
+// diffSGRState returns the SGR sequences needed to resume the current style
+// on a separately rendered continuation row. Chroma emits complete SGR
+// sequences and a full reset around each token; handling general terminal
+// control state here would be both unnecessary and unsafe.
+func diffSGRState(active, text string) string {
+	for rest := text; ; {
+		start := strings.Index(rest, "\x1b[")
+		if start < 0 {
+			return active
+		}
+		rest = rest[start:]
+		end := strings.IndexByte(rest, 'm')
+		if end < 0 {
+			return active
+		}
+		seq := rest[:end+1]
+		params := rest[2:end]
+		switch {
+		case params == "" || params == "0":
+			active = ""
+		case strings.HasPrefix(params, "0;") || strings.HasPrefix(params, "0:"):
+			// Replaying the whole sequence reproduces reset-then-style.
+			active = seq
+		default:
+			active += seq
+		}
+		rest = rest[end+1:]
+	}
 }

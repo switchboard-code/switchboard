@@ -58,6 +58,7 @@ var subagentRunner = &delegateRunnerHolder{}
 // for the same frozen-zone reason agents are: a file added mid-process is
 // picked up by the next run.
 var subagentWorkflows []delegate.Workflow
+var subagentWorkflowNotes []string
 
 type delegateRunnerHolder struct {
 	mu sync.Mutex
@@ -149,6 +150,9 @@ func registerDelegate(
 	budget *budgetState,
 	skillList []skills.Skill,
 ) ([]delegate.Agent, []string, error) {
+	subagentRunner.set(nil)
+	subagentWorkflows = nil
+	subagentWorkflowNotes = nil
 	if len(cfg.Tiers) == 0 {
 		return nil, nil, nil // no ladder, nothing to delegate on
 	}
@@ -187,18 +191,7 @@ func registerDelegate(
 			return primary.Session.ID()
 		},
 		Probe: func(ctx context.Context, tierID string) (config.Tier, provider.Provider, string, error) {
-			tier, ok := cfg.Tier(tierID)
-			if !ok {
-				return config.Tier{}, nil, "", fmt.Errorf("no tier %s", tierID)
-			}
-			// The rung here is the model's choice, which makes this the one
-			// destination check that governs egress the user did not initiate.
-			// A policy the router enforces on turns and not on delegate calls
-			// would be a policy a tool call walks around.
-			if err := destinationAllowed(cfg, tier.Target); err != nil {
-				return config.Tier{}, nil, "", err
-			}
-			return reg.probeTierFallback(ctx, tier)
+			return probeDelegateTier(ctx, cfg, reg, tierID)
 		},
 		NewSession: func(target provider.RouteTargetID) (*session.Session, error) {
 			sess, err := subStore.Create(workspace, target, cat.Revision)
@@ -267,6 +260,8 @@ func registerDelegate(
 				MaxToolRounds:     delegate.MaxRounds,
 				Hooks:             hookSet,
 				ToolExecutionGate: hookExecutionGate,
+				ContextWindow:     primary.ContextWindow,
+				OutputAllowance:   primary.OutputAllowance,
 			}
 			if err := sub.BindSession(sess); err != nil {
 				_ = sess.Close()
@@ -285,7 +280,7 @@ func registerDelegate(
 				func(amount catalog.Money) (string, error) { return primary.Session.BeginBudgetAttempt(int64(amount)) },
 				func(id, outcome string, charge catalog.Money) error {
 					return ledger.settle(primary.Session, sess, id, outcome, charge)
-				}, true))
+				}, true).withOutputAllowance(sub.OutputAllowance))
 			return sub, nil
 		},
 		Finish: func(sess *session.Session) error {
@@ -307,7 +302,25 @@ func registerDelegate(
 
 	workflows, workflowNotes := delegate.LoadWorkflows(workspace)
 	subagentWorkflows = workflows
+	subagentWorkflowNotes = append([]string(nil), workflowNotes...)
 	agentNotes = append(agentNotes, workflowNotes...)
 
 	return agents, agentNotes, registry.AddExternal(tool)
+}
+
+// probeDelegateTier applies destination policy to the concrete target that
+// will receive the subagent prompt, including an availability fallback. The
+// model chooses this rung, so checking only its configured primary would let a
+// disallowed fallback carry workspace content around the router's hard gate.
+func probeDelegateTier(ctx context.Context, cfg *config.Config, reg *providers, tierID string) (config.Tier, provider.Provider, string, error) {
+	tier, ok := cfg.Tier(tierID)
+	if !ok {
+		return config.Tier{}, nil, "", fmt.Errorf("no tier %s", tierID)
+	}
+	if err := destinationAllowed(cfg, tier.Target); err != nil {
+		return config.Tier{}, nil, "", err
+	}
+	return reg.probeTierFallbackFeasible(ctx, tier, func(concrete config.Tier) error {
+		return destinationAllowed(cfg, concrete.Target)
+	})
 }

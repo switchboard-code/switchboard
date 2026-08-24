@@ -70,6 +70,29 @@ func TestRenderExplicitAppendsArgumentsWithoutAPlaceholder(t *testing.T) {
 	}
 }
 
+func TestRenderExplicitRedactsBodyWithoutMutatingSourceSkill(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("d", 36)
+	for _, ecosystem := range []Ecosystem{EcosystemSwitchboard, EcosystemCodex, EcosystemClaude} {
+		t.Run(string(ecosystem), func(t *testing.T) {
+			sourceBody := strings.Repeat("x", 390) + " " + secret + " $ARGUMENTS"
+			sk := Skill{
+				Name: "boundary", Selector: string(ecosystem) + ":repo:boundary",
+				Body: sourceBody, Origin: Origin{Ecosystem: ecosystem},
+			}
+			got, err := RenderExplicit(sk, "target")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(got, secret) || !strings.Contains(got, "[redacted: a GitHub token]") || !strings.Contains(got, "target") {
+				t.Fatalf("explicit %s body was not visibly redacted:\n%s", ecosystem, got)
+			}
+			if sk.Body != sourceBody {
+				t.Fatalf("explicit rendering mutated %s source body", ecosystem)
+			}
+		})
+	}
+}
+
 func TestRenderExplicitRejectsInvalidInvocationAndUnsupportedBehavior(t *testing.T) {
 	base := Skill{Name: "blocked", Selector: "claude:user:blocked", Body: "body", Origin: Origin{Ecosystem: EcosystemClaude}}
 	tests := []struct {

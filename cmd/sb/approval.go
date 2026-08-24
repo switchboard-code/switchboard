@@ -78,7 +78,7 @@ func (r *lazyCommandReviewer) get(ctx context.Context) (*approval.ModelReviewer,
 			Target:   probed.Target,
 			Identity: identity,
 			Meter: func(target provider.RouteTarget, request provider.Request) (approval.AttemptFinish, error) {
-				finish, meterErr := beginMeteredCall(r.budget, r.catalog, r.loop.Session, target, request, session.UsagePurposeApproval)
+				finish, meterErr := beginMeteredCall(r.budget, r.catalog, r.loop.Session, target, request, session.UsagePurposeApproval, client)
 				if meterErr != nil {
 					return nil, meterErr
 				}

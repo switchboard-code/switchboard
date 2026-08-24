@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 	"github.com/switchboard-code/switchboard/internal/mcpnative"
 )
 
@@ -72,36 +73,37 @@ args = ["--mode", "safe"]
 
 func TestNativeMCPActivationStateFailsClosedOnUnsafeFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), nativeMCPStateFileName)
-	writeNativeMCPConfig(t, path, `{"version":1,"version":1,"key":"x","activations":[]}`)
+	writePrivateNativeMCPState(t, path, `{"version":1,"version":1,"key":"x","activations":[]}`)
 	if _, err := openNativeMCPActivationStateFile(path); err == nil || !strings.Contains(err.Error(), "duplicate JSON key") {
 		t.Fatalf("duplicate state error = %v", err)
 	}
 
 	if runtime.GOOS != "windows" {
-		writeNativeMCPConfig(t, path, `{"version":1,"key":"x","activations":[]}`)
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		writePrivateNativeMCPState(t, path, `{"version":1,"key":"x","activations":[]}`)
 		if err := os.Chmod(path, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := openNativeMCPActivationStateFile(path); err == nil || !strings.Contains(err.Error(), "want 0600") {
+		if _, err := openNativeMCPActivationStateFile(path); err == nil || !strings.Contains(err.Error(), "owner-only") {
 			t.Fatalf("loose-permission error = %v", err)
 		}
 
-		target := filepath.Join(t.TempDir(), "target.json")
-		writeNativeMCPConfig(t, target, `{"version":1,"key":"x","activations":[]}`)
-		link := filepath.Join(t.TempDir(), nativeMCPStateFileName)
-		if err := os.Symlink(target, link); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := openNativeMCPActivationStateFile(link); err == nil || !strings.Contains(err.Error(), "symbolic link") {
-			t.Fatalf("symlink state error = %v", err)
-		}
+	}
+
+	target := filepath.Join(t.TempDir(), "target.json")
+	writePrivateNativeMCPState(t, target, `{"version":1,"key":"x","activations":[]}`)
+	link := filepath.Join(t.TempDir(), nativeMCPStateFileName)
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := openNativeMCPActivationStateFile(link); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("symlink state error = %v", err)
 	}
 }
 
 func TestNativeMCPActivationMutationReloadFailsClosedOnUnsafeFile(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("creating symbolic links is not generally available to unprivileged Windows tests")
-	}
 	home := t.TempDir()
 	workspace := t.TempDir()
 	writeNativeMCPConfig(t, filepath.Join(home, ".claude.json"), `{
@@ -123,7 +125,7 @@ func TestNativeMCPActivationMutationReloadFailsClosedOnUnsafeFile(t *testing.T) 
 		t.Fatal(err)
 	}
 	if err := os.Symlink(targetPath, path); err != nil {
-		t.Fatal(err)
+		t.Skipf("symlinks unavailable: %v", err)
 	}
 
 	err = state.enable(request)
@@ -214,10 +216,18 @@ func TestNativeMCPActivationMutationReloadsLatestAcrossOpenHandles(t *testing.T)
 }
 
 func TestNativeMCPActivationConcurrentHandlesDoNotLoseUpdates(t *testing.T) {
+	for _, writers := range []int{32, 64} {
+		t.Run(fmt.Sprintf("%d writers", writers), func(t *testing.T) {
+			testNativeMCPActivationConcurrentHandles(t, writers)
+		})
+	}
+}
+
+func testNativeMCPActivationConcurrentHandles(t *testing.T, count int) {
+	t.Helper()
 	home := t.TempDir()
 	workspace := t.TempDir()
 	servers := make(map[string]any)
-	const count = 32
 	for index := range count {
 		name := fmt.Sprintf("server_%02d", index)
 		servers[name] = map[string]any{"command": name}
@@ -270,6 +280,121 @@ func TestNativeMCPActivationConcurrentHandlesDoNotLoseUpdates(t *testing.T) {
 	}
 	if references := reopened.references(workspace); len(references) != count/2 {
 		t.Fatalf("remaining references = %d, want %d", len(references), count/2)
+	}
+}
+
+func TestNativeMCPStateLockContextPreservesCallerDeadline(t *testing.T) {
+	deadline := time.Now().Add(time.Hour).Round(0)
+	parent, parentCancel := context.WithDeadline(context.Background(), deadline)
+	defer parentCancel()
+	waitCtx, cancel := nativeMCPStateLockContext(parent)
+	defer cancel()
+	got, ok := waitCtx.Deadline()
+	if !ok || !got.Equal(deadline) {
+		t.Fatalf("wait deadline = %v, %t; want exact caller deadline %v", got, ok, deadline)
+	}
+
+	beforeFallback := time.Now()
+	fallback, fallbackCancel := nativeMCPStateLockContext(context.Background())
+	afterFallback := time.Now()
+	defer fallbackCancel()
+	got, ok = fallback.Deadline()
+	if !ok {
+		t.Fatal("deadline-free caller received no finite lock fallback")
+	}
+	minDeadline := beforeFallback.Add(nativeMCPStateLockWait)
+	maxDeadline := afterFallback.Add(nativeMCPStateLockWait)
+	if got.Before(minDeadline) || got.After(maxDeadline) {
+		t.Fatalf("fallback deadline = %v, want within [%v, %v]", got, minDeadline, maxDeadline)
+	}
+}
+
+func TestNativeMCPStateLockHonorsCallerDeadlineWhileHeld(t *testing.T) {
+	path := filepath.Join(t.TempDir(), nativeMCPStateFileName)
+	held, err := acquireNativeMCPStateFileLock(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	const wait = 100 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	defer cancel()
+	started := time.Now()
+	second, err := acquireNativeMCPStateFileLock(ctx, path)
+	if second != nil {
+		_ = second.Close()
+		t.Fatal("contending lock acquired while the first lock remained held")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("contending lock error = %v, want caller deadline", err)
+	}
+	elapsed := time.Since(started)
+	if elapsed < wait/2 || elapsed > 2*time.Second {
+		t.Fatalf("caller deadline returned after %v, want approximately %v", elapsed, wait)
+	}
+}
+
+func TestNativeMCPStateLockCannotAcquireAfterCancellationAtPollBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), nativeMCPStateFileName)
+	held, err := acquireNativeMCPStateFileLock(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var releaseErr error
+	nativeMCPStateLockAfterPoll = func() {
+		cancel()
+		releaseErr = held.Close()
+		nativeMCPStateLockAfterPoll = nil
+	}
+	t.Cleanup(func() { nativeMCPStateLockAfterPoll = nil })
+
+	second, err := acquireNativeMCPStateFileLock(ctx, path)
+	if second != nil {
+		_ = second.Close()
+		t.Fatal("lock returned authority after cancellation at the poll boundary")
+	}
+	if releaseErr != nil {
+		t.Fatalf("releasing held lock at poll boundary: %v", releaseErr)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("poll-boundary cancellation error = %v, want context.Canceled", err)
+	}
+}
+
+func TestNativeMCPStateLockReleasesAcquisitionCanceledAtSuccessBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), nativeMCPStateFileName)
+	ctx, cancel := context.WithCancel(context.Background())
+	nativeMCPStateLockAfterAcquire = func() {
+		cancel()
+		nativeMCPStateLockAfterAcquire = nil
+	}
+	t.Cleanup(func() {
+		nativeMCPStateLockAfterAcquire = nil
+		cancel()
+	})
+
+	lock, err := acquireNativeMCPStateFileLock(ctx, path)
+	if lock != nil {
+		_ = lock.Close()
+		t.Fatal("lock returned authority after cancellation at the acquisition boundary")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("acquisition-boundary cancellation error = %v, want context.Canceled", err)
+	}
+
+	// The canceled acquisition must have unlocked and closed its descriptor,
+	// leaving the permanent sidecar immediately available to a fresh caller.
+	reopened, err := acquireNativeMCPStateFileLock(context.Background(), path)
+	if err != nil {
+		t.Fatalf("canceled acquisition retained the lock: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -347,6 +472,157 @@ func TestNativeMCPActivationCancellationWhileLockHeldDoesNotCommit(t *testing.T)
 	}
 }
 
+func TestNativeMCPActivationUnpublishedCancellationKeepsBaselineAuthority(t *testing.T) {
+	home := t.TempDir()
+	workspace := t.TempDir()
+	writeNativeMCPConfig(t, filepath.Join(home, ".claude.json"), `{
+  "mcpServers": {
+    "x": {"command":"x"},
+    "y": {"command":"y"}
+  }
+}`)
+	x := nativeMCPRequest(t, home, workspace, "claude:x")
+	y := nativeMCPRequest(t, home, workspace, "claude:y")
+	path := filepath.Join(t.TempDir(), nativeMCPStateFileName)
+	state, err := openNativeMCPActivationStateFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.enable(x); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	nativeMCPStateBeforePublication = cancel
+	t.Cleanup(func() { nativeMCPStateBeforePublication = nil })
+	if err := state.enableWithRequiredContext(ctx, y, false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled unpublished mutation error = %v", err)
+	}
+	if !state.NativeMCPActivated(x) || state.NativeMCPActivated(y) {
+		t.Fatal("unpublished cancellation discarded or changed the validated baseline")
+	}
+	state.mu.Lock()
+	poisoned := state.poisoned
+	state.mu.Unlock()
+	if poisoned != nil {
+		t.Fatalf("unpublished cancellation poisoned the validated baseline: %v", poisoned)
+	}
+	reopened, err := openNativeMCPActivationStateFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reopened.NativeMCPActivated(x) || reopened.NativeMCPActivated(y) {
+		t.Fatal("unpublished cancellation changed persisted activation state")
+	}
+}
+
+func TestNativeMCPActivationPublishedFailurePoisonsButDoesNotRollBack(t *testing.T) {
+	home := t.TempDir()
+	workspace := t.TempDir()
+	writeNativeMCPConfig(t, filepath.Join(home, ".claude.json"), `{
+  "mcpServers": {
+    "x": {"command":"x"},
+    "y": {"command":"y"}
+  }
+}`)
+	x := nativeMCPRequest(t, home, workspace, "claude:x")
+	y := nativeMCPRequest(t, home, workspace, "claude:y")
+	path := filepath.Join(t.TempDir(), nativeMCPStateFileName)
+	state, err := openNativeMCPActivationStateFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.enable(x); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected post-publication state failure")
+	nativeMCPStateAfterPublication = func(published bool, publicationErr error) error {
+		if !published || publicationErr != nil {
+			t.Fatalf("publication seam = published %v, err %v", published, publicationErr)
+		}
+		return injected
+	}
+	t.Cleanup(func() { nativeMCPStateAfterPublication = nil })
+	if err := state.enable(y); !errors.Is(err, injected) {
+		t.Fatalf("published failure error = %v", err)
+	}
+	if state.NativeMCPActivated(x) || state.NativeMCPActivated(y) {
+		t.Fatal("published failure left cached activation authority usable")
+	}
+	nativeMCPStateAfterPublication = nil
+	reopened, err := openNativeMCPActivationStateFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reopened.NativeMCPActivated(x) || !reopened.NativeMCPActivated(y) {
+		t.Fatal("published failure was incorrectly rolled back")
+	}
+}
+
+func TestNativeMCPActivationWriteBoundPrecedesPublicationArtifacts(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, nativeMCPStateFileName)
+	state, err := openNativeMCPActivationStateFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = state.mutate(context.Background(), func(latest *nativeMCPActivationState) (bool, error) {
+		latest.key = make([]byte, 32)
+		latest.records["oversize"] = nativeMCPActivationRecord{
+			ID: "claude:oversize", RealPath: "/" + strings.Repeat("x", maxNativeMCPStateBytes),
+			Digest: strings.Repeat("a", 64),
+		}
+		return true, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "write bound") {
+		t.Fatalf("oversized state error = %v", err)
+	}
+	state.mu.Lock()
+	poisoned := state.poisoned
+	state.mu.Unlock()
+	if poisoned != nil {
+		t.Fatalf("deterministic write-bound refusal poisoned the baseline: %v", poisoned)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("oversized state was published: %v", err)
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != nativeMCPStateFileName+".lock" && entry.Name() != nativeMCPStateRecoveryDirName {
+			t.Fatalf("oversized state created publication artifact %q", entry.Name())
+		}
+	}
+	recoveryEntries, err := os.ReadDir(filepath.Join(directory, nativeMCPStateRecoveryDirName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recoveryEntries) != 0 {
+		t.Fatalf("oversized state created %d recovery artifacts", len(recoveryEntries))
+	}
+}
+
+func TestNativeMCPStateRecoveryIgnoresOtherAuthorityLedgers(t *testing.T) {
+	directory := t.TempDir()
+	foreignName := ".switchboard-undo-cleanup-" + strings.Repeat("a", 32)
+	foreignPath := filepath.Join(directory, foreignName)
+	const foreign = "another authority owns this ledger\n"
+	if err := os.WriteFile(foreignPath, []byte(foreign), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openNativeMCPActivationStateFile(filepath.Join(directory, nativeMCPStateFileName)); err != nil {
+		t.Fatalf("foreign authority ledger affected native MCP recovery: %v", err)
+	}
+	raw, err := os.ReadFile(foreignPath)
+	if err != nil || string(raw) != foreign {
+		t.Fatalf("foreign authority ledger = %q, %v", raw, err)
+	}
+	if _, err := os.Stat(filepath.Join(directory, nativeMCPStateRecoveryDirName)); err != nil {
+		t.Fatalf("native MCP recovery namespace was not created separately: %v", err)
+	}
+}
+
 func nativeMCPRequest(t *testing.T, home, workspace, id string) mcpnative.ActivationRequest {
 	t.Helper()
 	result := mcpnative.Discover(nativeMCPTestOptions(t, home, workspace))
@@ -421,6 +697,24 @@ func writeNativeMCPConfig(t *testing.T, path, contents string) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writePrivateNativeMCPState(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := fileprivacy.EnsurePrivateDir(filepath.Dir(path)); err != nil {
+		t.Fatal(err)
+	}
+	f, err := fileprivacy.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(contents); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
 }

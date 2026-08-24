@@ -1,12 +1,13 @@
 package credential
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/switchboard-code/switchboard/internal/execution"
 )
 
 // OSStore is the macOS Keychain, reached through the `security` command.
@@ -29,9 +30,13 @@ import (
 // split is handled by refusing control characters outright, since no quoting
 // survives it.
 type OSStore struct {
-	// bin exists for tests. Empty means `security` on PATH.
+	// bin exists for tests. Production always uses the system binary by its
+	// absolute path: a checkout must not be able to receive credentials by
+	// putting a lookalike earlier on PATH.
 	bin string
 }
+
+const securityToolPath = "/usr/bin/security"
 
 func NewOSStore() *OSStore { return &OSStore{} }
 
@@ -41,7 +46,16 @@ func (s *OSStore) tool() string {
 	if s.bin != "" {
 		return s.bin
 	}
-	return "security"
+	return securityToolPath
+}
+
+func (s *OSStore) command(ctx context.Context, args ...string) *exec.Cmd {
+	// runCredentialCommand below owns cancellation for the complete process
+	// group. Constructing a CommandContext here would add a competing
+	// direct-child-only kill path.
+	cmd := exec.Command(s.tool(), args...)
+	cmd.Env = execution.ScrubbedChildEnv()
+	return cmd
 }
 
 // notFoundStatus is what `security` exits with when the item is absent. It is
@@ -60,14 +74,17 @@ func (s *OSStore) Get(ctx context.Context, ref Ref) (Secret, error) {
 		return Secret{}, err
 	}
 
-	cmd := exec.CommandContext(ctx, s.tool(),
+	cmd := s.command(ctx,
 		"find-generic-password", "-s", service(ref), "-a", account(ref), "-w")
 
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr boundedHelperCapture
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	if err := runCredentialCommand(ctx, cmd); err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return Secret{}, contextErr
+		}
 		if unavailable := s.unavailable(err); unavailable != nil {
 			return Secret{}, unavailable
 		}
@@ -75,7 +92,10 @@ func (s *OSStore) Get(ctx context.Context, ref Ref) (Secret, error) {
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == notFoundStatus {
 			return Secret{}, ErrNotFound
 		}
-		return Secret{}, fmt.Errorf("reading the keychain: %w%s", err, diagnostics(stderr.String()))
+		return Secret{}, fmt.Errorf("reading the keychain: %w%s", err, diagnostics(stderr.String(), stderr.overflow))
+	}
+	if stdout.overflow {
+		return Secret{}, fmt.Errorf("the keychain returned more than %d credential bytes; output withheld", maxHelperCaptureBytes)
 	}
 
 	// -w writes the password followed by a newline and nothing else.
@@ -109,7 +129,7 @@ func (s *OSStore) Set(ctx context.Context, ref Ref, value string) error {
 	// with a success exit code. That is how an OAuth token document lands in
 	// the keychain as unparseable JSON. Here the whole command line arrives on
 	// standard input, so `ps` sees only "security -i" and nothing is truncated.
-	cmd := exec.CommandContext(ctx, s.tool(), "-i")
+	cmd := s.command(ctx, "-i")
 	cmd.Stdin = strings.NewReader(fmt.Sprintf(
 		"add-generic-password -s %s -a %s -D %s -U -w %s\n",
 		quoteArg(service(ref)),
@@ -118,10 +138,13 @@ func (s *OSStore) Set(ctx context.Context, ref Ref, value string) error {
 		quoteArg(value),
 	))
 
-	var stderr bytes.Buffer
+	var stderr boundedHelperCapture
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	if err := runCredentialCommand(ctx, cmd); err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
 		if unavailable := s.unavailable(err); unavailable != nil {
 			return unavailable
 		}
@@ -131,9 +154,9 @@ func (s *OSStore) Set(ctx context.Context, ref Ref, value string) error {
 				"This is usually one of two things: the login keychain is locked and there is no\n"+
 				"desktop session to unlock it, which happens over SSH, or HOME points somewhere\n"+
 				"without a login keychain. Either way an environment variable or a credential\n"+
-				"helper will work where this will not.", diagnostics(stderr.String()))
+				"helper will work where this will not.", diagnostics(stderr.String(), stderr.overflow))
 		}
-		return fmt.Errorf("storing in the keychain: %w%s", err, diagnostics(stderr.String()))
+		return fmt.Errorf("storing in the keychain: %w%s", err, diagnostics(stderr.String(), stderr.overflow))
 	}
 	return nil
 }
@@ -143,13 +166,16 @@ func (s *OSStore) Delete(ctx context.Context, ref Ref) error {
 		return err
 	}
 
-	cmd := exec.CommandContext(ctx, s.tool(),
+	cmd := s.command(ctx,
 		"delete-generic-password", "-s", service(ref), "-a", account(ref))
 
-	var stderr bytes.Buffer
+	var stderr boundedHelperCapture
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	if err := runCredentialCommand(ctx, cmd); err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
 		if unavailable := s.unavailable(err); unavailable != nil {
 			return unavailable
 		}
@@ -157,7 +183,7 @@ func (s *OSStore) Delete(ctx context.Context, ref Ref) error {
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == notFoundStatus {
 			return ErrNotFound
 		}
-		return fmt.Errorf("removing from the keychain: %w%s", err, diagnostics(stderr.String()))
+		return fmt.Errorf("removing from the keychain: %w%s", err, diagnostics(stderr.String(), stderr.overflow))
 	}
 	return nil
 }
@@ -180,7 +206,7 @@ func quoteArg(value string) string {
 
 func (s *OSStore) unavailable(err error) error {
 	if execErr := new(exec.Error); errors.As(err, &execErr) {
-		return &Unavailable{Store: s.Name(), Reason: "the security command is not on PATH"}
+		return &Unavailable{Store: s.Name(), Reason: "the system security command is unavailable at /usr/bin/security"}
 	}
 	return nil
 }

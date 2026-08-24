@@ -9,8 +9,11 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
+	"github.com/switchboard-code/switchboard/internal/execution"
 	"github.com/switchboard-code/switchboard/internal/permission"
+	"github.com/switchboard-code/switchboard/internal/tools"
 )
 
 // fakeTransport is an in-memory wire, with a scripted server on the far end.
@@ -786,5 +789,285 @@ func TestBridgeSchemaFallsBackToAnObject(t *testing.T) {
 	}
 	if err := json.Unmarshal(bridged[0].Schema(), &schema); err != nil || schema.Type != "object" {
 		t.Errorf("schema = %s, want an object schema", bridged[0].Schema())
+	}
+}
+
+func TestBridgedToolRedactsCredentialMetadataBeforeProviderDefinitions(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("A", 36)
+	schema := json.RawMessage(fmt.Sprintf(
+		`{"type":"object","properties":{%q:{"type":"string","description":%q,"default":%q,"examples":[%q],"enum":[%q]}}}`,
+		secret, "use "+secret, secret, secret, secret,
+	))
+	info := ToolInfo{
+		Name:        "credential_test",
+		Description: "server supplied " + secret,
+		InputSchema: schema,
+	}
+	descriptionBefore := info.Description
+	schemaBefore := string(info.InputSchema)
+	c := &Client{
+		spec:  Spec{Name: "metadata"},
+		logf:  func(string, string) {},
+		tools: []ToolInfo{info},
+	}
+	bridged := c.BridgedTools()
+	if len(bridged) != 1 {
+		t.Fatalf("bridged tools = %d, want 1", len(bridged))
+	}
+
+	registry, err := tools.NewRegistry(t.TempDir(), execution.Capability{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(registry.StopBackgroundCommands)
+	if err := registry.AddExternal(bridged[0]); err != nil {
+		t.Fatal(err)
+	}
+	var rendered string
+	for _, definition := range registry.Definitions() {
+		if definition.Name != bridged[0].Name() {
+			continue
+		}
+		encoded, err := json.Marshal(definition)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rendered = string(encoded)
+		if !json.Valid(definition.Schema) {
+			t.Fatalf("redacted schema is invalid JSON: %s", definition.Schema)
+		}
+	}
+	if rendered == "" {
+		t.Fatal("bridged tool is absent from provider definitions")
+	}
+	if strings.Contains(rendered, secret) || strings.Contains(rendered, "ghp_") {
+		t.Fatalf("provider definition contains raw or partial credential: %s", rendered)
+	}
+	if !strings.Contains(rendered, "redacted") {
+		t.Fatalf("provider definition does not retain a redaction marker: %s", rendered)
+	}
+	if info.Description != descriptionBefore || string(info.InputSchema) != schemaBefore {
+		t.Fatal("rendering provider metadata mutated the discovered source values")
+	}
+	if c.tools[0].Description != descriptionBefore || string(c.tools[0].InputSchema) != schemaBefore {
+		t.Fatal("rendering provider metadata mutated the client's discovered inventory")
+	}
+}
+
+func TestBridgedToolRedactsCredentialAtMetadataBoundaryPositions(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("B", 36)
+	for _, offset := range []int{0, 1, 63, 64, 119, 120, 121, 1023} {
+		t.Run(fmt.Sprintf("offset_%d", offset), func(t *testing.T) {
+			padding := strings.Repeat("x", offset) + "\n"
+			originalSchema := json.RawMessage(fmt.Sprintf(
+				`{"type":"object","properties":{"value":{"type":"string","description":%q}}}`,
+				padding+secret+" end",
+			))
+			c := &Client{
+				spec: Spec{Name: "boundary"},
+				logf: func(string, string) {},
+				tools: []ToolInfo{{
+					Name:        "probe",
+					Description: padding + secret + " end",
+					InputSchema: originalSchema,
+				}},
+			}
+			tool := c.BridgedTools()[0]
+			got := tool.Description() + "\n" + string(tool.Schema())
+			if strings.Contains(got, secret) || strings.Contains(got, "ghp_") {
+				t.Fatalf("metadata at offset %d contains raw or partial credential", offset)
+			}
+			if strings.Count(got, "redacted") < 2 {
+				t.Fatalf("metadata at offset %d lost its visible redaction markers: %q", offset, got)
+			}
+			if !json.Valid(tool.Schema()) {
+				t.Fatalf("schema at offset %d is invalid after redaction: %s", offset, tool.Schema())
+			}
+			if string(c.tools[0].InputSchema) != string(originalSchema) {
+				t.Fatalf("schema source at offset %d was mutated", offset)
+			}
+		})
+	}
+}
+
+func TestBridgedToolRedactsEscapedCredentialInSchema(t *testing.T) {
+	escapedSecret := `ghp_` + strings.Repeat(`\u0043`, 36)
+	raw := json.RawMessage(`{"type":"object","properties":{"value":{"description":"` + escapedSecret + `"}}}`)
+	c := &Client{
+		spec:  Spec{Name: "escaped"},
+		logf:  func(string, string) {},
+		tools: []ToolInfo{{Name: "probe", InputSchema: raw}},
+	}
+	got := c.BridgedTools()[0].Schema()
+	if !json.Valid(got) {
+		t.Fatalf("schema is invalid after semantic redaction: %s", got)
+	}
+	if strings.Contains(string(got), "ghp_") || !strings.Contains(string(got), "redacted") {
+		t.Fatalf("escaped credential was not redacted: %s", got)
+	}
+	if string(c.tools[0].InputSchema) != string(raw) {
+		t.Fatal("escaped schema source was mutated")
+	}
+}
+
+func TestBridgedToolLeavesOrdinarySchemaBytesUnchanged(t *testing.T) {
+	raw := json.RawMessage("{\n  \"type\": \"object\", \"maximum\": 900719925474099312345,\n  \"properties\": {\"value\": {\"type\": \"string\"}}\n}")
+	c := &Client{
+		spec:  Spec{Name: "ordinary"},
+		logf:  func(string, string) {},
+		tools: []ToolInfo{{Name: "probe", InputSchema: raw}},
+	}
+	if got := c.BridgedTools()[0].Schema(); string(got) != string(raw) {
+		t.Fatalf("ordinary schema changed:\n got %s\nwant %s", got, raw)
+	}
+}
+
+func TestMCPNamesRedactCompleteComponentsBeforeNamespacing(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("D", 36)
+	c := &Client{
+		spec:  Spec{Name: secret, Allow: []string{secret}},
+		logf:  func(string, string) {},
+		tools: []ToolInfo{{Name: secret, Description: "ordinary"}},
+	}
+	bridged := c.BridgedTools()
+	if len(bridged) != 1 {
+		t.Fatalf("bridged tools = %d, want 1", len(bridged))
+	}
+	name := bridged[0].Name()
+	if strings.Contains(name, secret) || strings.Contains(name, "ghp_") {
+		t.Fatalf("provider tool name contains raw or partial credential: %q", name)
+	}
+	if description := bridged[0].Description(); strings.Contains(description, secret) || strings.Contains(description, "ghp_") {
+		t.Fatalf("provider tool description contains raw or partial credential: %q", description)
+	}
+	plan, err := bridged[0].Plan(json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(plan.Request.Detail, secret) || strings.Contains(plan.Request.Detail, "ghp_") {
+		t.Fatalf("permission detail contains raw or partial server credential: %q", plan.Request.Detail)
+	}
+	rules := c.AllowRules()
+	if len(rules) != 1 || rules[0].Tool != name {
+		t.Fatalf("redacted allow rule = %+v, want tool %q", rules, name)
+	}
+	if c.spec.Name != secret || c.tools[0].Name != secret {
+		t.Fatal("namespacing mutated the server or tool source name")
+	}
+}
+
+func TestBridgePermissionDetailRedactsServerMetadataBeforeTruncation(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("E", 36)
+	input := json.RawMessage(fmt.Sprintf(`{"value":%q}`, strings.Repeat("x", 105)+" tail"))
+	c := &Client{
+		spec:  Spec{Name: secret},
+		logf:  func(string, string) {},
+		tools: []ToolInfo{{Name: "probe"}},
+	}
+	plan, err := c.BridgedTools()[0].Plan(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail := plan.Request.Detail
+	if strings.Contains(detail, secret) || strings.Contains(detail, "ghp_") {
+		t.Fatalf("permission detail retained a boundary-cut credential: %q", detail)
+	}
+	if !utf8.ValidString(detail) {
+		t.Fatalf("permission detail is not valid UTF-8: %q", detail)
+	}
+	if len(compactJSON(input)) > 120 {
+		t.Fatalf("compact argument detail is %d bytes, want at most 120", len(compactJSON(input)))
+	}
+}
+
+func TestBridgeRefusesCredentialArgumentsBeforeExternalCall(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("G", 36)
+	escaped := `\u0067hp_` + strings.Repeat(`\u0048`, 36)
+	tests := []struct {
+		name  string
+		input json.RawMessage
+	}{
+		{name: "direct value", input: json.RawMessage(fmt.Sprintf(`{"value":%q}`, secret))},
+		{name: "escaped key", input: json.RawMessage(`{"` + escaped + `":"ordinary"}`)},
+		{name: "past permission detail boundary", input: json.RawMessage(fmt.Sprintf(
+			`{"value":%q}`, strings.Repeat("x", 4096)+" "+secret+" tail"))},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var calls int
+			c, _ := connectFake(t, echoTool, func(string, json.RawMessage) string {
+				calls++
+				return `{"content":[{"type":"text","text":"unexpected"}]}`
+			})
+			plan, err := c.BridgedTools()[0].Plan(test.input)
+			if err == nil {
+				t.Fatalf("credential arguments produced a runnable plan: %+v", plan)
+			}
+			if plan.Run != nil || calls != 0 {
+				t.Fatalf("credential arguments reached the external call path: run=%v calls=%d", plan.Run != nil, calls)
+			}
+			if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "ghp_") ||
+				!strings.Contains(err.Error(), "credential-shaped data") {
+				t.Fatalf("credential refusal was not generic and redacted: %q", err)
+			}
+		})
+	}
+}
+
+func TestBridgeCredentialGateLeavesOrdinaryAndSplitValuesAlone(t *testing.T) {
+	inputs := []json.RawMessage{
+		json.RawMessage(`{"query":"ordinary work","count":3}`),
+		// Scan semantic values independently; do not guess a token by joining
+		// unrelated fields that the external tool receives separately.
+		json.RawMessage(`{"prefix":"ghp_","suffix":"IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII"}`),
+	}
+	for _, input := range inputs {
+		input := input
+		t.Run(string(input), func(t *testing.T) {
+			var called json.RawMessage
+			c, _ := connectFake(t, echoTool, func(_ string, args json.RawMessage) string {
+				called = append(json.RawMessage(nil), args...)
+				return `{"content":[{"type":"text","text":"ok"}]}`
+			})
+			plan, err := c.BridgedTools()[0].Plan(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := plan.Run(context.Background())
+			if err != nil || result.IsError || result.Content != "ok" {
+				t.Fatalf("ordinary MCP call result=%+v err=%v", result, err)
+			}
+			if string(called) != string(input) {
+				t.Fatalf("ordinary arguments changed: got %s want %s", called, input)
+			}
+		})
+	}
+}
+
+func TestBridgeRedactsCredentialShapedTransportErrors(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("F", 36)
+	c := &Client{
+		spec:    Spec{Name: secret},
+		logf:    func(string, string) {},
+		pending: map[int64]chan rpcResponse{},
+		dead:    fmt.Errorf("mcp server %s failed", secret),
+		tools:   []ToolInfo{{Name: "probe"}},
+	}
+	plan, err := c.BridgedTools()[0].Plan(json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := plan.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError {
+		t.Fatalf("transport failure result = %+v, want an error result", result)
+	}
+	if strings.Contains(result.Content, secret) || strings.Contains(result.Content, "ghp_") {
+		t.Fatalf("transport failure rendered raw or partial credential: %q", result.Content)
+	}
+	if !strings.Contains(result.Content, "redacted") {
+		t.Fatalf("transport failure lost its redaction marker: %q", result.Content)
 	}
 }

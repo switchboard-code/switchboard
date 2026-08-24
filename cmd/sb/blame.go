@@ -26,13 +26,20 @@ import (
 	"github.com/switchboard-code/switchboard/internal/session"
 )
 
-const blameMaxRuns = 12
+const (
+	blameMaxRuns      = 12
+	maxBlameFileBytes = int64(4 << 20)
+)
+
+func readBlameFile(workspace, path string) ([]byte, error) {
+	return readWorkspaceFileBounded(workspace, path, maxBlameFileBytes, nil)
+}
 
 // blameLines annotates one file from every session the workspace has
 // recorded. abs is the file already resolved; shown is how the user named
 // it, for the report's own words.
 func blameLines(store, delegates *session.Store, workspace, abs, shown string) []string {
-	disk, err := os.ReadFile(abs)
+	disk, err := readBlameFile(workspace, abs)
 	if err != nil {
 		return []string{"  cannot read " + shown + ": " + err.Error()}
 	}
@@ -93,10 +100,7 @@ func blameLines(store, delegates *session.Store, workspace, abs, shown string) [
 			who = o.Tier + " " + who
 		}
 		turn := fmt.Sprintf("%s#%d", o.SessionID, o.Turn)
-		prompt := ""
-		if o.Prompt != "" {
-			prompt = fmt.Sprintf("  %q", truncate(o.Prompt, 44))
-		}
+		prompt := "  " + recordedTurnPrompt(o.Prompt, o.PromptAuthoredKnown, o.PromptSynthetic, 44)
 		word := "lines"
 		if counts[origin] == 1 {
 			word = "line"
@@ -197,7 +201,7 @@ func blameWorkspaceLines(store, delegates *session.Store, cat *catalog.Catalog, 
 				r.tiers[e.Tier] = true
 			}
 		}
-		disk, err := os.ReadFile(path)
+		disk, err := readBlameFile(workspace, path)
 		if err != nil {
 			if os.IsNotExist(err) {
 				gone++
@@ -277,7 +281,7 @@ func blameWorkspaceLines(store, delegates *session.Store, cat *catalog.Catalog, 
 // transcript search cannot give, because the line number is not in the
 // transcript.
 func blameLineLines(store, delegates *session.Store, workspace, abs, shown string, line int) []string {
-	disk, err := os.ReadFile(abs)
+	disk, err := readBlameFile(workspace, abs)
 	if err != nil {
 		return []string{"  cannot read " + shown + ": " + err.Error()}
 	}
@@ -306,9 +310,7 @@ func blameLineLines(store, delegates *session.Store, workspace, abs, shown strin
 		who = o.Tier + " " + who
 	}
 	lines := []string{fmt.Sprintf("  written by %s in %s#%d", who, o.SessionID, o.Turn)}
-	if o.Prompt != "" {
-		lines = append(lines, fmt.Sprintf("  asked: %q", truncate(o.Prompt, 70)))
-	}
+	lines = append(lines, "  asked: "+recordedTurnPrompt(o.Prompt, o.PromptAuthoredKnown, o.PromptSynthetic, 70))
 
 	ref, ok := logByID[o.SessionID]
 	if !ok {
@@ -318,7 +320,7 @@ func blameLineLines(store, delegates *session.Store, workspace, abs, shown strin
 		lines = append(lines, "  the turn also touched: "+strings.Join(others, ", "))
 	}
 	if closing := turnClosing(ref.path, o.Turn); closing != "" {
-		lines = append(lines, fmt.Sprintf("  the turn signed off: %q", truncate(closing, 90)))
+		lines = append(lines, fmt.Sprintf("  the turn signed off: %q", redactCredentialTextBeforeTruncate(closing, 90)))
 	}
 	if ref.errand {
 		// An errand's log is real and auditable, but /resume deliberately
@@ -600,7 +602,7 @@ func runBlameCLI(w io.Writer, store *session.Store, cat *catalog.Catalog, worksp
 	if path == "" {
 		fmt.Fprintln(w, "who wrote this workspace")
 		for _, line := range blameWorkspaceLines(store, delegates, cat, workspace) {
-			fmt.Fprintln(w, strings.TrimRight(line, " "))
+			fmt.Fprintln(w, cliText(strings.TrimRight(line, " ")))
 		}
 		return nil
 	}
@@ -610,9 +612,9 @@ func runBlameCLI(w io.Writer, store *session.Store, cat *catalog.Catalog, worksp
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(w, "why line %d of %s\n", line, file)
+			fmt.Fprintf(w, "why line %d of %s\n", line, cliText(file))
 			for _, out := range blameLineLines(store, delegates, workspace, filepath.Clean(abs), file, line) {
-				fmt.Fprintln(w, strings.TrimRight(out, " "))
+				fmt.Fprintln(w, cliText(strings.TrimRight(out, " ")))
 			}
 			return nil
 		}
@@ -621,9 +623,9 @@ func runBlameCLI(w io.Writer, store *session.Store, cat *catalog.Catalog, worksp
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "who wrote %s\n", path)
+	fmt.Fprintf(w, "who wrote %s\n", cliText(path))
 	for _, line := range blameLines(store, delegates, workspace, filepath.Clean(abs), path) {
-		fmt.Fprintln(w, strings.TrimRight(line, " "))
+		fmt.Fprintln(w, cliText(strings.TrimRight(line, " ")))
 	}
 	return nil
 }

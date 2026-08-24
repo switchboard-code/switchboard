@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/switchboard-code/switchboard/internal/execution"
 	"github.com/switchboard-code/switchboard/internal/permission"
 )
 
@@ -480,6 +481,20 @@ func TestComputerRedactsWhatItReadsBack(t *testing.T) {
 				t.Fatalf("action error exposed UI identity material %q: %s", private, res.Content)
 			}
 		}
+	}
+}
+
+func TestComputerWithholdsTruncatedScriptOutput(t *testing.T) {
+	token := "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	fragmented := token[:19] + "\n[omitted]\n" + token[20:]
+	_, err := interpretOSAScriptResult(execution.Result{
+		Output: fragmented, ExitCode: 1, Truncated: true,
+	}, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "output exceeded") {
+		t.Fatalf("truncated script result = %v", err)
+	}
+	if strings.Contains(err.Error(), "ghp_") || strings.Contains(err.Error(), token) {
+		t.Fatalf("truncated script fragments reached the error: %v", err)
 	}
 }
 

@@ -10,6 +10,15 @@ import (
 	"github.com/switchboard-code/switchboard/internal/provider/openaicompat"
 )
 
+func testClient(t *testing.T) *openaicompat.Client {
+	t.Helper()
+	client, err := New(FirstParty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
 // OpenAI is its own provider, not a profile of the compatible adapter. Sharing
 // the decoder is an implementation detail; sharing the identity would file
 // OpenAI's price sheet and OpenAI's credential under a name that means "some
@@ -26,7 +35,7 @@ func TestIdentityIsNotTheCompatibleAdapter(t *testing.T) {
 
 	// The credential is looked up by provider and surface, so the identity
 	// above is what decides which key pays for the request.
-	if got := New(FirstParty).Name(); got != Name {
+	if got := testClient(t).Name(); got != Name {
 		t.Errorf("client reports provider %q, so its errors and its credential would be attributed to the wrong vendor", got)
 	}
 }
@@ -39,7 +48,7 @@ func TestUntestedCapabilitiesAreRefusedNotDropped(t *testing.T) {
 	target := Target("gpt-5-mini")
 	target.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "high"}
 
-	_, err := New(FirstParty).Stream(context.Background(), target, provider.Request{
+	_, err := testClient(t).Stream(context.Background(), target, provider.Request{
 		Messages: []provider.Message{provider.UserText("hello")},
 	})
 
@@ -52,7 +61,7 @@ func TestUntestedCapabilitiesAreRefusedNotDropped(t *testing.T) {
 // A cache plan cannot be rendered into this format at all, so a non-nil plan is
 // an error rather than a request sent without the markers the caller asked for.
 func TestCachePlanIsRefused(t *testing.T) {
-	_, err := New(FirstParty).Stream(context.Background(), Target("gpt-5-mini"), provider.Request{
+	_, err := testClient(t).Stream(context.Background(), Target("gpt-5-mini"), provider.Request{
 		Messages:  []provider.Message{provider.UserText("hello")},
 		CachePlan: &provider.CachePlan{Breakpoints: []provider.Breakpoint{{}}},
 	})
@@ -60,6 +69,18 @@ func TestCachePlanIsRefused(t *testing.T) {
 	var capErr *provider.CapabilityError
 	if !errors.As(err, &capErr) {
 		t.Fatalf("err = %v, want a CapabilityError", err)
+	}
+}
+
+func TestUnknownSurfaceIsRefused(t *testing.T) {
+	if client, err := New("firstparty"); err == nil || client != nil {
+		t.Fatalf("unknown surface constructed client=%v err=%v", client, err)
+	}
+	if got := DefaultBaseURL("firstparty"); got != "" {
+		t.Fatalf("unknown surface inherited base URL %q", got)
+	}
+	if client, err := New(Subscription); err == nil || client != nil {
+		t.Fatalf("subscription constructed the chat-completions client=%v err=%v", client, err)
 	}
 }
 

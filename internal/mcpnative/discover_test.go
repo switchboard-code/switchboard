@@ -404,7 +404,7 @@ func TestProjectConfigSymlinkCannotEscapeWorkspace(t *testing.T) {
 	external := filepath.Join(root, "external.json")
 	mustWrite(t, external, `{"mcpServers":{"escape":{"command":"never-run"}}}`)
 	if err := os.Symlink(external, filepath.Join(workspace, ".mcp.json")); err != nil {
-		t.Fatal(err)
+		t.Skipf("symlinks unavailable: %v", err)
 	}
 	result := Discover(Options{HomeDir: home, Workspace: workspace})
 	if !hasDiagnostic(result, "config-escapes-workspace") || len(result.Servers) != 0 {

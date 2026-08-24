@@ -74,6 +74,9 @@ func (r RoutedArmFor) pickRequest(
 	if len(r.Ladder) == 0 {
 		return Arm{}, router.Decision{}, 0, fidelityErrorf("the routed arm has no ladder")
 	}
+	if err := validateRungOutputCaps(r.Ladder); err != nil {
+		return Arm{}, router.Decision{}, 0, err
+	}
 
 	promptTokens := prefix.RequestTokens(request)
 	contextTokens := prefix.RequestTokenCeiling(request)
@@ -143,6 +146,20 @@ func (r RoutedArmFor) pickRequest(
 	return arm, decision, ranks[decision.Tier], nil
 }
 
+func validateRungOutputCaps(ladder []Arm) error {
+	for _, tier := range ladder {
+		for index, fallback := range tier.Fallbacks {
+			if fallback.Target.Params.MaxOutputTokens != tier.Target.Params.MaxOutputTokens {
+				return fidelityErrorf(
+					"tier %s fallback %d has max_output %d, different from the rung's %d",
+					tier.Name, index+1, fallback.Target.Params.MaxOutputTokens,
+					tier.Target.Params.MaxOutputTokens)
+			}
+		}
+	}
+	return nil
+}
+
 // Run attempts a task with the router choosing the target and the escalation
 // policy allowed to change it mid-task.
 //
@@ -181,67 +198,111 @@ func (r RoutedArmFor) resolveTier(
 	requirements router.Requirements,
 	budgets router.Budgets,
 ) (Arm, router.Candidate, error) {
-	targets := []Fallback{{Target: tier.Target, Provider: tier.Provider, CacheAware: tier.CacheAware}}
-	targets = append(targets, tier.Fallbacks...)
-	var attempts []string
-	for _, target := range targets {
-		candidateArm := Arm{
-			Name: tier.Name, Target: target.Target, Provider: target.Provider, CacheAware: target.CacheAware,
+	for index, fallback := range tier.Fallbacks {
+		if fallback.Target.Params.MaxOutputTokens != tier.Target.Params.MaxOutputTokens {
+			return Arm{}, router.Candidate{}, fmt.Errorf(
+				"tier %s fallback %d has max_output %d, different from the rung's %d",
+				tier.Name, index+1, fallback.Target.Params.MaxOutputTokens,
+				tier.Target.Params.MaxOutputTokens)
 		}
-		info, err := r.probe(ctx, candidateArm)
-		if err != nil {
-			attempts = append(attempts, fmt.Sprintf("%s: %v", target.Target.Display(), err))
-			continue
-		}
-		candidate := candidateForRequest(candidateArm, rank, info, promptTokens, contextTokens)
-		_, _, candidate.CatalogKnown = r.Catalog.Lookup(candidateArm.Target)
+	}
+
+	primary := Arm{
+		Name: tier.Name, Target: tier.Target, Provider: tier.Provider, CacheAware: tier.CacheAware,
+		ContextWindow: tier.ContextWindow,
+	}
+	resolved, info, primaryProbeErr := resolveArmEvidence(ctx, r.Catalog, primary)
+	if primaryProbeErr == nil {
+		candidate := candidateForRequest(resolved, rank, info, promptTokens, contextTokens)
+		_, _, candidate.CatalogKnown = r.Catalog.Lookup(resolved.Target)
 		if _, err := (router.Heuristic{}).Route(router.Input{
 			Candidates: []router.Candidate{candidate}, Requirements: requirements, Budgets: budgets, Pin: tier.Name,
 		}); err != nil {
-			attempts = append(attempts, fmt.Sprintf("%s: %v", target.Target.Display(), err))
-			continue
+			// A reachable primary owns this rung. Availability fallbacks cannot
+			// weaken its context, vision, destination, or budget refusal.
+			return Arm{}, router.Candidate{}, fmt.Errorf(
+				"primary %s cannot serve this request: %w", tier.Target.Display(), err)
 		}
-		return candidateArm, candidate, nil
+		return resolved, candidate, nil
+	}
+
+	attempts := []string{fmt.Sprintf("%s: %v", tier.Target.Display(), primaryProbeErr)}
+	for _, fallback := range tier.Fallbacks {
+		candidateArm := Arm{
+			Name: tier.Name, Target: fallback.Target, Provider: fallback.Provider,
+			CacheAware: fallback.CacheAware, ContextWindow: fallback.ContextWindow,
+		}
+		candidateArm, info, err := resolveArmEvidence(ctx, r.Catalog, candidateArm)
+		if err == nil {
+			candidate := candidateForRequest(candidateArm, rank, info, promptTokens, contextTokens)
+			_, _, candidate.CatalogKnown = r.Catalog.Lookup(candidateArm.Target)
+			if _, routeErr := (router.Heuristic{}).Route(router.Input{
+				Candidates: []router.Candidate{candidate}, Requirements: requirements, Budgets: budgets, Pin: tier.Name,
+			}); routeErr == nil {
+				return candidateArm, candidate, nil
+			} else {
+				err = routeErr
+			}
+		}
+		attempts = append(attempts, fmt.Sprintf("%s: %v", fallback.Target.Display(), err))
 	}
 	return Arm{}, router.Candidate{}, fmt.Errorf(
 		"tier and fallbacks cannot serve this request:\n  %s", strings.Join(attempts, "\n  "))
 }
 
-func (r RoutedArmFor) probe(ctx context.Context, arm Arm) (catalog.ModelInfo, error) {
+func resolveArmEvidence(ctx context.Context, cat *catalog.Catalog, arm Arm) (Arm, catalog.ModelInfo, error) {
 	if arm.Provider == nil {
-		return catalog.ModelInfo{}, fmt.Errorf("target %s has no provider binding", arm.Target.Display())
+		return Arm{}, catalog.ModelInfo{}, fmt.Errorf("target %s has no provider binding", arm.Target.Display())
 	}
 	probe, err := arm.Provider.Probe(ctx, arm.Target)
 	if err != nil {
-		return catalog.ModelInfo{}, fmt.Errorf("live probe failed: %w", err)
+		return Arm{}, catalog.ModelInfo{}, fmt.Errorf("live probe failed: %w", err)
 	}
 	switch {
 	case !probe.Reachable:
-		return catalog.ModelInfo{}, fmt.Errorf("target is unreachable: %s", probe.Detail)
+		return Arm{}, catalog.ModelInfo{}, fmt.Errorf("target is unreachable: %s", probe.Detail)
 	case !probe.ModelPresent:
-		return catalog.ModelInfo{}, fmt.Errorf("model is unavailable: %s", probe.Detail)
+		return Arm{}, catalog.ModelInfo{}, fmt.Errorf("model is unavailable: %s", probe.Detail)
 	case probe.Tools == provider.ToolsNone:
-		return catalog.ModelInfo{}, fmt.Errorf("target cannot call tools")
+		return Arm{}, catalog.ModelInfo{}, fmt.Errorf("target cannot call tools")
 	}
 
-	info, _, ok := r.Catalog.Lookup(arm.Target)
-	if !ok {
-		info = catalog.ModelInfo{}
+	var info catalog.ModelInfo
+	if cat != nil {
+		info, _, _ = cat.Lookup(arm.Target)
 	}
-	if probe.Vision {
-		info.Vision = true
+	if probe.VisionKnown {
+		info.Vision = probe.Vision
 	}
 	switch probe.Tools {
+	case provider.ToolsNone:
+		info.Tools = catalog.ToolsNone
 	case provider.ToolsSerial, provider.ToolsUnreliable:
 		info.Tools = catalog.ToolsSerial
 	case provider.ToolsParallel:
 		info.Tools = catalog.ToolsParallel
 	}
-	return info, nil
+	info.ContextWindow = resolvedContextWindow(
+		arm.ContextWindow, probe.ContextWindow, probe.WindowEnforced, info.ContextWindow)
+	arm.resolvedContextWindow = info.ContextWindow
+	return arm, info, nil
+}
+
+func resolvedContextWindow(declared, probed int, enforced bool, catalogWindow int) int {
+	switch {
+	case probed > 0 && enforced:
+		return probed
+	case declared > 0:
+		return declared
+	case probed > 0:
+		return probed
+	default:
+		return catalogWindow
+	}
 }
 
 func candidateForRequest(arm Arm, rank int, info catalog.ModelInfo, promptTokens, contextTokens int) router.Candidate {
-	outputReserve := provider.EffectiveOutputTokenReserve(arm.Target, info.MaxOutput)
+	outputReserve := provider.EffectiveOutputTokenAllowance(arm.Provider, arm.Target, info.MaxOutput)
 	candidate := router.Candidate{
 		Tier: arm.Name, Target: arm.Target, Info: info, Rank: rank,
 		PromptTokens: promptTokens, ContextTokens: contextTokens,
@@ -254,7 +315,7 @@ func candidateForRequest(arm Arm, rank int, info catalog.ModelInfo, promptTokens
 	})
 	candidate.CeilingCost = costmodel.Estimator{}.Turn(costmodel.Inputs{
 		Target: arm.Target, Info: info, PrefixTokens: contextTokens,
-		OutputTokens:   max(info.MaxOutput, outputReserve),
+		OutputTokens:   outputReserve,
 		Eligible:       info.Cache.UsageAccounting == catalog.AccountingSeparate,
 		TokensAreExact: true,
 	}).High

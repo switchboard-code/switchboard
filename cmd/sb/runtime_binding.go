@@ -62,6 +62,21 @@ func persistRuntimeBinding(sess *session.Session, tier config.Tier, pinned bool)
 	return sess.AppendRuntimeBinding(tier.ID, tier.Target.ID(), pinned)
 }
 
+// persistRuntimeBindingFallback commits an availability substitution as one
+// event: the exact served target and the sentence explaining why it differs
+// from the configured primary. A caller may render note only after this
+// succeeds; otherwise content could leave on a fallback whose audit evidence
+// was lost in a second, best-effort append.
+func persistRuntimeBindingFallback(sess *session.Session, tier config.Tier, pinned bool, note string) error {
+	if note == "" {
+		return persistRuntimeBinding(sess, tier, pinned)
+	}
+	if sess == nil {
+		return fmt.Errorf("cannot persist a runtime binding without a session")
+	}
+	return sess.AppendRuntimeBindingNote(tier.ID, tier.Target.ID(), pinned, "warn", note)
+}
+
 // persistAutomaticPosture clears only the durable pin bit. This intentionally
 // retains the last durable target rather than the live target because /think
 // is a process-only parameter override and must not leak into the WAL when the

@@ -63,6 +63,38 @@ func terminal(t *testing.T, events []provider.Event) provider.Event {
 	return provider.Event{}
 }
 
+func TestResponsesBuildRequestEmitsOnlyAnExplicitMaxOutputTokens(t *testing.T) {
+	decode := func(target provider.RouteTarget) (int, bool) {
+		t.Helper()
+		raw, err := NewResponses().buildRequest(target, provider.Request{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wire map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &wire); err != nil {
+			t.Fatal(err)
+		}
+		encoded, ok := wire["max_output_tokens"]
+		if !ok {
+			return 0, false
+		}
+		var value int
+		if err := json.Unmarshal(encoded, &value); err != nil {
+			t.Fatal(err)
+		}
+		return value, true
+	}
+
+	target := SubscriptionTarget("custom")
+	if got, present := decode(target); present {
+		t.Fatalf("omitted max output emitted max_output_tokens=%d", got)
+	}
+	target.Params.MaxOutputTokens = 4_096
+	if got, present := decode(target); !present || got != 4_096 {
+		t.Fatalf("explicit max output emitted max_output_tokens=%d present=%v, want 4096", got, present)
+	}
+}
+
 // A tool call is an item in the output here rather than a field on a message,
 // and its arguments arrive as deltas keyed by item id. The fixture is a verbatim
 // capture of the endpoint doing exactly that.
@@ -215,6 +247,47 @@ func TestResponsesRequestShape(t *testing.T) {
 
 // A tool result is its own item with no role, and it refers to the call by
 // call_id. An assistant turn that made a call becomes two items.
+func TestResponsesReplayExcludesIncompleteAssistant(t *testing.T) {
+	const partial = "PARTIAL MUST NOT REPLAY"
+	base := provider.Request{Messages: []provider.Message{
+		provider.UserText("before"),
+		provider.UserText("after"),
+	}}
+	withPartial := base
+	withPartial.Messages = []provider.Message{
+		base.Messages[0],
+		{
+			Role:       provider.RoleAssistant,
+			Incomplete: true,
+			Content:    []provider.Block{provider.Text{Text: partial}},
+		},
+		base.Messages[1],
+	}
+
+	client := NewResponses()
+	body, err := client.buildRequest(SubscriptionTarget("gpt-5.4-mini"), withPartial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), partial) {
+		t.Fatalf("incomplete assistant reached Responses wire:\n%s", body)
+	}
+	if !strings.Contains(string(body), "before") || !strings.Contains(string(body), "after") {
+		t.Fatalf("projection removed surrounding durable messages:\n%s", body)
+	}
+	got, err := client.CountTokens(context.Background(), SubscriptionTarget("gpt-5.4-mini"), withPartial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := client.CountTokens(context.Background(), SubscriptionTarget("gpt-5.4-mini"), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("estimate with partial = %+v, want %+v", got, want)
+	}
+}
+
 func TestResponsesToolResultBecomesItsOwnItem(t *testing.T) {
 	body, err := NewResponses().buildRequest(SubscriptionTarget("gpt-5.4-mini"), provider.Request{
 		Messages: []provider.Message{
@@ -403,6 +476,9 @@ func TestResponsesProbeLeavesUnstatedEffortsUnknown(t *testing.T) {
 	if res.EffortLevels != nil {
 		t.Errorf("EffortLevels = %v, want nil from an entry that stated none", res.EffortLevels)
 	}
+	if res.VisionKnown {
+		t.Error("an entry with no input_modalities invented text-only evidence")
+	}
 }
 
 // The discovery answer also states each model's context window, and the
@@ -438,6 +514,26 @@ func TestResponsesProbeReportsTheModelsContextWindow(t *testing.T) {
 	}
 }
 
+func TestResponsesProbeReportsKnownNoVisionForTextOnlyModel(t *testing.T) {
+	c := serveResponsesFixture(t, "codex_models.json")
+
+	textOnly, err := c.Probe(context.Background(), SubscriptionTarget("gpt-5.3-codex-spark"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !textOnly.VisionKnown || textOnly.Vision {
+		t.Fatalf("text-only model vision evidence = known:%v vision:%v", textOnly.VisionKnown, textOnly.Vision)
+	}
+
+	vision, err := c.Probe(context.Background(), SubscriptionTarget("gpt-5.6-sol"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !vision.VisionKnown || !vision.Vision {
+		t.Fatalf("image-capable model vision evidence = known:%v vision:%v", vision.VisionKnown, vision.Vision)
+	}
+}
+
 // The picker's model set and its effort lists come from the one answer, so
 // every offered slug has an entry — empty where the model states none.
 func TestResponsesModelEffortsCoversEveryOfferedSlug(t *testing.T) {
@@ -462,6 +558,39 @@ func TestResponsesModelEffortsCoversEveryOfferedSlug(t *testing.T) {
 	if want := []string{"low", "medium", "high", "xhigh", "max", "ultra"}; !slices.Equal(efforts["gpt-daybreak-blue-latest"], want) {
 		t.Errorf("daybreak efforts = %v, want %v", efforts["gpt-daybreak-blue-latest"], want)
 	}
+}
+
+func TestResponsesModelsBoundsBodyAndRejectsUnsafeIDs(t *testing.T) {
+	t.Run("oversize body", func(t *testing.T) {
+		c := serveResponses(t, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, strings.Repeat(" ", provider.MaxProviderJSONBodyBytes+1))
+		})
+		if _, err := c.Models(context.Background()); err == nil || !strings.Contains(err.Error(), "response limit") {
+			t.Fatalf("err = %v, want response-limit refusal", err)
+		}
+	})
+
+	t.Run("credential shaped id", func(t *testing.T) {
+		token := "ghp_" + strings.Repeat("A", 40)
+		c := serveResponses(t, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{"models":[{"slug":"model-`+token+`"}]}`)
+		})
+		_, err := c.Models(context.Background())
+		if err == nil || strings.Contains(err.Error(), token) {
+			t.Fatalf("unsafe model ID was accepted or echoed: %v", err)
+		}
+	})
+
+	t.Run("unsafe effort", func(t *testing.T) {
+		token := "ghp_" + strings.Repeat("A", 40)
+		c := serveResponses(t, func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{"models":[{"slug":"safe","supported_reasoning_levels":[{"effort":"`+token+`"}]}]}`)
+		})
+		_, err := c.ModelEfforts(context.Background())
+		if err == nil || strings.Contains(err.Error(), token) {
+			t.Fatalf("unsafe effort was accepted or echoed: %v", err)
+		}
+	})
 }
 
 // The request carries client_version on every call, including discovery.
@@ -515,6 +644,31 @@ func TestResponsesDetailErrorIsUnwrapped(t *testing.T) {
 	}
 	if apiErr.Body != "Store must be set to false" {
 		t.Errorf("body = %q", apiErr.Body)
+	}
+}
+
+func TestResponsesErrorCredentialBodyIsRedactedBeforeItsCap(t *testing.T) {
+	token := "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for name, body := range map[string]string{
+		"complete":           `{"detail":"rejected ` + token + `"}`,
+		"display-cap":        strings.Repeat("x", 400-len(token)+1) + token,
+		"structured-display": `{"detail":"` + strings.Repeat("x", 400-len(token)+1) + token + `"}`,
+		"body-cap":           strings.Repeat("x", provider.MaxAPIErrorBodyBytes-len(token)+1) + token,
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := serveResponses(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, body)
+			})
+			_, err := c.Stream(context.Background(), SubscriptionTarget("gpt-5.4-mini"), provider.Request{})
+			var apiErr *provider.APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("err = %v, want APIError", err)
+			}
+			if strings.Contains(apiErr.Body, token) || strings.Contains(apiErr.Body, "ghp_") {
+				t.Fatalf("API error body exposed a credential fragment: %q", apiErr.Body)
+			}
+		})
 	}
 }
 

@@ -152,13 +152,26 @@ func handleCLIHelp(w io.Writer, args []string) (bool, error) {
 func helpCommandIndex(args []string) (index int, rootHelp bool) {
 	valueFlags := stringSet(completionValueFlags)
 	expectValue := false
+	expectWorkflowValue := false
+	workflowSelected := false
 	for i, arg := range args {
 		if expectValue {
 			expectValue = false
+			if expectWorkflowValue {
+				workflowSelected = true
+				expectWorkflowValue = false
+			}
 			continue
 		}
 		if isHelpFlag(arg) {
 			return 0, true
+		}
+		// Once -workflow has its required value, the first positional word is
+		// a workflow argument even when it happens to spell "help" or another
+		// real subcommand. Flags may still follow before that word, matching the
+		// standard parser, and a help flag in that position remains help.
+		if workflowSelected && (arg == "--" || !strings.HasPrefix(arg, "-")) {
+			return 0, false
 		}
 		if _, known := commandHelp[arg]; known {
 			return i, false
@@ -169,7 +182,11 @@ func helpCommandIndex(args []string) (index int, rootHelp bool) {
 		}
 		if valueFlags[flagName] && !hasValue {
 			expectValue = true
+			expectWorkflowValue = flagName == "-workflow"
 			continue
+		}
+		if flagName == "-workflow" && hasValue {
+			workflowSelected = true
 		}
 		if containsWord(completionFlags, flagName) || flagName == "-sandbox" {
 			continue
@@ -268,6 +285,8 @@ func writeRootHelp(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "usage:")
 	fmt.Fprintln(w, "  sb [flags]                    start an interactive session")
+	fmt.Fprintln(w, "  sb -p \"prompt\"               run exactly one prompt")
+	fmt.Fprintln(w, "  sb -workflow name [arguments] run an unattended workflow")
 	fmt.Fprintln(w, "  sb <subcommand> [arguments]   run one bounded command")
 	fmt.Fprintln(w, "  sb help [subcommand [action]] show scoped help")
 	fmt.Fprintln(w)

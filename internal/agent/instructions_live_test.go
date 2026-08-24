@@ -17,8 +17,8 @@ func TestComposesThisRepositoryWithoutMangling(t *testing.T) {
 	if !utf8.ValidString(text) {
 		t.Error("the composed instructions are not valid UTF-8")
 	}
-	if len(text) > maxInstructionBytes+2048 {
-		t.Errorf("composed to %d bytes, past the %d budget plus its notices", len(text), maxInstructionBytes)
+	if len(text) > maxInstructionBytes {
+		t.Errorf("composed to %d bytes, past the %d budget", len(text), maxInstructionBytes)
 	}
 	if !strings.Contains(text, "AGENTS.md") {
 		t.Errorf("the repository's own instructions were not found:\n%s", text)

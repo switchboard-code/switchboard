@@ -10,7 +10,7 @@ import (
 )
 
 func TestDoctorSaysEverythingAnswersWhenItDoes(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	isolateTestHome(t, t.TempDir())
 	ts := fakeOllama(t, "small", "big")
 	cfg := &config.Config{
 		Path:  "test.toml",
@@ -44,7 +44,7 @@ func TestDoctorSaysEverythingAnswersWhenItDoes(t *testing.T) {
 }
 
 func TestDoctorMarksARungNothingCanServe(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	isolateTestHome(t, t.TempDir())
 	ts := fakeOllama(t, "present")
 	cfg := &config.Config{
 		Path:  "test.toml",
@@ -72,7 +72,7 @@ func TestDoctorMarksARungNothingCanServe(t *testing.T) {
 }
 
 func TestDoctorReportsAFallbackServingItsRung(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	isolateTestHome(t, t.TempDir())
 	ts := fakeOllama(t, "backup")
 	cfg := &config.Config{
 		Path:  "test.toml",
@@ -97,7 +97,7 @@ func TestDoctorReportsAFallbackServingItsRung(t *testing.T) {
 }
 
 func TestDoctorPointsAnEmptyLadderAtSetup(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	isolateTestHome(t, t.TempDir())
 	cfg := &config.Config{Path: "test.toml"}
 	cat, err := catalog.LoadBundled()
 	if err != nil {
@@ -110,5 +110,25 @@ func TestDoctorPointsAnEmptyLadderAtSetup(t *testing.T) {
 	}
 	if !strings.Contains(b.String(), "no tiers bound") {
 		t.Errorf("an empty ladder must name its next action:\n%s", b.String())
+	}
+}
+
+func TestDoctorSectionRedactsAndEscapesDynamicRows(t *testing.T) {
+	token := "ghp_" + strings.Repeat("d", 36)
+	unsafe := "row\n\x1b]2;spoof\a\u202eright " + token
+	rows := []doctorRow{{label: unsafe, detail: unsafe, bad: true}}
+	var out strings.Builder
+	printDoctorSection(&out, unsafe, rows)
+	got := out.String()
+	if strings.Contains(got, token) || !strings.Contains(got, "[redacted: a GitHub token]") {
+		t.Fatalf("doctor exposed a credential: %q", got)
+	}
+	for _, control := range []string{"\x1b", "\a", "\u202e"} {
+		if strings.Contains(got, control) {
+			t.Fatalf("doctor retained terminal control %q: %q", control, got)
+		}
+	}
+	if strings.Count(got, "\n") != 3 {
+		t.Fatalf("untrusted newline changed doctor row structure: %q", got)
 	}
 }

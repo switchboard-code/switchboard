@@ -11,6 +11,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/switchboard-code/switchboard/internal/checkpoint"
 )
@@ -196,6 +197,7 @@ func TestReviewAndDiffFullscreenResultsFollowInvocationOrder(t *testing.T) {
 	newModel := func(t *testing.T) *tuiModel {
 		m := testModel(t)
 		m.app.workspace = root
+		m.app.trust = grantTUIDiffTrust(t, root)
 		m.app.undo = recorder
 		return m
 	}
@@ -428,6 +430,29 @@ func TestTurnReviewViewEscapesTabHeavyLinesWithin80Columns(t *testing.T) {
 	for i, row := range rows {
 		if strings.ContainsRune(row, '\t') || lipgloss.Width(row) > 80 {
 			t.Fatalf("tab-heavy row %d escaped bounds: %q", i, stripANSI(row))
+		}
+	}
+}
+
+func TestTurnReviewRowsResumeStylesAndBoundWideGraphemes(t *testing.T) {
+	v := &turnReviewView{lines: []string{"\x1b[31mabcdef\x1b[0m"}}
+	rows := v.visualLines(3)
+	if len(rows) != 2 {
+		t.Fatalf("styled review rows = %q, want two", rows)
+	}
+	for i, row := range rows {
+		if !strings.HasSuffix(row, ansi.ResetStyle) {
+			t.Errorf("row %d does not close its style: %q", i, row)
+		}
+	}
+	if !strings.Contains(rows[1], "\x1b[31m") {
+		t.Fatalf("continuation row lost active style: %q", rows[1])
+	}
+
+	v = &turnReviewView{lines: []string{"界"}}
+	for _, row := range v.visualLines(1) {
+		if width := ansi.StringWidth(row); width > 1 {
+			t.Fatalf("irreducible grapheme occupies %d cells at width one: %q", width, row)
 		}
 	}
 }

@@ -18,6 +18,7 @@ import (
 
 	"github.com/switchboard-code/switchboard/internal/provider"
 	"github.com/switchboard-code/switchboard/internal/session"
+	"github.com/switchboard-code/switchboard/internal/terminaltext"
 )
 
 // exportMarkdown renders one session's record. The timeline interleaves
@@ -89,7 +90,11 @@ func exportMarkdown(state session.State, timeline []session.Timeline) string {
 			fmt.Fprintf(&b, "> %s: %s\n\n", ev.Note.Level, ev.Note.Text)
 		}
 	}
-	return b.String()
+	// An export is explicitly for sharing and may also be printed directly to
+	// a terminal. Scan the complete artifact so credentials cannot straddle a
+	// formatting boundary, then make control and bidi characters visible while
+	// preserving the Markdown's intentional line structure.
+	return terminaltext.Display(redactCredentialText(b.String()))
 }
 
 // runExportCLI prints a recorded session as markdown: the named one, or

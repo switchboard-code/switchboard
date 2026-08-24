@@ -539,9 +539,16 @@ func (t *computerTool) osascript(ctx context.Context, script string, args []stri
 	if err != nil {
 		return "", err
 	}
+	return interpretOSAScriptResult(res, limit)
+}
+
+func interpretOSAScriptResult(res execution.Result, limit time.Duration) (string, error) {
 	if res.TimedOut {
 		return "", fmt.Errorf("osascript did not answer within %s; the app may be busy, or — on the first "+
 			"computer call from this terminal — a system consent dialog may be waiting on the user's screen", limit)
+	}
+	if res.Truncated {
+		return "", fmt.Errorf("osascript output exceeded the bounded capture and was withheld")
 	}
 	if res.ExitCode != 0 {
 		return "", fmt.Errorf("osascript failed: %s", strings.TrimSpace(res.Output))
@@ -564,6 +571,9 @@ func (t *computerTool) runOpen(ctx context.Context, app string) error {
 	})
 	if err != nil {
 		return err
+	}
+	if res.Truncated {
+		return fmt.Errorf("open output exceeded the bounded capture and was withheld")
 	}
 	if res.ExitCode != 0 {
 		return fmt.Errorf("%s", strings.TrimSpace(res.Output))

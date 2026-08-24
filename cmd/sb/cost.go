@@ -24,7 +24,7 @@ func runCostCLI(w io.Writer, store *session.Store, cat *catalog.Catalog, workspa
 		return err
 	}
 	if len(infos) == 0 {
-		fmt.Fprintf(w, "no sessions recorded for %s\n", workspace)
+		fmt.Fprintf(w, "no sessions recorded for %s\n", cliText(workspace))
 		return nil
 	}
 
@@ -34,7 +34,7 @@ func runCostCLI(w io.Writer, store *session.Store, cat *catalog.Catalog, workspa
 	for _, info := range infos {
 		state, err := session.ReadState(info.Path)
 		if err != nil {
-			fmt.Fprintf(w, "%-22s unreadable: %v\n", info.ID, err)
+			fmt.Fprintf(w, "%-22s unreadable: %s\n", cliText(info.ID), cliText(err.Error()))
 			continue
 		}
 		fmt.Fprintf(w, "%-22s %-19s %6d %10d %10d  %s\n",
@@ -311,9 +311,9 @@ func costTurnsLines(turns []session.TurnCost) []string {
 			break
 		}
 		in := t.Usage.TotalInputTokens()
-		lines = append(lines, fmt.Sprintf("  #%-3d %-10s ↓%s ↑%s  %d calls  %q",
+		lines = append(lines, fmt.Sprintf("  #%-3d %-10s ↓%s ↑%s  %d calls  %s",
 			t.Turn, catalog.Money(t.CostMicroUSD).String(), compact(in), compact(t.Usage.OutputTokens),
-			t.Calls, truncate(t.Prompt, 48)))
+			t.Calls, recordedTurnPrompt(t.Prompt, t.PromptAuthoredKnown, t.PromptSynthetic, 48)))
 	}
 	if len(billed) == 0 {
 		lines = append(lines, "  no turn billed dollars")

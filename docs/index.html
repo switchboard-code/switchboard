@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Switchboard — Terminal Coding Agent with a Model Ladder</title>
-<meta name="description" content="Free, open-source terminal coding agent that routes every turn to the cheapest model that can do the work — local, API, or subscription — and shows its reasoning. macOS & Linux, MIT.">
+<meta name="description" content="Free, open-source terminal coding agent that routes each turn across a user-ordered ladder of feasible local, API, or subscription models — and explains the routing decision. macOS, Linux & Windows, MIT.">
 <link rel="canonical" href="https://switchboard-code.dev/">
 <meta name="robots" content="index, follow">
 <meta name="theme-color" content="#e9e9e5">
@@ -15,27 +15,27 @@
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Switchboard">
 <meta property="og:title" content="Switchboard — the model is a slot, not a decision you make once">
-<meta property="og:description" content="A terminal coding agent that routes every turn to the cheapest model that can do the work, climbs only on evidence, and keeps the receipts. Free and open source.">
+<meta property="og:description" content="A terminal coding agent that routes each turn through a user-ordered model ladder, climbs on evidence, and keeps the receipts. Free and open source.">
 <meta property="og:url" content="https://switchboard-code.dev/">
 <meta property="og:image" content="https://switchboard-code.dev/assets/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="Switchboard: a routing schematic patching one turn to the cheapest suitable model rung">
+<meta property="og:image:alt" content="Switchboard: a routing schematic patching one turn to a feasible model rung">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Switchboard — the model is a slot, not a decision you make once">
-<meta name="twitter:description" content="A terminal coding agent that routes every turn to the cheapest model that can do the work, climbs only on evidence, and keeps the receipts. Free and open source.">
+<meta name="twitter:description" content="A terminal coding agent that routes each turn through a user-ordered model ladder, climbs on evidence, and keeps the receipts. Free and open source.">
 <meta name="twitter:image" content="https://switchboard-code.dev/assets/og.png">
-<meta name="twitter:image:alt" content="Switchboard: a routing schematic patching one turn to the cheapest suitable model rung">
+<meta name="twitter:image:alt" content="Switchboard: a routing schematic patching one turn to a feasible model rung">
 
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
   "name": "Switchboard",
-  "softwareVersion": "1.20.1",
+  "softwareVersion": "1.21.0",
   "applicationCategory": "DeveloperApplication",
-  "operatingSystem": "macOS, Linux",
-  "description": "A terminal coding agent that routes each turn across a user-defined ladder of models — local, API, or subscription — choosing the cheapest rung that can do the work, and records every decision, dollar, and diff for review.",
+  "operatingSystem": "macOS, Linux, Windows",
+  "description": "A terminal coding agent that routes each turn across a user-defined ladder of local, API, or subscription models, checks feasibility and budget, and records routing, usage, and first-party edit evidence for review.",
   "url": "https://switchboard-code.dev/",
   "codeRepository": "https://github.com/switchboard-code/switchboard",
   "license": "https://opensource.org/license/mit",
@@ -563,8 +563,8 @@
     <div class="hero-meta mono" aria-label="Product facts">
       <span>Terminal coding agent</span>
       <span>Free &amp; open source · MIT</span>
-      <span>macOS · Linux</span>
-      <span><a href="https://github.com/switchboard-code/switchboard/releases/latest">v1.20.1</a> · <a href="https://github.com/switchboard-code/switchboard">github.com/switchboard-code/switchboard</a></span>
+      <span>macOS · Linux · Windows</span>
+      <span><a href="https://github.com/switchboard-code/switchboard/releases/latest">v1.21.0</a> · <a href="https://github.com/switchboard-code/switchboard">github.com/switchboard-code/switchboard</a></span>
     </div>
 
     <h1><span class="k">Switchboard — a coding agent for your terminal</span>
@@ -573,10 +573,10 @@
 
     <div class="hero-grid">
       <div>
-        <p class="pitch">Line up the models you already have — a small local one, a bigger one, a paid API, the subscription you pay for anyway. Switchboard routes every turn to the cheapest one that can actually do the work, and climbs only when the work proves harder.</p>
-        <p class="hero-sub">Other agents ask you to pick one model up front, then spend it on everything — reading a file and redesigning a module at the same price. Switchboard treats the model as a slot your ladder fills, checks the real request before each turn, and shows the reason for every move. <code>/why</code> answers the question every other tool leaves you asking.</p>
+        <p class="pitch">Line up the models you already have — a small local one, a bigger one, a paid API, the subscription you pay for anyway. Switchboard checks each real request against your policy-ordered ladder, then climbs when the work supplies evidence for more.</p>
+        <p class="hero-sub">The model is a slot your ladder fills, not a choice frozen for the whole session. Switchboard checks capability, context, reachability, and budget before each turn, and shows the reason for every move. <code>/why</code> keeps that policy inspectable.</p>
         <div class="hero-ctas">
-          <a class="cta solid" href="#install">Install — one script</a>
+          <a class="cta solid" href="#install">Install</a>
           <a class="cta" href="https://github.com/switchboard-code/switchboard">Source on GitHub</a>
         </div>
       </div>
@@ -689,18 +689,18 @@
   <section id="how" aria-labelledby="how-h">
     <div class="sheet">
       <div class="sec-label"><span class="n">02</span><span class="mono">How it works</span></div>
-      <h2 id="how-h">Cheapest rung first.<br>Climb on evidence.</h2>
+      <h2 id="how-h">Your ladder first.<br>Climb on evidence.</h2>
 
       <div class="steps">
         <div class="step s1">
           <span class="no">01</span>
           <h3>Line up your models</h3>
-          <p>Cheapest at the bottom: a small local model, a bigger local one, a paid API, the subscription you already have. Four lines of TOML a rung. Your mix, your order, your ceiling.</p>
+          <p>Put lower-cost targets near the bottom: a small local model, a bigger local one, a paid API, the subscription you already have. Four lines of TOML a rung. Your mix, your order, your ceiling.</p>
         </div>
         <div class="step s2">
           <span class="no">02</span>
           <h3>Every turn gets routed</h3>
-          <p>Before each turn, Switchboard measures the request that would actually be sent — its size, the tools it needs, what&#8217;s reachable, what&#8217;s warm in cache, what fits your budget — and picks the lowest rung that qualifies. Not vibes: the request itself.</p>
+          <p>Before each turn, Switchboard measures the request that would actually be sent — its size, required tools, reachability, cache state, and budget — then chooses a feasible rung from deterministic signals and your ladder order.</p>
         </div>
         <div class="step s3">
           <span class="no">03</span>
@@ -716,7 +716,7 @@
     <div class="sheet">
       <div class="sec-label"><span class="n">03</span><span class="mono">The receipts</span></div>
       <h2 id="receipts-h">Every session is a record.<br>Ask it questions.</h2>
-      <p class="lede ink2">Everything the agent does is appended to a session log — every call, every dollar, every diff. That turns the questions you&#8217;d normally ask a chat transcript into questions the record can actually answer.</p>
+      <p class="lede ink2">The append-only session log records model calls, usage, routing, and first-party write/edit evidence. Current Git state stays a separate view, so bytes the record cannot attribute remain explicitly unknown.</p>
 
       <div class="asks">
         <div class="ask">
@@ -764,7 +764,7 @@
           <p class="lede ink2">The terminal UI handles the navigation work that otherwise sends you back to an editor mid-session:</p>
           <ul class="bench-list">
             <li><b>Find and open code</b> with a command palette and revision-checked search — a file that changed under you is refused, not opened stale.</li>
-            <li><b>Review changes</b> with an exact Git diff and a per-turn view of what the agent actually wrote.</li>
+            <li><b>Review changes</b> with a bounded Git diff and a per-turn view of recorded first-party writes and edits.</li>
             <li><b>Navigate semantics</b> — outline, symbols, definitions, references, diagnostics — through your installed language server.</li>
             <li><b>Delegate</b> one level of subagent, up to four in parallel, sharing your permission rules.</li>
             <li><b>Extend it</b> with your Claude and Codex skills, plugins, MCP servers, and hooks — under your trust grants, never by default.</li>
@@ -799,7 +799,7 @@
         <div class="guard">
           <span class="mono">Secrets</span>
           <h3>What leaves is scanned first</h3>
-          <p>Keys live in the OS keychain, prompts are scanned for key-shaped strings before they go out, and external tools are never inside the sandbox&#8217;s trust.</p>
+          <p>Masked keys use the OS credential service on macOS and Linux; Windows currently uses an environment variable or helper. Prompts are scanned for key-shaped strings before they go out.</p>
         </div>
         <div class="guard">
           <span class="mono">Reach</span>
@@ -817,15 +817,15 @@
 <section class="install" id="install" aria-labelledby="install-h">
   <div class="sheet">
     <div class="sec-label"><span class="n">06</span><span class="mono">Get it</span></div>
-    <h2 id="install-h">One script.<br>Then <code>sb</code>.</h2>
+    <h2 id="install-h">One binary.<br>Then <code>sb</code>.</h2>
     <div class="term">
       <div class="strip" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div>
       <div class="term-cmd"><span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/switchboard-code/switchboard/main/install.sh | bash</div>
       <button class="copy" type="button" data-copy aria-label="Copy install command">Copy</button>
       <span class="sr-only" data-copy-status aria-live="polite"></span>
     </div>
-    <p class="term-note mono">Checksums verified · installs to ~/.local/bin · or build from source with Go 1.26</p>
-    <p class="lede">The first run opens a setup checklist: which providers it can reach, a masked prompt for any keys, and a pick for the model t1 starts on. It can reuse an existing Codex CLI login. From there, every turn you type gets routed.</p>
+    <p class="term-note mono">macOS/Linux installer verifies checksums · Windows release archives include checksums.txt · or build with Go 1.26</p>
+    <p class="lede">The first run opens a setup checklist for reachable providers, credential status, and the model t1 starts on. macOS and Linux can store a masked key; Windows currently uses an environment variable or helper. An existing Codex CLI login can be reused.</p>
     <div class="hero-ctas">
       <a class="cta solid" href="https://github.com/switchboard-code/switchboard">Source on GitHub</a>
       <a class="cta" href="https://github.com/switchboard-code/switchboard#readme">Read the README</a>
@@ -848,7 +848,7 @@
     </nav>
     <span>MIT License</span>
   </div>
-  <p class="fine">Switchboard routes each turn across a ladder of models you configure — local, API, or subscription — choosing the lowest rung that can do the work, and records every decision, dollar, and diff so you can ask the session what happened. Free and open source for macOS and Linux.</p>
+  <p class="fine">Switchboard routes each turn across a policy-ordered ladder of models you configure — local, API, or subscription — checks feasibility and budget, and records routing, usage, and first-party edit evidence. Free and open source for macOS, Linux, and Windows.</p>
 </footer>
 
 <script>

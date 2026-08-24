@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/switchboard-code/switchboard/internal/config"
 	"github.com/switchboard-code/switchboard/internal/credential"
 	"github.com/switchboard-code/switchboard/internal/provider/openai"
+	"golang.org/x/term"
 )
 
 const authUsage = `usage:
@@ -82,24 +82,24 @@ func authStatus(ctx context.Context, cfg *config.Config) error {
 
 	for _, ref := range refs {
 		resolver := credential.Chain(cfg.AuthFor(ref.Provider))
-		fmt.Printf("%s\n", ref)
+		fmt.Printf("%s\n", cliText(ref.String()))
 
 		secret, err := resolver.Get(ctx, ref)
 		if err != nil {
 			var notFound *credential.NotFoundError
 			if errors.As(err, &notFound) {
-				fmt.Printf("  not found; looked in %s\n", strings.Join(notFound.Consulted, ", then "))
+				fmt.Printf("  not found; looked in %s\n", cliText(strings.Join(notFound.Consulted, ", then ")))
 				for _, u := range notFound.Unavailable {
-					fmt.Printf("    %s\n", u)
+					fmt.Printf("    %s\n", cliText(u))
 				}
 			} else {
-				fmt.Printf("  error: %v\n", err)
+				fmt.Printf("  error: %s\n", cliText(err.Error()))
 			}
 			continue
 		}
 		// secret.Source and secret.Detail describe the resolution. The value
 		// itself has no rendering that shows it.
-		fmt.Printf("  found in %s (%s)\n", secret.Source, secret.Detail)
+		fmt.Printf("  found in %s (%s)\n", cliText(string(secret.Source)), cliText(secret.Detail))
 	}
 	return nil
 }
@@ -134,7 +134,7 @@ func authLogin(ctx context.Context, arg string) error {
 			"set an environment variable or configure a credential helper", store.Name())
 	}
 
-	value, err := readSecret(fmt.Sprintf("Credential for %s: ", ref))
+	value, err := readSecret(fmt.Sprintf("Credential for %s: ", cliText(ref.String())))
 	if err != nil {
 		return err
 	}
@@ -145,7 +145,7 @@ func authLogin(ctx context.Context, arg string) error {
 	if err := writer.Set(ctx, ref, value); err != nil {
 		return err
 	}
-	fmt.Printf("stored %s in the %s\n", ref, store.Name())
+	fmt.Printf("stored %s in the %s\n", cliText(ref.String()), cliText(store.Name()))
 	return nil
 }
 
@@ -167,13 +167,13 @@ func authLogout(ctx context.Context, arg string) error {
 		}
 		return err
 	}
-	fmt.Printf("removed %s from the %s\n", ref, store.Name())
+	fmt.Printf("removed %s from the %s\n", cliText(ref.String()), cliText(store.Name()))
 
 	// A variable in the environment outlives the stored copy and would keep
 	// working, which looks like the removal silently failed.
 	if leftover := environmentStillSupplies(ctx, ref); leftover != "" {
 		fmt.Printf("\nnote: %s is still set in this environment and takes precedence,\n"+
-			"so requests will keep authenticating until it is unset\n", leftover)
+			"so requests will keep authenticating until it is unset\n", cliText(leftover))
 	}
 	return nil
 }
@@ -206,39 +206,18 @@ func readSecret(prompt string) (string, error) {
 	}
 
 	fmt.Print(prompt)
-	restore, echoOff := suppressEcho()
-	if !echoOff {
+	line, err := term.ReadPassword(int(os.Stdin.Fd()))
+	if err != nil {
 		fmt.Println("\n(echo could not be turned off, so what you type will be visible)")
 		fmt.Print(prompt)
+		text, readErr := bufio.NewReader(os.Stdin).ReadString('\n')
+		if readErr != nil && readErr != io.EOF {
+			return "", readErr
+		}
+		return strings.TrimRight(text, "\r\n"), nil
 	}
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	restore()
 	fmt.Println()
-	if err != nil && err != io.EOF {
-		return "", err
-	}
-	return strings.TrimRight(line, "\r\n"), nil
-}
-
-// suppressEcho turns off terminal echo through stty.
-//
-// The alternative is a termios ioctl per platform, which means either a
-// dependency or unsafe pointer work that would have to be tested on every
-// target. Shelling out to a POSIX-standard tool is the same trade already made
-// for the credential stores themselves, and it fails visibly: when stty is not
-// available the caller says so rather than reading a credential onto the screen
-// while pretending otherwise.
-func suppressEcho() (restore func(), ok bool) {
-	cmd := exec.Command("stty", "-echo")
-	cmd.Stdin = os.Stdin
-	if err := cmd.Run(); err != nil {
-		return func() {}, false
-	}
-	return func() {
-		on := exec.Command("stty", "echo")
-		on.Stdin = os.Stdin
-		_ = on.Run()
-	}, true
+	return strings.TrimRight(string(line), "\r\n"), nil
 }
 
 func runOAuth(ctx context.Context, args []string, cfg *config.Config) error {
@@ -263,12 +242,12 @@ func runOAuth(ctx context.Context, args []string, cfg *config.Config) error {
 		// still complete the flow by pasting it somewhere that has one, and a
 		// user who would rather read a URL before following it can.
 		prompt := func(url string) {
-			fmt.Printf("Opening your browser to sign in to %s.\nIf it does not open, visit:\n\n  %s\n\nWaiting...\n", ref, url)
+			fmt.Printf("Opening your browser to sign in to %s.\nIf it does not open, visit:\n\n  %s\n\nWaiting...\n", cliText(ref.String()), cliText(url))
 		}
 		if err := store.Login(ctx, ref, prompt); err != nil {
 			return err
 		}
-		fmt.Printf("\nsigned in to %s; the tokens are in the %s\n", ref, credential.NewOSStore().Name())
+		fmt.Printf("\nsigned in to %s; the tokens are in the %s\n", cliText(ref.String()), cliText(credential.NewOSStore().Name()))
 		return nil
 
 	case "logout":
@@ -278,7 +257,7 @@ func runOAuth(ctx context.Context, args []string, cfg *config.Config) error {
 			}
 			return err
 		}
-		fmt.Printf("discarded the stored tokens for %s\n", ref)
+		fmt.Printf("discarded the stored tokens for %s\n", cliText(ref.String()))
 		return nil
 
 	default:

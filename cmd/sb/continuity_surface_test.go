@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -75,6 +77,26 @@ func TestREPLRoutesAndSendsTheSameStampedOpeningOnce(t *testing.T) {
 	}
 }
 
+func TestREPLMentionExpansionKeepsExactAuthoredProjection(t *testing.T) {
+	r, _, _ := newOverrideREPL(t, "small", "large")
+	r.workspace = t.TempDir()
+	if err := os.WriteFile(filepath.Join(r.workspace, "notes.txt"), []byte("MACHINE-EXPANDED-NOTES"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	prompt, authored, images, ok := r.prepareInteractivePromptAuthored("inspect @notes.txt")
+	if !ok || len(images) != 0 {
+		t.Fatalf("prepared prompt ok=%v images=%d", ok, len(images))
+	}
+	if authored != "inspect @notes.txt" || !strings.Contains(prompt, "MACHINE-EXPANDED-NOTES") {
+		t.Fatalf("prepared prompt authored=%q provider=%q", authored, prompt)
+	}
+	opening := turnOpeningAuthored(prompt, authored, images)
+	if got, known := opening.AuthoredProjection(); !known || got != authored {
+		t.Fatalf("opening authored projection = %q known=%v, want %q", got, known, authored)
+	}
+}
+
 func TestTUIPlansNormalAndOverrideTurnsWithStampedOpening(t *testing.T) {
 	r, _, _ := newOverrideREPL(t, "small", "large")
 	stored := appendSurfaceContinuity(t, r.loop.Session, "route both TUI paths")
@@ -128,7 +150,7 @@ func TestRetryReplaysTheExactRecordedOpeningAndCapsuleOnce(t *testing.T) {
 		provider.Text{Text: "second question"},
 		provider.Image{MediaType: "image/png", Data: []byte{0x89, 0x50, 0x4e, 0x47}},
 		provider.Text{Text: " with exact trailing detail"},
-	}}
+	}}.WithAuthoredText("second question with exact trailing detail")
 	var err error
 	recorded, err = stampTurnOpening(m.app.loop.Session, recorded)
 	if err != nil {
@@ -145,7 +167,7 @@ func TestRetryReplaysTheExactRecordedOpeningAndCapsuleOnce(t *testing.T) {
 	if !ok || swap.err != nil {
 		t.Fatalf("retry swap = %#v", swap)
 	}
-	defer swap.sess.Close()
+	defer swap.sess.CloseDiscardingStaged()
 	start, ok := swap.andThen().(retryStartMsg)
 	if !ok {
 		t.Fatalf("retry continuation = %#v", swap.andThen())
@@ -168,6 +190,11 @@ func TestRetryReplaysTheExactRecordedOpeningAndCapsuleOnce(t *testing.T) {
 	if !reflect.DeepEqual(validatedAgain, recorded) || continuityBlockCount(validatedAgain) != 1 {
 		t.Fatal("surface plus loop stamping changed or duplicated the recorded opening")
 	}
+	intent := swap.sess.State().RetryIntent
+	if intent == nil {
+		t.Fatal("retry child lost its durable replay handoff")
+	}
+	validatedAgain.RetryIntentID = intent.ID
 	if err := swap.sess.AppendMessage(validatedAgain); err != nil {
 		t.Fatal(err)
 	}
@@ -176,10 +203,13 @@ func TestRetryReplaysTheExactRecordedOpeningAndCapsuleOnce(t *testing.T) {
 	}
 }
 
-func TestRetryStopsAfterPartialUndo(t *testing.T) {
+func TestRetryStalePrepareKeepsTheWholePostTurnWorkspace(t *testing.T) {
 	m := testModel(t)
 	appendTurn(t, m, "edit both files", "done")
-	dir := t.TempDir()
+	dir := filepath.Join(m.app.workspace, "retry-stale-prepare")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	good := filepath.Join(dir, "a-good.txt")
 	stale := filepath.Join(dir, "z-stale.txt")
 	for _, path := range []string{good, stale} {
@@ -188,35 +218,37 @@ func TestRetryStopsAfterPartialUndo(t *testing.T) {
 		}
 	}
 	rec := checkpoint.NewRecorder()
-	rec.Begin("edit both files")
-	rec.Record(good)
-	rec.Record(stale)
+	rec.BeginTurn(m.app.loop.Session.ID(), 0, "edit both files")
+	rec.RecordState(good, true, 0o644, []byte("before"))
+	rec.RecordState(stale, true, 0o644, []byte("before"))
 	if err := os.WriteFile(good, []byte("agent edit"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(stale, []byte("agent edit"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Close the checkpoint scope so its committed post-image is the agent edit;
-	// the write below is then correctly recognized as newer external state.
-	rec.Begin("later empty turn")
+	rec.Commit(good, true, 0o644, sha256.Sum256([]byte("agent edit")))
+	rec.Commit(stale, true, 0o644, sha256.Sum256([]byte("agent edit")))
+	// The committed post-image is the agent edit; this later write is correctly
+	// recognized as newer external state without inventing another turn scope.
 	if err := os.WriteFile(stale, []byte("newer external edit"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	m.app.undo = rec
 	sourceID := m.app.loop.Session.ID()
+	sourcePath := m.app.loop.Session.Path()
 	messages := len(m.app.loop.Session.State().Messages)
 	semantic := &lspView{}
 	m.full = semantic
 	workspaceEpoch := m.workspaceRuntime.epoch.Load()
 
-	completion, ok := cmdRetry(m, "")().(noticeMsg)
-	if !ok || completion.level != "error" || !strings.Contains(completion.text, "retry stopped before another model ran") ||
-		!strings.Contains(completion.text, "not restored") {
-		t.Fatalf("partial undo result = %#v", completion)
+	completion, ok := cmdRetry(m, "")().(sessionSwapMsg)
+	if !ok || completion.err == nil || !strings.Contains(completion.err.Error(), "preparing the retry publication transaction") ||
+		!errors.Is(completion.err, checkpoint.ErrStale) {
+		t.Fatalf("stale prepare result = %#v", completion)
 	}
-	if data, _ := os.ReadFile(good); string(data) != "before" {
-		t.Fatalf("successful restore was not reported/applied: %q", data)
+	if data, _ := os.ReadFile(good); string(data) != "agent edit" {
+		t.Fatalf("prepare restored a prefix before finding the stale file: %q", data)
 	}
 	if data, _ := os.ReadFile(stale); string(data) != "newer external edit" {
 		t.Fatalf("stale file was overwritten: %q", data)
@@ -224,10 +256,13 @@ func TestRetryStopsAfterPartialUndo(t *testing.T) {
 	if m.app.loop.Session.ID() != sourceID || len(m.app.loop.Session.State().Messages) != messages {
 		t.Fatal("partial undo still forked or launched a retry")
 	}
-	if got := m.workspaceRuntime.epoch.Load(); got != workspaceEpoch+1 || !semantic.stale {
-		t.Fatalf("partial retry restore left final-code caches live: epoch=%d want=%d lsp-stale=%v", got, workspaceEpoch+1, semantic.stale)
+	if retrySourceLabelled(t, sourcePath) {
+		t.Fatal("stale prepare labelled the source user_corrected")
 	}
-	m.Update(completion)
+	if got := m.workspaceRuntime.epoch.Load(); got != workspaceEpoch || semantic.stale {
+		t.Fatalf("non-mutating refusal invalidated the workspace: epoch=%d want=%d lsp-stale=%v", got, workspaceEpoch, semantic.stale)
+	}
+	m.onSessionSwap(completion)
 	if m.operationActive || m.busy {
 		t.Fatal("partial undo refusal did not release retry ownership")
 	}
@@ -242,12 +277,13 @@ func TestRetryRefusesPartialCheckpointRepeatedlyWithoutConsumingIt(t *testing.T)
 		t.Fatal(err)
 	}
 	rec := checkpoint.NewRecorder()
-	rec.Begin("edit the oversized file")
-	rec.Record(path)
-	if err := os.WriteFile(path, []byte("new bytes that cannot be restored from the bounded checkpoint"), 0o644); err != nil {
+	rec.BeginTurn(m.app.loop.Session.ID(), 0, "edit the oversized file")
+	rec.RecordState(path, true, 0o644, before)
+	after := []byte("new bytes that cannot be restored from the bounded checkpoint")
+	if err := os.WriteFile(path, after, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	rec.Begin("later empty turn")
+	rec.Commit(path, true, 0o644, sha256.Sum256(after))
 	m.app.undo = rec
 	sourceID := m.app.loop.Session.ID()
 
@@ -302,7 +338,10 @@ func TestSessionSwapHydratesTodosAndDropsReadAuthority(t *testing.T) {
 	if result := runSurfaceTool(t, m.app.loop.Tools, "read", map[string]any{"path": "kept.txt"}); result.IsError {
 		t.Fatalf("fixture read failed: %s", result.Content)
 	}
-	if err := m.app.loop.Tools.RestoreTodos([]tools.TodoItem{{Text: "old-session task", Status: tools.TodoActive}}); err != nil {
+	if err := m.app.loop.Tools.RestoreContinuity(
+		[]tools.TodoItem{{Text: "old-session task", Status: tools.TodoActive}},
+		continuity.Working{Objective: "old-session objective", StopCondition: "old-session stop"},
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -323,6 +362,9 @@ func TestSessionSwapHydratesTodosAndDropsReadAuthority(t *testing.T) {
 	if len(todos) != 1 || todos[0].Text != "new-session task" || newSession.CurrentContinuity().ID != stored.ID {
 		t.Fatalf("swap todos=%+v continuity=%+v", todos, newSession.CurrentContinuity())
 	}
+	if working := m.app.loop.Tools.Working(); working != (continuity.Working{Objective: "finish the continuity integration"}) {
+		t.Fatalf("swap retained old-session objective/stop context: %+v", working)
+	}
 	write := runSurfaceTool(t, m.app.loop.Tools, "write", map[string]any{"path": "kept.txt", "content": "must reread"})
 	if !write.IsError || !strings.Contains(write.Content, "not been read") {
 		t.Fatalf("old session read authority survived swap: %+v", write)
@@ -339,7 +381,7 @@ func TestSessionSwapReplayHidesContinuityAndKeepsOneAuthoredTurn(t *testing.T) {
 	opening := provider.Message{Role: provider.RoleUser, Content: []provider.Block{
 		provider.Text{Text: "visible prompt"},
 		provider.Text{Text: " plus detail"},
-	}}
+	}}.WithAuthoredText("visible prompt plus detail")
 	opening, err = stampTurnOpening(newSession, opening)
 	if err != nil {
 		t.Fatal(err)
@@ -377,7 +419,7 @@ func TestRaceArmsReceiveOneStampedOpeningAndHydratedTodos(t *testing.T) {
 		ca: &racedProvider{turns: []racedTurn{racedText("answer a")}},
 		cb: &racedProvider{turns: []racedTurn{racedText("answer b")}},
 	}
-	setup, ok := m.startRaceArms(probe, "compare exactly", nil)().(raceSetupMsg)
+	setup, ok := m.startRaceArms(probe, "compare exactly", nil, "compare exactly")().(raceSetupMsg)
 	if !ok || setup.err != nil {
 		t.Fatalf("race setup = %#v", setup)
 	}
@@ -414,7 +456,7 @@ func TestRaceArmsReceiveOneStampedOpeningAndHydratedTodos(t *testing.T) {
 
 func compactWithSummary(t *testing.T, m *tuiModel, summary string) sessionSwapMsg {
 	t.Helper()
-	client := &racedProvider{turns: []racedTurn{racedText(summary)}}
+	client := &racedProvider{turns: []racedTurn{racedText(testCompactHandoff(summary))}}
 	binding := m.app.loop.Binding()
 	binding.Provider = client
 	m.app.loop.Bind(binding)
@@ -429,7 +471,7 @@ func compactWithSummary(t *testing.T, m *tuiModel, summary string) sessionSwapMs
 
 func TestCompactSwapAuthorsLineageAndDeliversContinuityOnce(t *testing.T) {
 	m := testModel(t)
-	appendTurn(t, m, "what remains", "keep working")
+	appendTurn(t, m, "finish the parser migration; report what remains", "keep working")
 	source := m.app.loop.Session
 	stored := appendSurfaceContinuity(t, source, "finish after compaction")
 	if err := m.app.loop.BindSession(source); err != nil {
@@ -446,10 +488,16 @@ func TestCompactSwapAuthorsLineageAndDeliversContinuityOnce(t *testing.T) {
 		capsule.ParentMessages != 2 || capsule.ParentCapsule != stored.ID || capsule.Narrative != "" {
 		t.Fatalf("compacted capsule = %+v", capsule)
 	}
+	if capsule.Objective != `Verified current user objective: "finish the parser migration; report what remains"` ||
+		capsule.Phase != compactReconciliationPhase || capsule.NextAction != compactReconciliationNext ||
+		len(capsule.Tasks) != 1 || capsule.Tasks[0].Text != compactReconciliationNext {
+		t.Fatalf("compacted capsule promoted summarizer prose instead of the verified scope and reconciliation step: %+v", capsule)
+	}
 	seedOpening := freshState.Messages[0]
 	if seedOpening.ContinuityRef != capsule.ID || continuityBlockCount(seedOpening) != 1 ||
-		!strings.Contains(seedOpening.AuthoredText(), "Line one.\n\nLine two.\tNext action.") {
-		t.Fatalf("compact seed did not carry one hidden capsule beside the unmodified summary: %#v", seedOpening)
+		strings.Contains(seedOpening.AuthoredText(), "Line one.\n\nLine two.\tNext action.") ||
+		!strings.Contains(seedOpening.AuthoredText(), compactReconciliationNext) {
+		t.Fatalf("compact seed did not replace model authority while carrying one hidden capsule: %#v", seedOpening)
 	}
 	// A compacted session continues on its own now: the swap hands back the
 	// continuation's launcher. It is not run here — the harness has no live
@@ -461,7 +509,7 @@ func TestCompactSwapAuthorsLineageAndDeliversContinuityOnce(t *testing.T) {
 	}
 	m.finishPlanning()
 	t.Cleanup(func() { _ = m.app.loop.Session.Close() })
-	if todos := m.app.loop.Tools.Todos(); len(todos) != 1 || todos[0].Text != "finish after compaction" {
+	if todos := m.app.loop.Tools.Todos(); len(todos) != 1 || todos[0].Text != compactReconciliationNext {
 		t.Fatalf("compaction did not hydrate todos: %+v", todos)
 	}
 
@@ -501,7 +549,7 @@ func TestCompactSwapAuthorsLineageAndDeliversContinuityOnce(t *testing.T) {
 // "continue" never fires. Only an empty queue gets it.
 func TestCompactContinueYieldsToQueuedPrompts(t *testing.T) {
 	m := testModel(t)
-	appendTurn(t, m, "do the work", "done")
+	appendTurn(t, m, "implement the parser repair", "done")
 	swap := compactWithSummary(t, m, "A summary of the work so far.")
 	m.queue = []string{"typed while the summary ran"}
 
@@ -535,7 +583,7 @@ func TestCompactRespectsContinuityTombstone(t *testing.T) {
 	}
 	swap := compactWithSummary(t, m, "A summary still seeds the fresh transcript.")
 	if got := swap.sess.State().Continuity; got != nil {
-		swap.sess.Close()
+		swap.sess.CloseDiscardingStaged()
 		t.Fatalf("tombstoned source produced a new capsule: %+v", got)
 	}
 	// Same continuation contract as any compact swap: the launcher comes
@@ -555,15 +603,52 @@ func TestCompactRespectsContinuityTombstone(t *testing.T) {
 }
 
 func TestCompactContinuityDoesNotCreateAHeaderOnlyCapsule(t *testing.T) {
+	handoff, err := parseCompactHandoff(testCompactHandoff("Fresh compact objective."))
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, state := range map[string]session.State{
 		"none":           {ID: "source"},
 		"empty":          {ID: "source", Continuity: &continuity.Capsule{Source: continuity.SourceManual}},
 		"narrative only": {ID: "source", Continuity: &continuity.Capsule{Source: continuity.SourceManual, Narrative: "old prose summary", Omitted: []string{"narrative"}}},
 		"tombstone":      {ID: "source", Continuity: &continuity.Capsule{Source: continuity.SourceManual, Cleared: true}},
 	} {
-		if capsule, ok := compactContinuity(state); ok {
+		if capsule, ok := compactContinuity(state, handoff); ok {
 			t.Errorf("%s source produced header-only capsule %+v", name, capsule)
 		}
+	}
+}
+
+func TestCompactContinuityDoesNotRepromoteStateCancelledAfterItsBasis(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := store.Create(t.TempDir(), "test/local/model", "rev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	if err := sess.AppendMessage(provider.UserText("implement the release automation")); err != nil {
+		t.Fatal(err)
+	}
+	stale := appendSurfaceContinuity(t, sess, "publish the release")
+	if err := sess.AppendMessage(provider.UserText("cancel the release; the work is complete")); err != nil {
+		t.Fatal(err)
+	}
+
+	summary := strings.Replace(testCompactHandoff("Complete."),
+		"- Next: continue the objective.", "- Next: none.", 1)
+	handoff, err := parseCompactHandoff(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capsule, ok := compactContinuity(sess.State(), handoff)
+	if !ok {
+		t.Fatal("live structured state did not produce a compact capsule")
+	}
+	if capsule.ParentCapsule != stale.ID || capsule.Objective != "Complete." || capsule.NextAction != "" || len(capsule.Tasks) != 0 {
+		t.Fatalf("stale pre-cancellation task was re-promoted: %+v", capsule)
 	}
 }
 

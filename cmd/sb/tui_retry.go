@@ -15,19 +15,25 @@ package main
 // discarded turn ran are outside the checkpoint boundary, the same limit
 // /undo states.
 //
-// The set-aside answer is labelled before the fork: §8.4's user_corrected
-// is exactly this event, recorded as a note on the source log, where the
-// answer it corrects lives. Routing never reads it — collecting the corpus
-// honestly comes before acting on it.
+// The set-aside answer is labelled only after the fork is adopted and the
+// staged file inverse commits: §8.4's user_corrected is exactly this event,
+// recorded on the source log where the answer lives. A failed pause, fork,
+// stale checkpoint, cancelled operation, or failed adoption leaves that source
+// and the post-turn workspace untouched and unlabelled.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/switchboard-code/switchboard/internal/checkpoint"
 	"github.com/switchboard-code/switchboard/internal/config"
 	"github.com/switchboard-code/switchboard/internal/provider"
+	"github.com/switchboard-code/switchboard/internal/session"
 )
 
 type retryStartMsg struct {
@@ -35,10 +41,74 @@ type retryStartMsg struct {
 	opening    provider.Message
 	prompt     string // display-only projection; replay always uses opening
 	tier       string // empty reruns on the sitting rung
+	// openingRecorded means a crash landed the opening WAL record before the
+	// execution-start seam. The agent resumes after it without appending twice.
+	openingRecorded bool
+}
+
+type retryAdoption struct {
+	source          *session.Session
+	undo            *checkpoint.PreparedUndo
+	checkpointKnown bool
+	destination     string
+}
+
+const retryRecoveryGuardText = "an interrupted /retry owns this session; automatic replay is withheld to avoid duplicating provider or tool work. Use /retry abandon to keep the child without replay; then /resume can return to the set-aside source"
+
+func (m *tuiModel) retryRecoveryExists() bool {
+	if m == nil || m.app == nil || m.app.loop == nil || m.app.loop.Session == nil {
+		return false
+	}
+	return m.app.loop.Session.State().RetryIntent != nil
+}
+
+func (m *tuiModel) retryRecoveryBlocksNewWork() bool {
+	return m.retryRecoveryExists() && !m.busy && !m.turnPlanning
+}
+
+// retryRecoveryCommandAllowed keeps an unresolved execution handoff inert.
+// Inspection and the two explicit recovery exits remain available; commands
+// that append, mutate the workspace, launch external work, or enqueue another
+// provider turn stay closed until the handoff is durably resolved.
+func retryRecoveryCommandAllowed(name, args string) bool {
+	if name == "retry" {
+		return strings.TrimSpace(args) == "abandon"
+	}
+	switch name {
+	case "exit", "quit", "help", "recap", "session",
+		"tiers", "ladder", "why", "races", "cost", "usage", "stats", "find", "cache",
+		"hooks", "permissions", "agents", "skills", "files", "search", "lsp", "outline",
+		"symbols", "problems", "definition", "references", "diff", "review", "changes",
+		"blame", "mistakes":
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *retryAdoption) abortPrepared() error {
+	if r == nil || r.undo == nil {
+		return nil
+	}
+	return r.undo.AbortDurable()
 }
 
 func cmdRetry(m *tuiModel, args string) tea.Cmd {
 	args = strings.TrimSpace(args)
+	if args == "abandon" {
+		intent := m.app.loop.Session.State().RetryIntent
+		if intent == nil {
+			return noticeCmd("", "no interrupted retry handoff is waiting for a recovery decision")
+		}
+		if err := m.app.loop.Session.AbandonRetryIntent(intent.ID); err != nil {
+			return m.stopAfterRetryIntentResolutionFailure(err, errors.New("explicit /retry abandon was requested"))
+		}
+		notice := noticeCmd("warn", "interrupted retry handoff abandoned; this child stays as recorded and no work was replayed")
+		return m.releaseDeferredStartup(func() tea.Cmd { return notice })
+	}
+	if m.retryRecoveryExists() {
+		return noticeCmd("warn", retryRecoveryGuardText)
+	}
 	var dest config.Tier
 	if args != "" {
 		t, ok := m.app.config.Tier(args)
@@ -54,9 +124,33 @@ func cmdRetry(m *tuiModel, args string) tea.Cmd {
 		return noticeCmd("", "nothing to retry; the session has no completed turn")
 	}
 	opening := provider.CloneMessage(state.Messages[last])
-	prompt := opening.AuthoredText()
+	prompt, authoredKnown := opening.AuthoredProjection()
+	if !authoredKnown {
+		return noticeCmd("error", "retry refused: this legacy turn does not record its exact authored wording; its provider-expanded opening will not be shown or replayed as user-authored")
+	}
 	if prompt == "" {
 		return noticeCmd("error", "the last turn's opening carries no text to replay")
+	}
+
+	// Bind the only checkpoint scope /retry is allowed to consume before any
+	// asynchronous work. An empty current scope is meaningful: this turn changed
+	// no files and must not fall through to an older same-label mutation.
+	checkpointTurn := checkpoint.TurnIdentity{SessionID: state.ID, OpeningMessage: last}
+	recorder := m.app.undo
+	checkpointKnown := false
+	if recorder != nil {
+		if current, ok := recorder.CurrentTurn(checkpointTurn); ok {
+			checkpointKnown = true
+			if current.Partial {
+				which := ""
+				if len(current.Skipped) > 0 {
+					which = " (no bounded pre-image for " + boundedRetryPaths(current.Skipped) + ")"
+				}
+				text := "retry stopped before changing files or running another model: the turn's exact checkpoint is partial" + which + "; use /undo to review and explicitly consume that partial restore"
+				_ = m.app.loop.Session.AppendNote("warn", text)
+				return noticeCmd("error", text)
+			}
+		}
 	}
 
 	ctx, generation, sourceID, err := m.startOperation("retry")
@@ -64,80 +158,92 @@ func cmdRetry(m *tuiModel, args string) tea.Cmd {
 		return noticeCmd("warn", err.Error())
 	}
 
-	// The files first, while the recorder's stack still has the turn on
-	// top. A turn that changed nothing has no scope, and an older label on
-	// top means the stack has moved past this turn — either way the files
-	// stay, and the notice says which world the rerun starts in.
-	if rec := m.app.undo; rec != nil {
-		if turns := rec.Turns(); len(turns) > 0 && turns[len(turns)-1].Label == checkpointLabel(prompt) {
-			if turns[len(turns)-1].Partial {
-				var skipped []string
-				if details := rec.Details(); len(details) > 0 && details[len(details)-1].Label == turns[len(turns)-1].Label {
-					skipped = details[len(details)-1].Skipped
-				}
-				text := "retry stopped before changing files or running another model: the turn's checkpoint is partial"
-				if len(skipped) > 0 {
-					text += "; not checkpointed: " + boundedRetryPaths(skipped)
-				}
-				text += "; use /undo to review and explicitly consume that partial restore"
-				_ = m.app.loop.Session.AppendNote("warn", text)
-				return func() tea.Msg {
-					return noticeMsg{level: "error", text: text, operation: generation, sourceID: sourceID}
-				}
-			}
-			restored, removed, skipped, failed, label, undoErr := rec.Undo()
-			changed := append(append([]string(nil), restored...), removed...)
-			if len(changed) > 0 {
-				m.app.loop.Tools.ForgetVersions(changed)
-				invalidateRestoredWorkspace(m)
-				m.app.loop.Session.AppendNote("info", fmt.Sprintf("retry: took back the files of %q (%d restored, %d removed)", label, len(restored), len(removed)))
-			}
-			if undoErr != nil || len(skipped) > 0 || len(failed) > 0 {
-				if len(changed) > 0 {
-					m.addInfo(fmt.Sprintf("  took back part of the turn's file changes (%d restored, %d removed); what commands did stays done", len(restored), len(removed)))
-				}
-				text := retryUndoRefusal(len(restored), len(removed), skipped, failed, undoErr)
-				_ = m.app.loop.Session.AppendNote("warn", text)
-				return func() tea.Msg {
-					return noticeMsg{level: "error", text: text, operation: generation, sourceID: sourceID}
-				}
-			}
-			if len(changed) > 0 {
-				m.addInfo(fmt.Sprintf("  took back the turn's file changes (%d restored, %d removed); what commands did stays done", len(restored), len(removed)))
-			}
-		} else {
-			m.addInfo("  the turn's files were left as they are (it changed none, or /undo already took them back)")
-		}
-	}
-
 	destID := m.app.tier.ID
+	intentTier := m.app.tier
 	if dest.ID != "" {
 		destID = dest.ID
+		intentTier = dest
 	}
+	intentTarget, intentTierSet := retryTierIdentity(intentTier)
 	sess := m.app.loop.Session
-	sess.AppendNote("info", fmt.Sprintf("retry: the last answer was set aside (outcome user_corrected); rerunning on %s", destID))
-
 	id := sess.ID()
 	app := m.app
 	start := func() tea.Msg {
 		return retryStartMsg{opening: provider.CloneMessage(opening), prompt: prompt, tier: dest.ID}
 	}
-	return func() tea.Msg {
-		release, err := pauseAdvisorLedger(ctx, app)
+	return m.ownOperationCmd(generation, func() tea.Msg {
+		pause := pauseAdvisorLedger
+		if app.retryPause != nil {
+			pause = app.retryPause
+		}
+		release, err := pause(ctx, app)
 		if err != nil {
 			return sessionSwapMsg{err: fmt.Errorf("waiting for the advisor ledger before retry: %w", err), operation: generation, sourceID: sourceID}
+		}
+		if err := ctx.Err(); err != nil {
+			return sessionSwapMsg{err: err, release: release, operation: generation, sourceID: sourceID}
 		}
 		// A retry-specific fork can keep an empty conversation for the first
 		// turn, but it always carries the source's budget ledger. Repeated retry
 		// therefore cannot make already-sent requests disappear from a ceiling.
-		forked, err := app.store.ForkSessionForRetry(sess, last)
+		// It stays undiscoverable until the staged file inverse and session
+		// publication commit together in onSessionSwap.
+		fork := func(store *session.Store, source *session.Session, keep int) (*session.Session, error) {
+			return store.ForkSessionForRetryStaged(source, keep)
+		}
+		if app.retryFork != nil {
+			fork = app.retryFork
+		}
+		forked, err := fork(app.store, sess, last)
 		if err != nil {
 			return sessionSwapMsg{err: err, release: release, operation: generation, sourceID: sourceID}
 		}
+		var prepared *checkpoint.PreparedUndo
+		failFork := func(err error) tea.Msg {
+			if prepared != nil {
+				err = errors.Join(err, prepared.AbortDurable())
+			}
+			if closeErr := forked.CloseDiscardingStaged(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("discarding staged retry child: %w", closeErr))
+			}
+			return sessionSwapMsg{err: err, release: release, operation: generation, sourceID: sourceID}
+		}
+		if err := ctx.Err(); err != nil {
+			return failFork(err)
+		}
+		if _, err := forked.AppendRetryIntent(id, last, opening, destID, intentTarget, intentTierSet); err != nil {
+			return failFork(fmt.Errorf("saving the retry replay handoff before publication: %w", err))
+		}
+		journalDir, dirErr := app.store.WorkspaceDir(app.workspace)
+		if dirErr != nil {
+			return failFork(fmt.Errorf("opening the retry recovery directory: %w", dirErr))
+		}
+		childIdentity, identityErr := forked.PublicationRecoveryIdentity()
+		if identityErr != nil {
+			return failFork(fmt.Errorf("binding the staged retry child to recovery: %w", identityErr))
+		}
+		transactionRecorder := recorder
+		if !checkpointKnown {
+			// Publication needs the same write-ahead decision even when no exact
+			// file checkpoint exists. An empty private recorder contributes no
+			// restore claims; it only keeps the child/journal commit atomic.
+			transactionRecorder = checkpoint.NewRecorder()
+			transactionRecorder.BeginTurn(checkpointTurn.SessionID, checkpointTurn.OpeningMessage, prompt)
+		}
+		prepared, err = transactionRecorder.PrepareDurableUndoCurrent(
+			checkpointTurn, journalDir, app.workspace, forked.Path(), childIdentity,
+		)
+		if err != nil {
+			return failFork(fmt.Errorf("preparing the retry publication transaction durably: %w", err))
+		}
+		if err := ctx.Err(); err != nil {
+			return failFork(err)
+		}
 		return sessionSwapMsg{sess: forked, tier: app.tier, client: app.loop.Binding().Provider, fresh: last == 0,
 			note: fmt.Sprintf("retrying the last turn on %s; the set-aside answer stays in %s, /resume %s returns to it", destID, id, id), andThen: start, release: release,
-			continueTurn: true, operation: generation, sourceID: sourceID, preserveRuntimeTarget: true}
-	}
+			continueTurn: true, operation: generation, sourceID: sourceID, preserveRuntimeTarget: true,
+			retry: &retryAdoption{source: sess, undo: prepared, checkpointKnown: checkpointKnown, destination: destID}}
+	})
 }
 
 // retryStart launches the replay once the swap has landed. A named rung goes
@@ -158,19 +264,71 @@ func (m *tuiModel) retryStart(msg retryStartMsg) tea.Cmd {
 		return nil
 	}
 	refuse := func(text string) tea.Cmd {
+		refusal := errors.New(text)
+		// Validation can refuse a recovered pending handoff before this process
+		// claims execution ownership. Keep that expected recovery state available
+		// for /retry abandon. Once activeRetryIntent is set, however, refusal owns
+		// a durable abandonment append; failure at that seam must stop the process.
+		if m.activeRetryIntent != "" {
+			if err := m.resolveActiveRetryIntent(); err != nil {
+				return m.stopAfterRetryIntentResolutionFailure(err, refusal)
+			}
+		}
 		m.finishPlanning()
 		m.addNotice("error", text)
-		return m.nextQueuedTurn()
+		if m.retryRecoveryExists() {
+			return nil
+		}
+		return m.releaseDeferredStartup(m.nextQueuedTurn)
 	}
-	opening, err := stampRecordedTurnOpening(m.app.loop.Session, msg.opening)
-	if err != nil {
-		return refuse("retry refused: " + err.Error())
+	opening := provider.CloneMessage(msg.opening)
+	if !msg.openingRecorded {
+		var err error
+		opening, err = stampRecordedTurnOpening(m.app.loop.Session, opening)
+		if err != nil {
+			return refuse("retry refused: " + err.Error())
+		}
 	}
-	prompt := opening.AuthoredText()
+	prompt, authoredKnown := opening.AuthoredProjection()
+	if !authoredKnown {
+		return refuse("retry refused: the recorded opening does not carry an exact authored projection; provider-expanded content will not be painted as user-authored")
+	}
 	if prompt == "" {
 		return refuse("retry refused: the recorded opening carries no authored text")
 	}
-	m.addUser(prompt)
+	intent := m.app.loop.Session.State().RetryIntent
+	if intent == nil || intent.Status != session.RetryIntentPending {
+		return refuse("retry refused: the published child has no pending durable replay handoff")
+	}
+	matches, err := session.RetryIntentOpeningMatches(*intent, opening)
+	if err != nil || !matches {
+		return refuse("retry refused: the source opening no longer matches its durable replay handoff")
+	}
+	if msg.openingRecorded && opening.RetryIntentID != intent.ID {
+		return refuse("retry refused: the recorded child opening is not bound to its durable replay handoff")
+	}
+	destination := m.app.tier.ID
+	destinationTier := m.app.tier
+	if msg.tier != "" {
+		destination = msg.tier
+		var ok bool
+		destinationTier, ok = m.app.config.Tier(msg.tier)
+		if !ok {
+			return refuse("no tier " + msg.tier + " is configured; try /tiers")
+		}
+	}
+	if intent.Tier != destination {
+		return refuse("retry refused: the requested tier no longer matches its durable replay handoff")
+	}
+	target, tierSet := retryTierIdentity(destinationTier)
+	if intent.TierTarget != target || intent.TierSetSHA256 != tierSet {
+		return refuse("retry refused: the destination tier or its ordered fallbacks changed after the durable replay handoff")
+	}
+	m.activeRetryIntent = intent.ID
+	m.resumeRetryOpening = msg.openingRecorded
+	if !msg.openingRecorded {
+		m.addUser(prompt)
+	}
 	if msg.tier != "" && msg.tier != m.app.tier.ID {
 		tier, ok := m.app.config.Tier(msg.tier)
 		if !ok {
@@ -245,20 +403,6 @@ func injectionShaped(msg provider.Message) bool {
 	return strings.HasPrefix(text, "[advisor]") || strings.HasPrefix(text, "[watch]") || strings.HasPrefix(text, "[steer]")
 }
 
-func retryUndoRefusal(restored, removed int, skipped, failed []string, undoErr error) string {
-	parts := []string{fmt.Sprintf("retry stopped before another model ran: file restore was incomplete (%d restored, %d removed)", restored, removed)}
-	if undoErr != nil {
-		parts = append(parts, "undo error: "+undoErr.Error())
-	}
-	if len(skipped) > 0 {
-		parts = append(parts, "not checkpointed: "+boundedRetryPaths(skipped))
-	}
-	if len(failed) > 0 {
-		parts = append(parts, "not restored or not fully verified: "+boundedRetryPaths(failed))
-	}
-	return strings.Join(parts, "; ")
-}
-
 func boundedRetryPaths(paths []string) string {
 	const limit = 4
 	shown := paths
@@ -272,12 +416,89 @@ func boundedRetryPaths(paths []string) string {
 	return text
 }
 
-// checkpointLabel mirrors what the recorder files a turn under, so the
-// stack-top comparison compares like with like.
-func checkpointLabel(s string) string {
-	s = strings.TrimSpace(s)
-	if len(s) > 60 {
-		s = s[:60] + "…"
+func retryTierIdentity(tier config.Tier) (string, string) {
+	target := string(tier.Target.ID())
+	digest := sha256.New()
+	write := func(id string) {
+		_, _ = digest.Write([]byte(fmt.Sprintf("%d:", len(id))))
+		_, _ = digest.Write([]byte(id))
 	}
-	return s
+	write(target)
+	for _, fallback := range tier.Fallbacks {
+		write(string(fallback.ID()))
+	}
+	return target, hex.EncodeToString(digest.Sum(nil))
+}
+
+// pendingRetryStartup reconstructs only a provably unstarted handoff. The
+// opening bytes remain authoritative in the source log; the child stores their
+// digest and coordinate, so it never creates a second secret-bearing prompt
+// copy. A started handoff is intentionally left for explicit human action.
+func pendingRetryStartup(m *tuiModel, store *session.Store) tea.Cmd {
+	if m == nil || m.app == nil || m.app.loop == nil || store == nil {
+		return nil
+	}
+	childState := m.app.loop.Session.State()
+	intent := childState.RetryIntent
+	if intent == nil {
+		return nil
+	}
+	explicit := func(reason string) tea.Cmd {
+		m.addNotice("warn", reason+" Automatic replay was withheld to avoid duplicating provider or tool work. Use /retry abandon to keep this child without replay; then /resume "+intent.SourceSessionID+" can return to the set-aside source, where /retry is the explicit rerun action.")
+		return nil
+	}
+	if intent.Status != session.RetryIntentPending {
+		return explicit("An interrupted /retry crossed its durable execution-start boundary.")
+	}
+	if len(childState.Messages) != intent.OpeningMessage && len(childState.Messages) != intent.OpeningMessage+1 {
+		return explicit("The pending /retry child no longer ends at its recorded source cut.")
+	}
+	opening, err := store.ReadRetrySourceOpening(intent.SourceSessionID, m.app.workspace, intent.OpeningMessage)
+	if err != nil {
+		return explicit("The pending /retry source could not be read exactly: " + err.Error() + ".")
+	}
+	if opening.Role != provider.RoleUser || opening.Injected {
+		return explicit("The pending /retry coordinate is not an authored user opening.")
+	}
+	matches, err := session.RetryIntentOpeningMatches(*intent, opening)
+	if err != nil || !matches {
+		return explicit("The pending /retry source opening does not match its durable digest.")
+	}
+	openingRecorded := len(childState.Messages) == intent.OpeningMessage+1
+	if openingRecorded {
+		childOpening := provider.CloneMessage(childState.Messages[intent.OpeningMessage])
+		if childOpening.Role != provider.RoleUser || childOpening.Injected || childOpening.RetryIntentID != intent.ID {
+			return explicit("The pending /retry child tail is not an authored user opening.")
+		}
+		matches, err := session.RetryIntentOpeningMatches(*intent, childOpening)
+		if err != nil || !matches {
+			return explicit("The pending /retry child tail does not match its durable digest.")
+		}
+		opening = childOpening
+	}
+	prompt, authoredKnown := opening.AuthoredProjection()
+	if !authoredKnown || prompt == "" {
+		return explicit("The pending /retry opening has no exact authored projection.")
+	}
+	destinationTier := m.app.tier
+	if intent.Tier != m.app.tier.ID {
+		var ok bool
+		destinationTier, ok = m.app.config.Tier(intent.Tier)
+		if !ok {
+			return explicit("The pending /retry destination tier " + intent.Tier + " is no longer configured.")
+		}
+	}
+	target, tierSet := retryTierIdentity(destinationTier)
+	if target != intent.TierTarget || tierSet != intent.TierSetSHA256 {
+		return explicit("The pending /retry destination tier or its ordered fallbacks changed after publication.")
+	}
+	_, generation := m.startPlanning()
+	tier := ""
+	if intent.Tier != m.app.tier.ID {
+		tier = intent.Tier
+	}
+	m.addNotice("warn", "recovering a published /retry whose durable handoff proves no provider call began; replaying its exact source opening once on "+intent.Tier)
+	return func() tea.Msg {
+		return retryStartMsg{generation: generation, opening: opening, prompt: prompt, tier: tier, openingRecorded: openingRecorded}
+	}
 }

@@ -16,6 +16,7 @@
 /.planning/
 /.forge/
 /.codex/
+/.Codex/
 /.netlify/
 
 .DS_Store

@@ -146,6 +146,9 @@ func diffLimit(requested int) (int, error) {
 }
 
 func (r *Repository) hasHEAD(ctx context.Context) (bool, error) {
+	if err := r.executionAllowed(); err != nil {
+		return false, err
+	}
 	result := runGit(ctx, r.git, r.Root, maxDiagnosticBytes,
 		"rev-parse", "--verify", "--quiet", "HEAD^{commit}")
 	if result.err == nil {
@@ -158,6 +161,9 @@ func (r *Repository) hasHEAD(ctx context.Context) (bool, error) {
 }
 
 func (r *Repository) trackedPatch(ctx context.Context, state PathState, limit int) ([]byte, bool, error) {
+	if err := r.executionAllowed(); err != nil {
+		return nil, false, err
+	}
 	paths := []string{state.Path}
 	if state.OriginalPath != "" && state.OriginalPath != state.Path {
 		paths = append(paths, state.OriginalPath)
@@ -172,6 +178,9 @@ func (r *Repository) trackedPatch(ctx context.Context, state PathState, limit in
 }
 
 func (r *Repository) untrackedPatch(ctx context.Context, state PathState, limit int) (DiffSectionKind, []byte, bool, error) {
+	if err := r.executionAllowed(); err != nil {
+		return "", nil, false, err
+	}
 	abs := filepath.Join(r.Root, filepath.FromSlash(state.Path))
 	info, err := os.Lstat(abs)
 	if err != nil {

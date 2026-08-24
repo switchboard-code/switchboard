@@ -5,9 +5,114 @@ import (
 	"errors"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
+
+func TestShellContextRedactsBeforeTheByteCap(t *testing.T) {
+	token := "sk-ant-api03-" + "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnop"
+	raw := strings.Repeat("x", shellOutputCap-len(token)/2-1) + " " + token
+	var capture shellOutput
+	if n, err := capture.Write([]byte(raw + strings.Repeat("z", shellCaptureCap))); err != nil || n == 0 {
+		t.Fatalf("bounded capture write = %d, %v", n, err)
+	}
+	captured := capture.String()
+	if len(captured) != shellCaptureCap {
+		t.Fatalf("bounded capture retained %d bytes, want %d", len(captured), shellCaptureCap)
+	}
+	display := capShellOutput(captured)
+	if !strings.Contains(display, "sk-ant-api03-") {
+		t.Fatal("test precondition: the user-visible cap did not retain the boundary fragment")
+	}
+	contextOutput := capShellOutput(redactCredentialText(captured))
+	if strings.Contains(contextOutput, "sk-ant-api03-") || !strings.Contains(contextOutput, "[redacted") {
+		t.Fatalf("redacted shell projection retained a credential fragment: %q", contextOutput)
+	}
+
+	m := testModel(t)
+	m.onShellDone(shellDoneMsg{
+		command:        "printf " + token,
+		output:         display,
+		contextCommand: redactCredentialText("printf " + token),
+		contextOutput:  contextOutput,
+		result:         shellResult{kind: shellSucceeded},
+	})
+	prompt := m.shellContext("continue")
+	if strings.Contains(prompt, "sk-ant-api03-") || strings.Count(prompt, "[redacted") < 2 {
+		t.Fatalf("shell command or output reached provider context as a credential fragment:\n%s", prompt)
+	}
+}
+
+func TestShellOutputWriterIsBoundedAndAcknowledgesConcurrentWrites(t *testing.T) {
+	var out shellOutput
+	payload := []byte(strings.Repeat("output", shellCaptureCap))
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if n, err := out.Write(payload); err != nil || n != len(payload) {
+				t.Errorf("Write = %d, %v; want %d, nil", n, err, len(payload))
+			}
+		}()
+	}
+	wg.Wait()
+	retained, discarded := out.snapshot()
+	if got := len(retained); got != shellCaptureCap {
+		t.Fatalf("concurrent capture retained %d bytes, want exactly %d", got, shellCaptureCap)
+	}
+	if !discarded {
+		t.Fatal("bounded writer did not record that output was discarded")
+	}
+}
+
+func TestShellScanOverlapCoversEveryCredentialShapeAtTheCap(t *testing.T) {
+	secrets := []string{
+		"sk-ant-" + strings.Repeat("A", 40),
+		"sk-proj-" + strings.Repeat("A", 40),
+		"ghp_" + strings.Repeat("A", 36),
+		"github_pat_" + strings.Repeat("A", 22),
+		"glpat-" + strings.Repeat("A", 20),
+		"xoxb-" + strings.Repeat("A", 10),
+		"AKIAABCDEFGHIJKLMNOP",
+		"AIza" + strings.Repeat("A", 35),
+		"sk_live_" + strings.Repeat("A", 20),
+		"npm_" + strings.Repeat("A", 36),
+		"hf_" + strings.Repeat("A", 30),
+		"-----BEGIN PRIVATE KEY-----\nabcdefghijklmnopqrstuvwxyz\n-----END PRIVATE KEY-----",
+	}
+	for _, secret := range secrets {
+		var out shellOutput
+		raw := strings.Repeat("x", shellOutputCap-5) + " " + secret + "\n" + strings.Repeat("z", shellCaptureCap)
+		if _, err := out.Write([]byte(raw)); err != nil {
+			t.Fatal(err)
+		}
+		redacted := redactCredentialText(out.String())
+		if !strings.Contains(redacted, "[redacted:") {
+			t.Fatalf("overlap did not retain enough of credential shape %q for scanning", secret[:min(12, len(secret))])
+		}
+		bounded := capShellOutput(redacted)
+		if strings.Contains(bounded, secret[:min(12, len(secret))]) {
+			t.Fatalf("credential prefix survived the bounded projection for %q", secret[:min(12, len(secret))])
+		}
+	}
+}
+
+func TestShellByteCapPreservesUTF8AndWholeGraphemes(t *testing.T) {
+	for _, cluster := range []string{"e\u0301", "👩‍💻"} {
+		raw := strings.Repeat("x", shellOutputCap-1) + cluster + "tail"
+		got := capShellOutput(raw)
+		body, _, _ := strings.Cut(got, "\n[truncated")
+		if !utf8.ValidString(got) {
+			t.Fatalf("cap split UTF-8 for %q: %q", cluster, got[len(got)-32:])
+		}
+		if strings.Contains(body, cluster) || body != strings.Repeat("x", shellOutputCap-1) {
+			t.Fatalf("cap retained only part of grapheme %q: suffix=%q", cluster, body[len(body)-8:])
+		}
+	}
+}
 
 func runShellForTest(t *testing.T, command string) (*tuiModel, shellDoneMsg) {
 	t.Helper()
@@ -64,13 +169,60 @@ func TestShellSuccessShowsExitZeroAndKeepsOutputExpandable(t *testing.T) {
 	e.cache = nil
 	m.tr.invalidate(m.tr.indexOf(e))
 	expanded := stripANSI(strings.Join(m.tr.flat, "\n"))
-	if !strings.Contains(expanded, m.app.workspace) {
+	// Transcript wrapping may split a long temporary path across physical
+	// rows; compare its semantic cells rather than requiring one terminal row.
+	if !strings.Contains(strings.Join(strings.Fields(expanded), ""), strings.Join(strings.Fields(m.app.workspace), "")) {
 		t.Fatalf("expansion did not reveal stdout:\n%s", expanded)
 	}
 
 	contextPrompt := m.shellContext("continue")
 	if !strings.Contains(contextPrompt, "[shell result: success; exit_code=0]") {
 		t.Fatalf("next-prompt context lost the structured outcome:\n%s", contextPrompt)
+	}
+}
+
+func TestShellCompletionInvalidatesEveryOpenWorkspaceSurface(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		open  func(*tuiModel) fullscreen
+		stale func(fullscreen) bool
+	}{
+		{
+			name: "workspace source",
+			open: func(m *tuiModel) fullscreen {
+				return &workspaceView{runtime: m.workspaceRuntime, generation: m.workspaceGeneration}
+			},
+			stale: func(view fullscreen) bool {
+				v := view.(*workspaceView)
+				return v.stale && v.previewStale
+			},
+		},
+		{
+			name:  "diff",
+			open:  func(*tuiModel) fullscreen { return &diffView{} },
+			stale: func(view fullscreen) bool { return view.(*diffView).stale },
+		},
+		{
+			name:  "lsp",
+			open:  func(*tuiModel) fullscreen { return &lspView{} },
+			stale: func(view fullscreen) bool { return view.(*lspView).stale },
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := testModel(t)
+			before := m.workspaceGeneration
+			view := test.open(m)
+			m.full = view
+
+			m.onShellDone(shellDoneMsg{command: "true", result: shellResult{kind: shellSucceeded}})
+
+			if m.workspaceGeneration != before+1 {
+				t.Fatalf("workspace generation = %d, want %d", m.workspaceGeneration, before+1)
+			}
+			if !test.stale(view) {
+				t.Fatalf("%s remained current after a host-authority shell completion", test.name)
+			}
+		})
 	}
 }
 

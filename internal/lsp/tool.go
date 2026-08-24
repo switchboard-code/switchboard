@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/switchboard-code/switchboard/internal/permission"
+	"github.com/switchboard-code/switchboard/internal/safeexec"
 	"github.com/switchboard-code/switchboard/internal/tools"
 )
 
@@ -33,6 +34,12 @@ const (
 type Server struct {
 	Argv []string
 	Root string
+	// Executable and Environment bind a fixed machine language server and its
+	// interpreter search path outside both the target workspace and the process
+	// launch checkout. A zero Executable retains the legacy direct-start API for
+	// explicit library callers and tests; Switchboard assembly always sets it.
+	Executable  safeexec.Executable
+	Environment []string
 	// OpenCloseSync is a verified server-profile correction for a runtime
 	// whose legacy numeric textDocumentSync advertisement omits the separate
 	// openClose behavior it actually requires. Generic numeric decoding stays
@@ -86,11 +93,19 @@ func (s *Server) get(ctx context.Context) (*Client, error) {
 	attempt := &serverStart{done: make(chan struct{}), cancel: cancel}
 	s.starting = attempt
 	starter := s.startClient
-	if starter == nil {
-		starter = startWithProblems
-	}
 	argv := append([]string(nil), s.Argv...)
 	root := s.Root
+	executable := s.Executable
+	environment := append([]string(nil), s.Environment...)
+	if starter == nil {
+		if executable.Path() != "" {
+			starter = func(ctx context.Context, argv []string, root string, problems *ProblemStore) (*Client, error) {
+				return startBoundWithProblems(ctx, executable, argv, root, environment, problems)
+			}
+		} else {
+			starter = startWithProblems
+		}
+	}
 	openCloseSync := s.OpenCloseSync
 	problems := s.Problems()
 	s.mu.Unlock()

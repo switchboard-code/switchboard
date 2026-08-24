@@ -46,7 +46,7 @@ func (m *TaskManager) Steer(id, message string) error {
 	if state == nil {
 		return fmt.Errorf("no task %s", id)
 	}
-	if state.Status.terminal() {
+	if state.Status != TaskQueued && state.Status != TaskRunning {
 		return fmt.Errorf("task %s already %s; nothing is listening", id, state.Status)
 	}
 	state.pendingSteers = append(state.pendingSteers, message)
@@ -82,8 +82,9 @@ func (h *TaskHandle) injectSteering() []provider.Message {
 		// session.OpensTurn, which is what /fork, /retry, and blame cut on:
 		// an unmarked steer puts a phantom turn boundary in the middle of the
 		// subagent's errand.
-		steer := provider.UserText(steerPrefix + " " + message)
+		steer := provider.UserText(steerPrefix + " " + redactCrossAgent(message))
 		steer.Injected = true
+		steer.UserSteer = true
 		out = append(out, steer)
 	}
 	return out
@@ -97,7 +98,7 @@ func (h *TaskHandle) RecordActivity(what string) {
 	if h == nil || h.manager == nil {
 		return
 	}
-	what = strings.TrimSpace(what)
+	what = strings.TrimSpace(redactCrossAgent(what))
 	if what == "" {
 		return
 	}

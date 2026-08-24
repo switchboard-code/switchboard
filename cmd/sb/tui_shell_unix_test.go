@@ -13,6 +13,24 @@ import (
 	"time"
 )
 
+func TestShellHighVolumeOutputStaysBounded(t *testing.T) {
+	m, msg := runShellForTest(t, `yes switchboard | head -c 5000000`)
+	if msg.err != nil || msg.result.kind != shellSucceeded {
+		t.Fatalf("high-volume command failed: err=%v result=%+v", msg.err, msg.result)
+	}
+	marker := "[truncated at " + strconv.Itoa(shellOutputCap) + "-byte limit]"
+	if len(msg.output) > shellOutputCap+len(marker)+2 || !strings.Contains(msg.output, marker) {
+		t.Fatalf("display output was not bounded: bytes=%d suffix=%q", len(msg.output), msg.output[max(0, len(msg.output)-80):])
+	}
+	if len(msg.contextOutput) > shellOutputCap+len(marker)+2 || !strings.Contains(msg.contextOutput, marker) {
+		t.Fatalf("context output was not bounded: bytes=%d", len(msg.contextOutput))
+	}
+	m.onShellDone(msg)
+	if len(m.pendingShell) != 1 || len(m.pendingShell[0]) > shellOutputCap+512 {
+		t.Fatalf("high-volume output escaped the pending-context bound: entries=%d bytes=%d", len(m.pendingShell), len(m.pendingShell[0]))
+	}
+}
+
 func TestShellCancellationKillsDescendantHoldingOutputAndReleasesPrompt(t *testing.T) {
 	m := testModel(t)
 	m.app.workspace = t.TempDir()

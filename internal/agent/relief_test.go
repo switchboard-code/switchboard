@@ -115,6 +115,12 @@ func TestAReliefBindingTakesOverTheTurn(t *testing.T) {
 	busy := &busyProvider{}
 	h.loop.Provider = busy
 	h.loop.MaxAttempts = 1
+	noteBeforeCall := false
+	h.provider.beforeStream = func(_ int) {
+		h.obs.mu.Lock()
+		defer h.obs.mu.Unlock()
+		noteBeforeCall = len(h.obs.notices) == 1 && h.obs.notices[0] == "warn: exact fallback substitution"
+	}
 
 	roomy := provider.RouteTarget{Provider: "scripted", Surface: "local", ModelID: "roomy"}
 	asked := 0
@@ -123,7 +129,7 @@ func TestAReliefBindingTakesOverTheTurn(t *testing.T) {
 		if reason != ReliefAvailability {
 			t.Errorf("reason = %s, want availability", reason)
 		}
-		return Binding{Provider: h.provider, Target: roomy}, "moved", nil
+		return Binding{Provider: h.provider, Target: roomy}, "exact fallback substitution", nil
 	}
 
 	if err := h.loop.Turn(context.Background(), "hello"); err != nil {
@@ -134,6 +140,9 @@ func TestAReliefBindingTakesOverTheTurn(t *testing.T) {
 	}
 	if h.loop.Binding().Target.ID() != roomy.ID() {
 		t.Errorf("bound target = %s, want the rung that took over", h.loop.Binding().Target.ID())
+	}
+	if !noteBeforeCall {
+		t.Fatal("the relieved provider was called before its exact substitution note was rendered")
 	}
 }
 
@@ -205,7 +214,7 @@ func TestContextRefusalNamesTheTargetAndTheNumbers(t *testing.T) {
 		Provider: "anthropic", Surface: "first-party", ModelID: "claude-haiku-4-5",
 	}
 
-	refusal := h.loop.checkContext(h.loop.Target, 1<<20)
+	refusal := h.loop.checkContext(h.loop.Binding(), 1<<20)
 	var window *ContextWindowError
 	if !errors.As(refusal, &window) {
 		t.Fatalf("refusal = %v, want a ContextWindowError", refusal)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,6 +19,13 @@ func TestPipedInputRidesTheMentionConvention(t *testing.T) {
 	if got != want {
 		t.Errorf("attachment drifted from the @path convention:\n%q\nwant\n%q", got, want)
 	}
+	opening := turnOpeningAuthored(got, "explain this failure", nil)
+	if authored, known := opening.AuthoredProjection(); !known || authored != "explain this failure" {
+		t.Fatalf("piped opening authored projection = %q known=%v", authored, known)
+	}
+	if !strings.Contains(opening.Text(), "panic: nil map") {
+		t.Fatal("piped provider opening lost standard input")
+	}
 }
 
 func TestEmptyPipeAttachesNothing(t *testing.T) {
@@ -25,6 +33,18 @@ func TestEmptyPipeAttachesNothing(t *testing.T) {
 		if got := attachPipedInput("prompt", data); got != "prompt" {
 			t.Errorf("empty stdin %q grew the prompt to %q", data, got)
 		}
+	}
+}
+
+func TestReadPipedInputHasACompleteBound(t *testing.T) {
+	atLimit := bytes.Repeat([]byte{'x'}, int(maxPipedInputBytes))
+	got, err := readPipedInput(bytes.NewReader(atLimit))
+	if err != nil || !bytes.Equal(got, atLimit) {
+		t.Fatalf("exact-limit piped input = %d bytes, %v", len(got), err)
+	}
+	got, err = readPipedInput(bytes.NewReader(append(append([]byte(nil), atLimit...), 'x')))
+	if err == nil || got != nil || !strings.Contains(err.Error(), "exceeds") || !strings.Contains(err.Error(), "1048576") {
+		t.Fatalf("over-limit piped input = %d bytes, %v; want complete refusal", len(got), err)
 	}
 }
 

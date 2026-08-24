@@ -94,6 +94,37 @@ Fix $issue; all=<$ARGUMENTS>; first=<$0>`)
 	}
 }
 
+func TestLegacyClaudeCommandDerivedDescriptionStaysLocalAndBodyEgressIsRedacted(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	ws := t.TempDir()
+	secret := "ghp_" + strings.Repeat("e", 36)
+	body := "Review with " + secret + "."
+	writeClaudeCommand(t, filepath.Join(ws, ".claude", "commands"), "sensitive.md", body)
+
+	list, notes := Load(ws)
+	if len(notes) != 0 || len(list) != 1 {
+		t.Fatalf("legacy sensitive command loaded %+v, notes %v", list, notes)
+	}
+	sk := list[0]
+	if !sk.ImplicitDisabled || sk.Description != body || sk.Body != body {
+		t.Fatalf("legacy source inventory changed: %+v", sk)
+	}
+	if strings.Contains(NewTool(list).Description(), secret) {
+		t.Fatal("manual-only command description entered the frozen model inventory")
+	}
+	rendered, err := RenderExplicit(sk, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rendered, secret) || !strings.Contains(rendered, "[redacted: a GitHub token]") {
+		t.Fatalf("legacy command body egress was not visibly redacted: %q", rendered)
+	}
+	if sk.Description != body || sk.Body != body {
+		t.Fatal("legacy command source inventory was mutated")
+	}
+}
+
 func TestClaudeSkillWinsSameScopeNativeCommandName(t *testing.T) {
 	home := t.TempDir()
 	setTestHome(t, home)

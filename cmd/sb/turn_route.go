@@ -4,16 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/switchboard-code/switchboard/internal/agent"
 	"github.com/switchboard-code/switchboard/internal/catalog"
 	"github.com/switchboard-code/switchboard/internal/config"
 	"github.com/switchboard-code/switchboard/internal/prefix"
 	"github.com/switchboard-code/switchboard/internal/provider"
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 	route "github.com/switchboard-code/switchboard/internal/router"
 	"github.com/switchboard-code/switchboard/internal/session"
 )
@@ -31,9 +33,7 @@ type turnPlan struct {
 func prospectiveTurnPlan(loop *agent.Loop, sticky *route.Sticky, opening provider.Message, workspace string) turnPlan {
 	state := loop.Session.State()
 	messages := append(append([]provider.Message(nil), state.Messages...), opening)
-	request := provider.Request{
-		System: loop.System, Tools: loop.Tools.Definitions(), Messages: messages,
-	}
+	request := loop.Request(messages)
 	promptTokens := prefix.RequestTokens(request)
 	features := sessionFeatures(state.Messages, opening.Text(), sticky, workspace)
 	features.PromptTokens = promptTokens
@@ -82,7 +82,7 @@ func planUserTurnSkipping(
 	remaining, limited := remainingBudget(budget, state.ID,
 		catalog.Money(state.RetryReserveMicroUSD), catalog.Money(state.AccountedCostMicroUSD()))
 
-	request := provider.Request{System: loop.System, Tools: loop.Tools.Definitions(), Messages: messages}
+	request := loop.Request(messages)
 	hitProbabilities := map[provider.RouteTargetID]float64{}
 	// The current tier may be served by a live fallback whose ID does not occur
 	// in the configured ladder. Score the target that would actually receive the
@@ -96,7 +96,7 @@ func planUserTurnSkipping(
 	}
 	requirements := route.Requirements{
 		NeedsTools:        true,
-		NeedsVision:       messagesNeedVision(messages),
+		NeedsVision:       messagesNeedVision(request.Messages),
 		ApprovedProviders: cfg.Destinations,
 	}
 	budgets := route.Budgets{MaxCost: remaining, MaxCostSet: limited}
@@ -163,11 +163,15 @@ func withLiveVision(candidate route.Candidate, probes *providers) route.Candidat
 
 func withLiveCapabilities(candidate route.Candidate, probes *providers) route.Candidate {
 	if probes != nil {
-		// A positive live attestation outranks a surface-wide catalog default.
-		// Absence does not: several APIs cannot report per-model vision at all.
+		candidate.Info.ContextWindow = resolveContextWindow(probes.config, probes, candidate.Target, candidate.Info.ContextWindow)
+		candidate.ReservedOutputTokens = probes.outputTokenAllowance(candidate.Target, candidate.Info.MaxOutput)
+		candidate.CeilingCost = preflightBoundWithOutput(candidate.Info, candidate.ContextTokens, candidate.ReservedOutputTokens)
+		// A live modality attestation outranks a surface-wide catalog default in
+		// both directions. Silence does not: several APIs cannot report per-model
+		// vision at all.
 		if probe, known := probes.probedCapabilities(candidate.Target); known {
-			if probe.Vision {
-				candidate.Info.Vision = true
+			if probe.VisionKnown {
+				candidate.Info.Vision = probe.Vision
 			}
 			switch probe.Tools {
 			case provider.ToolsNone:
@@ -186,12 +190,19 @@ func withLiveCapabilities(candidate route.Candidate, probes *providers) route.Ca
 	return candidate
 }
 
+func withLiveCandidateCapabilities(candidates []route.Candidate, probes *providers) []route.Candidate {
+	for index := range candidates {
+		candidates[index] = withLiveCapabilities(candidates[index], probes)
+	}
+	return candidates
+}
+
 func candidateWithLiveFallback(tier config.Tier, primary route.Candidate, rank int, cat *catalog.Catalog,
 	probes *providers, promptTokens, contextTokens int, hitProbabilities map[provider.RouteTargetID]float64, requirements route.Requirements,
 	budgets route.Budgets,
 ) route.Candidate {
 	primary = withLiveCapabilities(primary, probes)
-	if candidatePassesHardFilters(primary, probes, requirements, budgets) {
+	if candidatePassesHardFilters(primary, probes, requirements, budgets) || !probeSaysUnavailable(probes, primary.Target) {
 		return primary
 	}
 	for _, target := range tier.Fallbacks {
@@ -204,6 +215,18 @@ func candidateWithLiveFallback(tier config.Tier, primary route.Candidate, rank i
 		}
 	}
 	return primary
+}
+
+// probeSaysUnavailable is the only condition that unlocks a tier's fallback
+// list during pure selection. Context, vision, destination, and budget failures
+// belong to the concrete primary and make the rung infeasible; silently changing
+// models to satisfy one of them would turn fallback into hidden routing.
+func probeSaysUnavailable(probes *providers, target provider.RouteTarget) bool {
+	if probes == nil {
+		return false
+	}
+	probe, known := probes.probedCapabilities(target)
+	return known && (!probe.Reachable || !probe.ModelPresent || probe.Tools == provider.ToolsNone)
 }
 
 func candidatePassesHardFilters(candidate route.Candidate, probes *providers, requirements route.Requirements, budgets route.Budgets) bool {
@@ -220,6 +243,16 @@ func candidatePassesHardFilters(candidate route.Candidate, probes *providers, re
 func tierWithActiveTargetFirst(configured config.Tier, active provider.RouteTarget) config.Tier {
 	if active.ID() == configured.Target.ID() {
 		return configured
+	}
+	if active.Params.MaxOutputTokens != configured.Target.Params.MaxOutputTokens {
+		// A durable session binding predating a max_output change keeps its exact
+		// wire identity until the user deliberately rebinds the rung. It cannot
+		// inherit the current outage list: max_output is rung policy, and mixing
+		// the historical primary with current-cap fallbacks creates a tier no
+		// config can represent and the runtime correctly refuses. Keep the named
+		// rung for pin/routing continuity, but make this historical binding its
+		// sole approved target.
+		return config.Tier{ID: configured.ID, Label: configured.Label, Target: active}
 	}
 	ordered := make([]provider.RouteTarget, 0, len(configured.Fallbacks)+1)
 	for _, target := range append([]provider.RouteTarget{configured.Target}, configured.Fallbacks...) {
@@ -269,6 +302,7 @@ func resolveUserTurn(ctx context.Context, loop *agent.Loop, cfg *config.Config, 
 ) (config.Tier, provider.Provider, string, turnPlan, error) {
 	state := loop.Session.State()
 	messages := append(append([]provider.Message(nil), state.Messages...), opening)
+	messages = loop.Request(messages).Messages
 	requirements := route.Requirements{
 		NeedsTools:        true,
 		NeedsVision:       messagesNeedVision(messages),
@@ -339,7 +373,7 @@ func retargetTurnPlan(plan *turnPlan, loop *agent.Loop, cat *catalog.Catalog, ca
 	}
 	state := loop.Session.State()
 	messages := append(append([]provider.Message(nil), state.Messages...), opening)
-	request := provider.Request{System: loop.System, Tools: loop.Tools.Definitions(), Messages: messages}
+	request := loop.Request(messages)
 	hitProbability := caches.HitProbability(tier.Target, cat, request)
 	candidate := candidateForTierContext(tier, rank, cat, plan.PromptTokens, plan.ContextTokens, hitProbability)
 	plan.Decision.Target = tier.Target.ID()
@@ -370,9 +404,7 @@ func messagesNeedVision(messages []provider.Message) bool {
 // fidelity, or cross a hard budget.
 func checkMoveFeasible(loop *agent.Loop, cat *catalog.Catalog, probes *providers, budget *budgetState, destinations []string, tier config.Tier, rank int) error {
 	state := loop.Session.State()
-	request := provider.Request{
-		System: loop.System, Tools: loop.Tools.Definitions(), Messages: state.Messages,
-	}
+	request := loop.Request(state.Messages)
 	promptTokens := prefix.RequestTokens(request)
 	contextTokens := prefix.RequestTokenCeiling(request)
 	remaining, limited := remainingBudget(budget, state.ID,
@@ -381,7 +413,7 @@ func checkMoveFeasible(loop *agent.Loop, cat *catalog.Catalog, probes *providers
 		Candidates: []route.Candidate{withLiveVision(candidateForTierContext(tier, rank, cat, promptTokens, contextTokens, 0), probes)},
 		Requirements: route.Requirements{
 			NeedsTools:        true,
-			NeedsVision:       messagesNeedVision(state.Messages),
+			NeedsVision:       messagesNeedVision(request.Messages),
 			ApprovedProviders: destinations,
 		},
 		Budgets: route.Budgets{MaxCost: remaining, MaxCostSet: limited},
@@ -400,6 +432,7 @@ func checkTurnFeasible(loop *agent.Loop, cat *catalog.Catalog, probes *providers
 	remaining, limited := remainingBudget(budget, state.ID,
 		catalog.Money(state.RetryReserveMicroUSD), catalog.Money(state.AccountedCostMicroUSD()))
 	messages := append(append([]provider.Message(nil), state.Messages...), opening)
+	messages = loop.Request(messages).Messages
 	_, err := (route.Heuristic{}).Route(route.Input{
 		Candidates: []route.Candidate{withLiveVision(candidateForTierContext(tier, rank, cat, plan.PromptTokens, plan.ContextTokens, 0), probes)},
 		Requirements: route.Requirements{
@@ -546,31 +579,95 @@ var languageByExtension = map[string]string{
 	".ts": "TypeScript", ".tsx": "TypeScript", ".vue": "Vue", ".zig": "Zig",
 }
 
+const (
+	// Language evidence is a routing hint, not permission to stall the turn
+	// loop on an adversarial checkout. The former walker inspected as many as
+	// 50,000 entries synchronously on every turn. Keep this deliberately lower
+	// and abandon the hint altogether if either the work or latency budget is
+	// exhausted.
+	routeLanguageMaxEntries = 10_000
+	routeLanguageMaxDirs    = 2_000
+	routeLanguageMaxDepth   = 32
+	routeLanguageBatch      = 64
+	routeLanguageTimeout    = 100 * time.Millisecond
+)
+
 func repoLanguages(root string) []string {
+	ctx, cancel := context.WithTimeout(context.Background(), routeLanguageTimeout)
+	defer cancel()
+	return repoLanguagesWithContext(ctx, root, rootedfs.WalkLimits{
+		MaxEntries:     routeLanguageMaxEntries,
+		MaxDirectories: routeLanguageMaxDirs,
+		MaxDepth:       routeLanguageMaxDepth,
+		ReadDirBatch:   routeLanguageBatch,
+	}, nil)
+}
+
+// repoLanguagesWithLimits is deliberately all-or-nothing. Language evidence
+// influences routing; a prefix from a capped or raced traversal is not a fact
+// about the repository and must be omitted rather than scored as complete.
+func repoLanguagesWithLimits(root string, limits rootedfs.WalkLimits, beforeOpen func(string)) []string {
+	return repoLanguagesWithContext(context.Background(), root, limits, beforeOpen)
+}
+
+func repoLanguagesWithContext(ctx context.Context, root string, limits rootedfs.WalkLimits, beforeOpen func(string)) []string {
+	if ctx == nil || ctx.Err() != nil {
+		return nil
+	}
+	if strings.TrimSpace(root) == "" {
+		return nil
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return nil
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return nil
+	}
+	expected, err := os.Lstat(real)
+	if err != nil || expected.Mode()&os.ModeSymlink != 0 || !expected.IsDir() {
+		return nil
+	}
+	if beforeOpen != nil {
+		beforeOpen(real)
+	}
+	capability, err := rootedfs.OpenRoot(real)
+	if err != nil {
+		return nil
+	}
+	defer capability.Close()
+	opened, err := capability.Stat(".")
+	current, currentErr := os.Lstat(real)
+	if err != nil || currentErr != nil || current.Mode()&os.ModeSymlink != 0 || !current.IsDir() ||
+		!os.SameFile(expected, opened) || !os.SameFile(opened, current) {
+		return nil
+	}
+
 	seen := map[string]struct{}{}
-	files := 0
-	_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if entry.IsDir() {
-			switch entry.Name() {
+	status, walkErr := rootedfs.WalkRegularFiles(ctx, capability, ".", limits,
+		func(relative string, _ os.FileInfo) bool {
+			switch filepath.Base(relative) {
 			case ".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build", ".switchboard":
-				if path != root {
-					return filepath.SkipDir
-				}
+				return true
+			default:
+				return false
+			}
+		},
+		func(_ string, _ *os.Root, name string, _ os.FileInfo) error {
+			if language := languageByExtension[strings.ToLower(filepath.Ext(name))]; language != "" {
+				seen[language] = struct{}{}
 			}
 			return nil
-		}
-		files++
-		if language := languageByExtension[strings.ToLower(filepath.Ext(entry.Name()))]; language != "" {
-			seen[language] = struct{}{}
-		}
-		if files >= 50_000 {
-			return fs.SkipAll
-		}
+		})
+	current, currentErr = os.Lstat(real)
+	if walkErr != nil || status.Partial() || currentErr != nil || current.Mode()&os.ModeSymlink != 0 ||
+		!current.IsDir() || !os.SameFile(expected, current) {
 		return nil
-	})
+	}
+	if openedAfter, statErr := capability.Stat("."); statErr != nil || !os.SameFile(expected, openedAfter) {
+		return nil
+	}
 	languages := make([]string, 0, len(seen))
 	for language := range seen {
 		languages = append(languages, language)

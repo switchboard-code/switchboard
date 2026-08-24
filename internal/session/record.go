@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
+	"strconv"
 	"time"
 
 	"github.com/switchboard-code/switchboard/internal/continuity"
@@ -16,7 +18,7 @@ import (
 
 // The log is a header line followed by framed records:
 //
-//	switchboard-session 4\n
+//	switchboard-session 5\n
 //	<8-hex payload length> <8-hex crc32c> <compact json>\n
 //
 // Length and checksum together let replay tell a torn final write from a clean
@@ -26,17 +28,34 @@ import (
 // newline.
 const (
 	magic         = "switchboard-session"
-	SchemaVersion = 4
+	SchemaVersion = 5
 
-	frameHeaderLen = 18 // 8 hex + space + 8 hex + space
+	frameHeaderLen        = 18 // 8 hex + space + 8 hex + space
+	maxSessionRecordBytes = 64 << 20
 )
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
-// ErrCorruptRecord ends replay. It is not surfaced to the caller as a failure:
-// the log truncates at that point and resumes from the last valid state, with
-// the loss reported (§10.3).
+// ErrCorruptRecord reports a complete frame that failed validation. It must be
+// surfaced and the log left untouched: unlike a final frame without its line
+// terminator, a complete bad frame is not proof of an interrupted append, and
+// discarding it could also discard valid history after it.
 var ErrCorruptRecord = errors.New("corrupt record")
+
+// ErrRecordTooLarge is returned before allocating the declared payload. The
+// limit is intentionally much larger than any provider/tool payload admitted
+// by the runtime, while keeping a forged 8-hex length from requesting GiBs.
+var ErrRecordTooLarge = errors.New("session record exceeds size limit")
+
+// errTornFinalRecord is the one recoverable corruption shape. A non-empty
+// final line that reaches EOF without its terminator proves that the last
+// append did not complete. It wraps ErrCorruptRecord so broad integrity checks
+// still recognize it while replay can distinguish safe tail repair.
+var errTornFinalRecord = fmt.Errorf("%w: incomplete final frame", ErrCorruptRecord)
+
+func isRecoverableRecordEnd(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, errTornFinalRecord)
+}
 
 // ErrSchemaTooNew refuses a log written by a newer binary. A best-effort parse
 // would silently drop records it does not understand.
@@ -45,8 +64,15 @@ var ErrSchemaTooNew = errors.New("session was written by a newer version of swit
 type RecordType string
 
 const (
-	RecordSessionStart   RecordType = "session_start"
-	RecordMessage        RecordType = "message"
+	RecordSessionStart RecordType = "session_start"
+	RecordMessage      RecordType = "message"
+	// RecordAssistantDraft carries incremental, already-user-visible stream
+	// output. It is optional forward-compatible evidence: older readers of the
+	// same schema ignore the record and still read the ordinary final Message,
+	// while a crash leaves a newer reader enough deltas to reconstruct one
+	// incomplete assistant message. That makes adding it safe without a schema
+	// migration or teaching an older binary a new execution semantic.
+	RecordAssistantDraft RecordType = "assistant_draft"
 	RecordUsage          RecordType = "usage"
 	RecordRetryReserve   RecordType = "retry_reserve"
 	RecordBudgetAttempt  RecordType = "budget_attempt"
@@ -54,7 +80,19 @@ const (
 	RecordBudgetTransfer RecordType = "budget_transfer"
 	RecordRaceBranch     RecordType = "race_branch"
 	RecordRuntimeBinding RecordType = "runtime_binding"
-	RecordContinuity     RecordType = "continuity"
+	// RecordWorkspaceBinding is the durable canonical workspace identity earned
+	// when a pre-canonicalization session is resumed through a symlink alias.
+	// SessionStart.Workspace remains immutable physical provenance (and still
+	// owns the log's directory); this record lets later discovery find the same
+	// session after that legacy alias is removed without weakening the initial
+	// same-directory proof.
+	RecordWorkspaceBinding RecordType = "workspace_binding"
+	RecordContinuity       RecordType = "continuity"
+	// RecordRetryIntent is a compact execution handoff for /retry. It stores a
+	// digest and source message coordinate rather than another prompt copy, so
+	// restart can recover the exact source opening without creating a second
+	// durable secret-bearing payload.
+	RecordRetryIntent RecordType = "retry_intent"
 	// RecordMessageContinuity commits a successful todo-result message and the
 	// exact continuity state it produced in one checksummed WAL frame. Two
 	// separately synced records would leave a crash window where replay saw the
@@ -317,6 +355,14 @@ type SessionStart struct {
 	// against, so a cost recorded here can be checked later against the data
 	// that actually produced it rather than whatever is current (§4).
 	CatalogRevision string `json:"catalog_revision,omitempty"`
+
+	// Staged logs are durable working records but are not resumable history
+	// until their creating handle atomically publishes a matching sidecar.
+	// PublicationID binds that sidecar to this exact log. Schema 5 makes older
+	// binaries refuse the new lifecycle instead of accidentally discovering an
+	// unadopted child as the latest session.
+	Staged        bool   `json:"staged,omitempty"`
+	PublicationID string `json:"publication_id,omitempty"`
 }
 
 // RuntimeBinding is the latest durable routing state for a live session.
@@ -328,6 +374,20 @@ type RuntimeBinding struct {
 	Tier   string                 `json:"tier"`
 	Target provider.RouteTargetID `json:"target"`
 	Pinned bool                   `json:"pinned"`
+
+	// Note is an audit fact committed in the same frame as a binding whose
+	// meaning would otherwise be incomplete (currently an availability
+	// fallback). Replay deliberately strips it from State.RuntimeBinding: it is
+	// timeline evidence, not part of target identity.
+	Note *Note `json:"note,omitempty"`
+}
+
+// WorkspaceBinding records the canonical workspace path proven equivalent to
+// the immutable SessionStart.Workspace at an append-locked resume boundary.
+// It is intentionally a separate record rather than a rewrite of session_start:
+// the event log remains append-only and its physical pathname stays checkable.
+type WorkspaceBinding struct {
+	Workspace string `json:"workspace"`
 }
 
 // Continuity aliases the package-owned value so session consumers can read
@@ -469,42 +529,70 @@ func encodeRecord(rec Record) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("encoding %s record: %w", rec.Type, err)
 	}
+	if len(payload) > maxSessionRecordBytes {
+		return nil, fmt.Errorf("encoding %s record: %w (%d > %d)",
+			rec.Type, ErrRecordTooLarge, len(payload), maxSessionRecordBytes)
+	}
 	frame := make([]byte, 0, frameHeaderLen+len(payload)+1)
 	frame = fmt.Appendf(frame, "%08x %08x ", len(payload), crc32.Checksum(payload, crcTable))
 	frame = append(frame, payload...)
 	return append(frame, '\n'), nil
 }
 
-// decodeRecord reads one framed record. It returns ErrCorruptRecord for a torn
-// or altered frame and io.EOF at a clean end of log.
+// decodeRecord reads one framed record. It returns errTornFinalRecord only for
+// a non-empty unterminated final frame, ErrCorruptRecord for a complete frame
+// that fails validation, and io.EOF at a clean end of log.
 func decodeRecord(r *bufio.Reader) (Record, int, error) {
-	line, err := r.ReadBytes('\n')
-	if len(line) == 0 {
-		if err == nil {
-			err = io.EOF
-		}
-		return Record{}, 0, err
+	var header [frameHeaderLen]byte
+	n, err := io.ReadFull(r, header[:])
+	if n == 0 && errors.Is(err, io.EOF) {
+		return Record{}, 0, io.EOF
 	}
-	consumed := len(line)
-
-	// A line with no terminator is the tail of a write that did not finish.
 	if err != nil {
-		if errors.Is(err, io.EOF) {
+		if bytes.IndexByte(header[:n], '\n') >= 0 {
+			return Record{}, n, ErrCorruptRecord
+		}
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return Record{}, n, errTornFinalRecord
+		}
+		return Record{}, n, err
+	}
+	if bytes.IndexByte(header[:], '\n') >= 0 || header[8] != ' ' || header[17] != ' ' {
+		return Record{}, n, ErrCorruptRecord
+	}
+
+	wantLen64, lenErr := strconv.ParseUint(string(header[:8]), 16, 32)
+	wantCRC64, crcErr := strconv.ParseUint(string(header[9:17]), 16, 32)
+	if lenErr != nil || crcErr != nil {
+		return Record{}, n, ErrCorruptRecord
+	}
+	if wantLen64 > maxSessionRecordBytes {
+		return Record{}, n, fmt.Errorf("%w: %w (%d > %d)",
+			ErrCorruptRecord, ErrRecordTooLarge, wantLen64, maxSessionRecordBytes)
+	}
+
+	wantLen := int(wantLen64)
+	body := make([]byte, wantLen+1)
+	bodyN, err := io.ReadFull(r, body)
+	consumed := n + bodyN
+	if err != nil {
+		// A newline proves that the physical frame ended early; otherwise EOF
+		// proves only an interrupted final append.
+		if bytes.IndexByte(body[:bodyN], '\n') >= 0 {
 			return Record{}, consumed, ErrCorruptRecord
+		}
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return Record{}, consumed, errTornFinalRecord
 		}
 		return Record{}, consumed, err
 	}
-	if len(line) < frameHeaderLen+1 || line[8] != ' ' || line[17] != ' ' {
+	if body[wantLen] != '\n' {
 		return Record{}, consumed, ErrCorruptRecord
 	}
 
-	var wantLen, wantCRC uint32
-	if _, err := fmt.Sscanf(string(line[:frameHeaderLen-1]), "%08x %08x", &wantLen, &wantCRC); err != nil {
-		return Record{}, consumed, ErrCorruptRecord
-	}
-
-	payload := line[frameHeaderLen : len(line)-1]
-	if uint32(len(payload)) != wantLen || crc32.Checksum(payload, crcTable) != wantCRC {
+	payload := body[:wantLen]
+	wantCRC := uint32(wantCRC64)
+	if crc32.Checksum(payload, crcTable) != wantCRC {
 		return Record{}, consumed, ErrCorruptRecord
 	}
 
@@ -512,5 +600,29 @@ func decodeRecord(r *bufio.Reader) (Record, int, error) {
 	if err := json.Unmarshal(payload, &rec); err != nil {
 		return Record{}, consumed, ErrCorruptRecord
 	}
+	return rec, consumed, nil
+}
+
+// decodeSequencedRecord adds the logical frame-identity check to the physical
+// decoder. A checksum proves only that one frame is internally complete; the
+// strictly increasing sequence proves where it belongs in this log. Gaps,
+// duplicates, backwards values, and integer-wrap sentinels are complete
+// corruption, never an interrupted tail that replay may discard.
+func decodeSequencedRecord(r *bufio.Reader, previous *int) (Record, int, error) {
+	rec, consumed, err := decodeRecord(r)
+	if err != nil {
+		return rec, consumed, err
+	}
+	if previous == nil {
+		return Record{}, consumed, fmt.Errorf("%w: record sequence has no prior coordinate", ErrCorruptRecord)
+	}
+	if *previous < 0 || *previous == math.MaxInt {
+		return Record{}, consumed, fmt.Errorf("%w: record sequence cannot advance after %d", ErrCorruptRecord, *previous)
+	}
+	want := *previous + 1
+	if rec.Seq != want || rec.Seq <= 0 {
+		return Record{}, consumed, fmt.Errorf("%w: record sequence %d follows %d, want %d", ErrCorruptRecord, rec.Seq, *previous, want)
+	}
+	*previous = rec.Seq
 	return rec, consumed, nil
 }

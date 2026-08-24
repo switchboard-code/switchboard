@@ -10,8 +10,6 @@ package main
 import (
 	"encoding/base64"
 	"os"
-	"os/exec"
-	"runtime"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -120,12 +118,26 @@ func (m *tuiModel) copySelection() tea.Cmd {
 		return nil
 	}
 	return func() tea.Msg {
-		_, _ = os.Stderr.WriteString("\x1b]52;c;" + base64.StdEncoding.EncodeToString([]byte(text)) + "\a")
-		if runtime.GOOS == "darwin" {
-			cmd := exec.Command("pbcopy")
-			cmd.Stdin = strings.NewReader(text)
-			_ = cmd.Run()
+		if m.clipboardWrite != nil {
+			m.clipboardWrite(text)
 		}
 		return clipboardMsg{lines: n}
 	}
+}
+
+func writeClipboard(text string) {
+	_ = writeClipboardAll(text)
+}
+
+// writeClipboardAll is the one transcript-egress boundary for drag selection,
+// /copy, and workspace locations. OSC 52 covers terminal-owned clipboards;
+// nativeClipboardWrite adds a platform clipboard where it can do so without a
+// repository-controlled helper lookup.
+func writeClipboardAll(text string) error {
+	_, oscErr := os.Stderr.WriteString("\x1b]52;c;" + base64.StdEncoding.EncodeToString([]byte(text)) + "\a")
+	native, nativeErr := nativeClipboardWrite(text)
+	if native {
+		return nativeErr
+	}
+	return oscErr
 }

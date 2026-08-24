@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/switchboard-code/switchboard/internal/provider"
 )
@@ -88,7 +89,7 @@ func (c *ResponsesClient) Stream(ctx context.Context, target provider.RouteTarge
 	if err != nil {
 		return nil, err
 	}
-	return newResponsesStream(ctx, resp.Body), nil
+	return newResponsesStream(ctx, resp.Body, target.Params.MaxOutputTokens), nil
 }
 
 // CountTokens has no exact answer here: this endpoint exposes no counting
@@ -96,6 +97,7 @@ func (c *ResponsesClient) Stream(ctx context.Context, target provider.RouteTarge
 // docs/estimator.md, and is flagged inexact so a budget check widens rather
 // than trusting it.
 func (c *ResponsesClient) CountTokens(_ context.Context, _ provider.RouteTarget, req provider.Request) (provider.TokenEstimate, error) {
+	req = provider.ReplayRequest(req)
 	chars := 0
 	for _, b := range req.System {
 		chars += blockChars(b)
@@ -141,8 +143,11 @@ func (c *ResponsesClient) Probe(ctx context.Context, target provider.RouteTarget
 	defer resp.Body.Close()
 
 	var list codexModelList
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return res, &provider.ProtocolError{Provider: Name, Detail: "decoding the model list", Err: err}
+	if err := provider.DecodeBoundedModelList(resp.Body, Name, "decoding the model list", "models", &list); err != nil {
+		return res, err
+	}
+	if err := validateCodexModelList(list); err != nil {
+		return res, err
 	}
 	res.Reachable = true
 
@@ -159,6 +164,13 @@ func (c *ResponsesClient) Probe(ctx context.Context, target provider.RouteTarget
 		offered = append(offered, m.Slug)
 		if m.Slug == target.ModelID {
 			res.ModelPresent = true
+			res.VisionKnown = m.InputModalities != nil
+			for _, modality := range m.InputModalities {
+				if modality == "image" {
+					res.Vision = true
+					break
+				}
+			}
 			res.ContextWindow = m.ContextWindow
 			// The endpoint's per-model window is its own statement of what
 			// the model holds, not a metadata inference.
@@ -185,8 +197,11 @@ func (c *ResponsesClient) Models(ctx context.Context) ([]string, error) {
 	defer resp.Body.Close()
 
 	var list codexModelList
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil, &provider.ProtocolError{Provider: Name, Detail: "decoding the model list", Err: err}
+	if err := provider.DecodeBoundedModelList(resp.Body, Name, "decoding the model list", "models", &list); err != nil {
+		return nil, err
+	}
+	if err := validateCodexModelList(list); err != nil {
+		return nil, err
 	}
 	out := make([]string, 0, len(list.Models))
 	for _, m := range list.Models {
@@ -207,14 +222,34 @@ func (c *ResponsesClient) ModelEfforts(ctx context.Context) (map[string][]string
 	defer resp.Body.Close()
 
 	var list codexModelList
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil, &provider.ProtocolError{Provider: Name, Detail: "decoding the model list", Err: err}
+	if err := provider.DecodeBoundedModelList(resp.Body, Name, "decoding the model list", "models", &list); err != nil {
+		return nil, err
+	}
+	if err := validateCodexModelList(list); err != nil {
+		return nil, err
 	}
 	out := make(map[string][]string, len(list.Models))
 	for _, m := range list.Models {
 		out[m.Slug] = m.effortLevels()
 	}
 	return out, nil
+}
+
+func validateCodexModelList(list codexModelList) error {
+	for _, model := range list.Models {
+		if err := provider.ValidateModelID(model.Slug); err != nil {
+			return &provider.ProtocolError{Provider: Name, Detail: "validating the model list", Err: err}
+		}
+		for _, level := range model.SupportedReasoningLevels {
+			if level.Effort == "" {
+				continue
+			}
+			if err := provider.ValidateReasoningEffort(level.Effort); err != nil {
+				return &provider.ProtocolError{Provider: Name, Detail: "validating the model list", Err: err}
+			}
+		}
+	}
+	return nil
 }
 
 func (c *ResponsesClient) do(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
@@ -240,21 +275,22 @@ func (c *ResponsesClient) do(ctx context.Context, method, path string, body []by
 		return nil, err
 	}
 	if resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		raw := provider.ReadAPIErrorBody(resp.Body)
 		resp.Body.Close()
 		return nil, &provider.APIError{
 			Provider:   Name,
 			StatusCode: resp.StatusCode,
-			Body:       responsesErrorMessage(raw),
+			Body:       provider.SanitizeAPIErrorText(responsesErrorMessage(raw)),
 		}
 	}
 	return resp, nil
 }
 
 // responsesErrorMessage unwraps what this endpoint returns, which is a "detail"
-// string rather than the nested error object the documented API uses. A body
-// that is neither is returned as-is but capped, because an HTML error page is
-// itself the useful signal that a path does not exist.
+// string rather than the nested error object the documented API uses. The
+// complete, already body-bounded semantic component is sanitized before the
+// display cap: truncating first can cut a recognized credential below its
+// scanner length floor and expose the resulting prefix.
 func responsesErrorMessage(raw []byte) string {
 	var envelope struct {
 		Detail any `json:"detail"`
@@ -264,17 +300,17 @@ func responsesErrorMessage(raw []byte) string {
 	}
 	if err := json.Unmarshal(raw, &envelope); err == nil {
 		if envelope.Error != nil && envelope.Error.Message != "" {
-			return envelope.Error.Message
+			return capResponsesErrorMessage(envelope.Error.Message)
 		}
 		switch d := envelope.Detail.(type) {
 		case string:
 			if d != "" {
-				return d
+				return capResponsesErrorMessage(d)
 			}
 		case nil:
 		default:
 			if encoded, err := json.Marshal(d); err == nil {
-				return string(encoded)
+				return capResponsesErrorMessage(string(encoded))
 			}
 		}
 	}
@@ -283,9 +319,18 @@ func responsesErrorMessage(raw []byte) string {
 	if strings.HasPrefix(text, "<") {
 		return "the endpoint returned an HTML page rather than an API response, which means this path does not exist"
 	}
+	return capResponsesErrorMessage(text)
+}
+
+func capResponsesErrorMessage(text string) string {
+	text = provider.SanitizeAPIErrorText(text)
 	const limit = 400
 	if len(text) > limit {
-		text = text[:limit] + "..."
+		cut := limit
+		for cut > 0 && !utf8.ValidString(text[:cut]) {
+			cut--
+		}
+		text = text[:cut] + "..."
 	}
 	return text
 }
@@ -301,6 +346,7 @@ func (c *ResponsesClient) buildRequest(target provider.RouteTarget, req provider
 			Detail:     "this target caches by routing key, not by markers on blocks; set a prompt cache key instead",
 		}
 	}
+	req = provider.ReplayRequest(req)
 
 	input := make([]responsesItem, 0, len(req.Messages))
 
@@ -350,6 +396,9 @@ func (c *ResponsesClient) buildRequest(target provider.RouteTarget, req provider
 // one message here and three items there, and a tool result is its own item
 // with no role at all.
 func messageToItems(target provider.RouteTarget, m provider.Message) ([]responsesItem, error) {
+	if m.Role == provider.RoleAssistant && m.Incomplete {
+		return nil, nil
+	}
 	var items []responsesItem
 	var parts []responsesContent
 

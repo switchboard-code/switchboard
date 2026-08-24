@@ -6,10 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 const value = "sk-not-a-real-key-0123456789"
@@ -120,18 +120,51 @@ func TestEmptyEnvIsNotACredential(t *testing.T) {
 	}
 }
 
-// script writes a helper command for the tests below.
-func script(t *testing.T, body string) []string {
+func testHelperStore(t *testing.T, behavior string) *HelperStore {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "helper.sh")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
-		t.Fatal(err)
+	return &HelperStore{
+		Command: []string{os.Args[0]},
+		Env:     []string{"SB_TEST_CREDENTIAL_HELPER=" + behavior},
 	}
-	return []string{path}
+}
+
+func TestMain(m *testing.M) {
+	if behavior := os.Getenv("SB_TEST_CREDENTIAL_HELPER"); behavior != "" {
+		runTestCredentialHelper(behavior)
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
+func runTestCredentialHelper(behavior string) {
+	token := "ghp_" + strings.Repeat("a", 36)
+	switch behavior {
+	case "credential":
+		fmt.Println(value)
+	case "reference":
+		fmt.Printf("%s/%s\n", os.Getenv("SB_CREDENTIAL_PROVIDER"), os.Getenv("SB_CREDENTIAL_ACCOUNT"))
+	case "broken":
+		fmt.Fprintln(os.Stderr, "vault is locked")
+		os.Exit(1)
+	case "partial":
+		fmt.Fprint(os.Stdout, value)
+		fmt.Fprintln(os.Stderr, "then it died")
+		os.Exit(3)
+	case "stderr-secret":
+		fmt.Fprintln(os.Stderr, "helper failed with "+token)
+		os.Exit(4)
+	case "stderr-overflow":
+		fmt.Fprint(os.Stderr, strings.Repeat("x", maxHelperCaptureBytes-len(token)+1)+token)
+		os.Exit(5)
+	case "stdout-overflow":
+		fmt.Fprint(os.Stdout, strings.Repeat("s", maxHelperCaptureBytes+1))
+	default:
+		os.Exit(2)
+	}
 }
 
 func TestHelperSuppliesTheCredential(t *testing.T) {
-	store := &HelperStore{Command: script(t, `printf '%s\n' "`+value+`"`)}
+	store := testHelperStore(t, "credential")
 
 	got, err := store.Get(context.Background(), Ref{Provider: "anthropic"})
 	if err != nil {
@@ -146,7 +179,7 @@ func TestHelperSuppliesTheCredential(t *testing.T) {
 }
 
 func TestHelperIsToldWhichCredentialIsWanted(t *testing.T) {
-	store := &HelperStore{Command: script(t, `printf '%s/%s\n' "$SB_CREDENTIAL_PROVIDER" "$SB_CREDENTIAL_ACCOUNT"`)}
+	store := testHelperStore(t, "reference")
 
 	got, err := store.Get(context.Background(), Ref{Provider: "anthropic", Account: "bedrock"})
 	if err != nil {
@@ -163,7 +196,7 @@ func TestHelperIsToldWhichCredentialIsWanted(t *testing.T) {
 // have.
 func TestBrokenHelperStopsTheChain(t *testing.T) {
 	resolver := NewResolver(
-		&HelperStore{Command: script(t, `echo "vault is locked" >&2; exit 1`)},
+		testHelperStore(t, "broken"),
 		staticStore{secret: New("from-the-next-source", SourceKeychain, "")},
 	)
 
@@ -182,7 +215,7 @@ func TestBrokenHelperStopsTheChain(t *testing.T) {
 // stdout is the credential channel. A helper that fails partway may have
 // written part of a secret to it, so it is never quoted back.
 func TestHelperStdoutStaysOutOfErrors(t *testing.T) {
-	store := &HelperStore{Command: script(t, `printf '%s' "`+value+`"; echo "then it died" >&2; exit 3`)}
+	store := testHelperStore(t, "partial")
 
 	_, err := store.Get(context.Background(), Ref{Provider: "anthropic"})
 	if err == nil {
@@ -193,6 +226,38 @@ func TestHelperStdoutStaysOutOfErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "then it died") {
 		t.Errorf("the error dropped the helper's diagnostics: %v", err)
+	}
+}
+
+func TestHelperRedactsCompleteStderrBeforeItsDisplayCap(t *testing.T) {
+	token := "ghp_" + strings.Repeat("a", 36)
+	store := testHelperStore(t, "stderr-secret")
+	_, err := store.Get(context.Background(), Ref{Provider: "anthropic"})
+	if err == nil || strings.Contains(err.Error(), token) || !strings.Contains(err.Error(), "[redacted: a GitHub token]") {
+		t.Fatalf("helper stderr credential was not safely redacted: %v", err)
+	}
+}
+
+func TestHelperWithholdsOverflowingStdoutAndStderr(t *testing.T) {
+	for _, behavior := range []string{"stderr-overflow", "stdout-overflow"} {
+		t.Run(behavior, func(t *testing.T) {
+			store := testHelperStore(t, behavior)
+			_, err := store.Get(context.Background(), Ref{Provider: "anthropic"})
+			if err == nil || !strings.Contains(err.Error(), "withheld") {
+				t.Fatalf("overflowing helper stream was not withheld: %v", err)
+			}
+			if strings.Contains(err.Error(), "ghp_") || strings.Contains(err.Error(), strings.Repeat("s", 100)) {
+				t.Fatalf("overflowing helper stream reached its error: %v", err)
+			}
+		})
+	}
+}
+
+func TestHelperDiagnosticsRepairInvalidUTF8AfterCompleteRedaction(t *testing.T) {
+	token := "ghp_" + strings.Repeat("b", 36)
+	got := diagnostics(string([]byte{0xff}) + token)
+	if !utf8.ValidString(got) || strings.Contains(got, token) || !strings.Contains(got, "[redacted: a GitHub token]") {
+		t.Fatalf("helper diagnostic was not safely normalized: %q", got)
 	}
 }
 

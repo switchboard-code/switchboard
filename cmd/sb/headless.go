@@ -22,6 +22,26 @@ import (
 	"github.com/switchboard-code/switchboard/internal/session"
 )
 
+// Piped input is an attachment, not an unbounded transport. A one-megabyte
+// complete-file ceiling is generous for diagnostics and diffs while keeping a
+// forgotten producer or hostile pipe from exhausting the headless process
+// before the outbound credential gate can inspect the assembled prompt.
+const maxPipedInputBytes = int64(1 << 20)
+
+func readPipedInput(r io.Reader) ([]byte, error) {
+	if r == nil {
+		return nil, errors.New("piped stdin is unavailable")
+	}
+	data, err := io.ReadAll(io.LimitReader(r, maxPipedInputBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading piped stdin: %w", err)
+	}
+	if int64(len(data)) > maxPipedInputBytes {
+		return nil, fmt.Errorf("piped stdin exceeds the %d-byte attachment limit", maxPipedInputBytes)
+	}
+	return data, nil
+}
+
 // attachPipedInput carries piped stdin into the prompt the way an @path
 // mention carries a file: the prompt stays what the user said, and the
 // attachment follows, labelled, so the model knows why it is there.

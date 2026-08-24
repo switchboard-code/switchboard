@@ -25,11 +25,14 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 )
 
 const (
-	maxDefinitionBytes = int64(1 << 20) // one MiB of instructions/frontmatter
-	maxSupportingBytes = int64(4 << 20) // four MiB per explicitly requested resource
+	maxDefinitionBytes       = int64(1 << 20) // one MiB of instructions/frontmatter
+	maxSupportingBytes       = int64(4 << 20) // four MiB per explicitly requested resource
+	maxSkillDirectoryEntries = 1024
 )
 
 // Ecosystem identifies the directory convention that supplied a skill.
@@ -167,7 +170,7 @@ func Load(workspace string) (list []Skill, notes []string) {
 	sources := skillSources(workspace)
 	seenPaths := map[string]bool{}
 	for _, src := range sources {
-		entries, err := os.ReadDir(src.dir)
+		entries, err := readSkillDirectory(src.dir, maxSkillDirectoryEntries)
 		if err != nil {
 			if !os.IsNotExist(err) {
 				notes = append(notes, fmt.Sprintf("skills %s: %v", src.dir, err))
@@ -313,7 +316,7 @@ func additionalCandidates(root string) ([]skillCandidate, error) {
 		return nil, err
 	}
 
-	entries, err := os.ReadDir(root)
+	entries, err := readSkillDirectory(root, maxSkillDirectoryEntries)
 	if err != nil {
 		return nil, err
 	}
@@ -428,7 +431,7 @@ func escapeSelectorSegment(value string) string {
 // one open directory handle. This keeps discovery internally consistent if a
 // writable repository changes the directory while a session is assembling.
 func readSkillFiles(rootDir, definitionPath string, packed bool) ([]byte, bool, []string, os.FileInfo, error) {
-	root, err := os.OpenRoot(rootDir)
+	root, err := rootedfs.OpenRoot(rootDir)
 	if err != nil {
 		return nil, false, nil, nil, err
 	}
@@ -607,7 +610,7 @@ func readRootedFile(root, path string, limit int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	opened, err := os.OpenRoot(root)
+	opened, err := rootedfs.OpenRoot(root)
 	if err != nil {
 		return nil, err
 	}
@@ -615,7 +618,61 @@ func readRootedFile(root, path string, limit int64) ([]byte, error) {
 	return readFileFromRoot(opened, rel, limit)
 }
 
+func readSkillDirectory(path string, maxEntries int) ([]os.DirEntry, error) {
+	return readSkillDirectoryWithHook(path, maxEntries, nil)
+}
+
+func readSkillDirectoryWithHook(path string, maxEntries int, beforeOpen func()) ([]os.DirEntry, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, err
+	}
+	before, err := os.Lstat(resolved)
+	if err != nil {
+		return nil, err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.IsDir() {
+		return nil, fmt.Errorf("%s is not a real directory", path)
+	}
+	if beforeOpen != nil {
+		beforeOpen()
+	}
+	directory, err := openSkillPathRead(resolved)
+	if err != nil {
+		return nil, err
+	}
+	defer directory.Close()
+	opened, err := directory.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !opened.IsDir() || !os.SameFile(before, opened) {
+		return nil, fmt.Errorf("%s changed identity while it was opened", path)
+	}
+	entries, readErr := directory.ReadDir(maxEntries + 1)
+	if readErr != nil && readErr != io.EOF {
+		return nil, readErr
+	}
+	if len(entries) > maxEntries {
+		return nil, fmt.Errorf("%s has more than %d entries", path, maxEntries)
+	}
+	finished, err := directory.Stat()
+	if err != nil {
+		return nil, err
+	}
+	linked, linkErr := os.Stat(path)
+	if linkErr != nil || !linked.IsDir() || !os.SameFile(opened, finished) ||
+		!os.SameFile(finished, linked) || !opened.ModTime().Equal(finished.ModTime()) {
+		return nil, fmt.Errorf("%s changed while it was read", path)
+	}
+	return entries, nil
+}
+
 func readFileFromRoot(root *os.Root, rel string, limit int64) ([]byte, error) {
+	return readFileFromRootWithHook(root, rel, limit, nil)
+}
+
+func readFileFromRootWithHook(root *os.Root, rel string, limit int64, beforeOpen func()) ([]byte, error) {
 	info, err := root.Stat(rel)
 	if err != nil {
 		return nil, err
@@ -626,7 +683,10 @@ func readFileFromRoot(root *os.Root, rel string, limit int64) ([]byte, error) {
 	if info.Size() > limit {
 		return nil, fmt.Errorf("%s exceeds the %d-byte limit", rel, limit)
 	}
-	file, err := root.Open(rel)
+	if beforeOpen != nil {
+		beforeOpen()
+	}
+	file, err := openRootedRead(root, rel)
 	if err != nil {
 		return nil, err
 	}
@@ -638,6 +698,9 @@ func readFileFromRoot(root *os.Root, rel string, limit int64) ([]byte, error) {
 	if !openedInfo.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s is not a regular file", rel)
 	}
+	if !os.SameFile(info, openedInfo) {
+		return nil, fmt.Errorf("%s changed while it was opened", rel)
+	}
 	if openedInfo.Size() > limit {
 		return nil, fmt.Errorf("%s exceeds the %d-byte limit", rel, limit)
 	}
@@ -647,6 +710,19 @@ func readFileFromRoot(root *os.Root, rel string, limit int64) ([]byte, error) {
 	}
 	if int64(len(data)) > limit {
 		return nil, fmt.Errorf("%s exceeds the %d-byte limit", rel, limit)
+	}
+	afterFD, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !afterFD.Mode().IsRegular() || !os.SameFile(openedInfo, afterFD) ||
+		openedInfo.Size() != afterFD.Size() || !openedInfo.ModTime().Equal(afterFD.ModTime()) ||
+		int64(len(data)) != afterFD.Size() {
+		return nil, fmt.Errorf("%s changed while it was read", rel)
+	}
+	afterPath, err := root.Stat(rel)
+	if err != nil || !afterPath.Mode().IsRegular() || !os.SameFile(afterFD, afterPath) {
+		return nil, fmt.Errorf("%s changed while it was read", rel)
 	}
 	return data, nil
 }

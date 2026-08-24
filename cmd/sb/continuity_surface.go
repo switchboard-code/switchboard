@@ -11,10 +11,30 @@ import (
 // this message before any routing, token, context, or cost calculation, then
 // carry that exact value through to TurnMessage.
 func turnOpening(prompt string, images []provider.Image) provider.Message {
-	opening := provider.UserText(prompt)
+	return turnOpeningAuthored(prompt, prompt, images)
+}
+
+// turnOpeningAuthored keeps the provider request and the user-visible
+// projection together. Prompt may contain file attachments, shell output, or
+// other harness context; authored is the exact text the surface showed as the
+// user's instruction.
+func turnOpeningAuthored(prompt, authored string, images []provider.Image) provider.Message {
+	opening := provider.UserText(prompt).WithAuthoredText(authored)
 	for _, image := range images {
 		opening.Content = append(opening.Content, image)
 	}
+	return opening
+}
+
+// syntheticTurnOpening is opening-shaped for provider protocol compatibility,
+// but it is not attributed to the user. The durable bit, rather than matching
+// its text, lets compaction distinguish an automatic continuation from a user
+// who intentionally typed the same sentence.
+func syntheticTurnOpening(prompt string, images []provider.Image) provider.Message {
+	opening := turnOpeningAuthored(prompt, "", images)
+	opening.Authored = ""
+	opening.AuthoredKnown = false
+	opening.Synthetic = true
 	return opening
 }
 

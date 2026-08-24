@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 )
 
 func openStore(t *testing.T) (*Store, string) {
@@ -104,12 +106,14 @@ func TestFileCarriesTheHeaderAndTightPermissions(t *testing.T) {
 	if !strings.HasPrefix(string(data), "# Workspaces trusted") {
 		t.Error("the file must explain itself; it gets regenerated")
 	}
-	info, err := os.Stat(path)
+	f, err := fileprivacy.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("trust store is 0%o, want 0600", perm)
+	ownerOnly, ownerErr := fileprivacy.IsOwnerOnly(f)
+	closeErr := f.Close()
+	if ownerErr != nil || closeErr != nil || !ownerOnly {
+		t.Errorf("trust store owner-only=%v, check=%v, close=%v", ownerOnly, ownerErr, closeErr)
 	}
 }
 
@@ -146,9 +150,7 @@ func TestOpenRejectsUnsafeExistingTrustStores(t *testing.T) {
 	t.Run("symlink", func(t *testing.T) {
 		dir := t.TempDir()
 		target := filepath.Join(dir, "target.toml")
-		if err := os.WriteFile(target, []byte("[workspaces]\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		writePrivateTrustFile(t, target, []byte("[workspaces]\n"))
 		path := filepath.Join(dir, FileName)
 		if err := os.Symlink(target, path); err != nil {
 			t.Skipf("symlinks unavailable: %v", err)
@@ -159,13 +161,26 @@ func TestOpenRejectsUnsafeExistingTrustStores(t *testing.T) {
 	})
 	t.Run("oversized", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), FileName)
-		if err := os.WriteFile(path, []byte("#"+strings.Repeat("x", maxTrustFileBytes)), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		writePrivateTrustFile(t, path, []byte("#"+strings.Repeat("x", maxTrustFileBytes)))
 		if _, err := OpenFile(path); err == nil || !strings.Contains(err.Error(), "exceeds") {
 			t.Fatalf("OpenFile oversized = %v", err)
 		}
 	})
+}
+
+func writePrivateTrustFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	f, err := fileprivacy.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestNilStoreIsNeverTrusted(t *testing.T) {

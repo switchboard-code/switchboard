@@ -100,9 +100,14 @@ func findLines(store *session.Store, workspace, query string) []string {
 			lines = append(lines, fmt.Sprintf("  … more sessions match; a narrower query sees past the first %d", findMaxSessions))
 			break
 		}
-		label, _ := session.ReadOpening(info.Path)
+		opening, _ := session.ReadOpeningSummary(info.Path)
+		label := safeOpeningText(opening)
 		if label == "" {
-			label = "(no prompt recorded)"
+			if opening.Found {
+				label = "(authored wording unavailable for this legacy session)"
+			} else {
+				label = "(no prompt recorded)"
+			}
 		}
 		word := "match"
 		if hits > 1 {
@@ -110,7 +115,7 @@ func findLines(store *session.Store, workspace, query string) []string {
 		}
 		lines = append(lines,
 			fmt.Sprintf("  %s  %s  %d %s", state.ID, info.Modified.Local().Format("Jan 2 15:04"), hits, word),
-			"    "+truncate(label, 70),
+			"    "+redactCredentialTextBeforeTruncate(label, 70),
 			"    "+snippet)
 	}
 	if matched == 0 {
@@ -130,19 +135,37 @@ func searchMessages(messages []provider.Message, needle string) (int, string) {
 		if msg.Role != provider.RoleUser && msg.Role != provider.RoleAssistant {
 			continue
 		}
-		for _, b := range msg.Content {
-			text, ok := b.(provider.Text)
-			if !ok {
+		var texts []string
+		switch msg.Role {
+		case provider.RoleAssistant:
+			for _, block := range msg.Content {
+				if text, ok := block.(provider.Text); ok {
+					texts = append(texts, text.Text)
+				}
+			}
+		case provider.RoleUser:
+			// Search user-authored words, not provider-expanded files, shell
+			// output, carried synthetic context, or machine injections. A verified
+			// user steer remains authored conversation despite its injected wire
+			// position.
+			if msg.Synthetic || (msg.Injected && !msg.UserSteer) || (!msg.Injected && !session.OpensTurn(msg)) {
 				continue
 			}
-			for _, line := range strings.Split(text.Text, "\n") {
+			authored, known := msg.AuthoredProjection()
+			if !known {
+				continue
+			}
+			texts = append(texts, authored)
+		}
+		for _, text := range texts {
+			for _, line := range strings.Split(text, "\n") {
 				n := strings.Count(strings.ToLower(line), needle)
 				if n == 0 {
 					continue
 				}
 				hits += n
 				if snippet == "" {
-					snippet = truncate(strings.TrimSpace(line), 70)
+					snippet = redactCredentialTextBeforeTruncate(strings.TrimSpace(line), 70)
 				}
 			}
 		}
@@ -176,12 +199,12 @@ func runFindCLI(w io.Writer, store *session.Store, workspace, query string) erro
 	}
 	if rest, ok := strings.CutPrefix(query, "all "); ok {
 		for _, line := range findAllLines(store, strings.TrimSpace(rest)) {
-			fmt.Fprintln(w, strings.TrimRight(line, " "))
+			fmt.Fprintln(w, cliText(strings.TrimRight(line, " ")))
 		}
 		return nil
 	}
 	for _, line := range findLines(store, workspace, query) {
-		fmt.Fprintln(w, strings.TrimRight(line, " "))
+		fmt.Fprintln(w, cliText(strings.TrimRight(line, " ")))
 	}
 	return nil
 }

@@ -68,7 +68,7 @@ func TestSessionInvocationFlagsCannotFallThroughToSubcommands(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			input := []string{"-" + name}
 			switch name {
-			case "model", "tier", "p", "resume":
+			case "model", "tier", "p", "workflow", "resume":
 				input = append(input, "value")
 			case "mode":
 				input = append(input, "auto")
@@ -86,6 +86,100 @@ func TestSessionInvocationFlagsCannotFallThroughToSubcommands(t *testing.T) {
 				t.Fatalf("validateSubcommandFlags(%v) = %v", input, err)
 			}
 		})
+	}
+}
+
+func TestPromptAndWorkflowAreMutuallyExclusive(t *testing.T) {
+	opts, args, err := parseCLIOptions([]string{"-p", "fix it", "-workflow", "survey internal/agent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(args) != 0 {
+		t.Fatalf("unexpected positional arguments: %v", args)
+	}
+	err = validateSessionInvocation(opts)
+	if err == nil || !strings.Contains(err.Error(), "-p and -workflow") {
+		t.Fatalf("validateSessionInvocation = %v", err)
+	}
+}
+
+func TestExplicitEmptyPromptStillConflictsWithWorkflow(t *testing.T) {
+	opts, _, err := parseCLIOptions([]string{"-p=", "-workflow", "survey"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSessionInvocation(opts); err == nil {
+		t.Fatal("explicit -p was silently discarded in favor of -workflow")
+	}
+}
+
+func TestExplicitEmptyWorkflowCannotFallIntoAnInteractiveSession(t *testing.T) {
+	opts, _, err := parseCLIOptions([]string{"-workflow="})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSessionInvocation(opts); err == nil || !strings.Contains(err.Error(), "non-empty workflow name") {
+		t.Fatalf("empty workflow validation = %v", err)
+	}
+}
+
+func TestUnquotedWorkflowArgumentsCannotBeDroppedOrDispatched(t *testing.T) {
+	opts, args, err := parseCLIOptions([]string{"-workflow", "review", "internal/agent", "plugins"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSessionInvocation(opts); err != nil {
+		t.Fatal(err)
+	}
+	args = consumeWorkflowArguments(&opts, args)
+	if len(args) != 0 || opts.workflow != "review internal/agent plugins" {
+		t.Fatalf("normalized workflow = %q, args = %v", opts.workflow, args)
+	}
+}
+
+func TestWorkflowArgumentNamedHelpIsNotReparsedAsCLIHelp(t *testing.T) {
+	var out strings.Builder
+	for _, args := range [][]string{
+		{"-workflow", "review", "help"},
+		{"-workflow=review", "plugins", "--help"},
+		{"-workflow", "review", "--", "-h"},
+	} {
+		handled, err := handleCLIHelp(&out, args)
+		if handled || err != nil {
+			t.Fatalf("handleCLIHelp(%v) = handled %v, err %v", args, handled, err)
+		}
+	}
+}
+
+func TestWorkflowRejectsCompetingTerminalSessionSurfaces(t *testing.T) {
+	for _, flag := range []string{"-sessions", "-tiers", "-repl"} {
+		t.Run(flag, func(t *testing.T) {
+			opts, _, err := parseCLIOptions([]string{"-workflow", "review", flag})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validateSessionInvocation(opts); err == nil || !strings.Contains(err.Error(), flag) {
+				t.Fatalf("workflow with %s validation = %v", flag, err)
+			}
+		})
+	}
+}
+
+func TestHeadlessWorkflowNeverEntersInteractiveOnboarding(t *testing.T) {
+	terminal := func(opts options) bool {
+		return shouldRunOnboarding(opts, 0, true, true)
+	}
+	if !terminal(options{}) {
+		t.Fatal("a plain first interactive launch should still offer onboarding")
+	}
+	if terminal(options{workflow: "survey internal/agent"}) {
+		t.Fatal("a headless workflow would enter the interactive onboarding wizard")
+	}
+	if terminal(options{prompt: "inspect this"}) {
+		t.Fatal("a headless prompt would enter the interactive onboarding wizard")
+	}
+	if terminal(options{repl: true}) {
+		t.Fatal("an explicit REPL would enter the interactive onboarding wizard")
 	}
 }
 

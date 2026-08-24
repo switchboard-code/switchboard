@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 )
 
 func testPlugin(t *testing.T, root, seed string, executable bool) Plugin {
@@ -190,12 +192,14 @@ func TestStatePersistsDeterministicallyAndPrivately(t *testing.T) {
 		}
 	}
 
-	info, err := os.Stat(path)
+	f, err := fileprivacy.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := info.Mode().Perm(); got != 0o600 {
-		t.Fatalf("mode = %o, want 600", got)
+	ownerOnly, ownerErr := fileprivacy.IsOwnerOnly(f)
+	closeErr := f.Close()
+	if ownerErr != nil || closeErr != nil || !ownerOnly {
+		t.Fatalf("owner-only=%v, check=%v, close=%v", ownerOnly, ownerErr, closeErr)
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -230,9 +234,7 @@ func TestStateParsingFailsClosed(t *testing.T) {
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), StateFileName)
-			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-				t.Fatal(err)
-			}
+			writePrivateStateFile(t, path, []byte(body))
 			if _, err := OpenStateFile(path); err == nil {
 				t.Fatal("malformed state loaded")
 			}
@@ -247,9 +249,7 @@ func TestActivationRecoverySelectorsAreKeyedStableAndVersionOneMigrates(t *testi
 	firstPath := filepath.Join(t.TempDir(), StateFileName)
 	secondPath := filepath.Join(t.TempDir(), StateFileName)
 	for _, path := range []string{firstPath, secondPath} {
-		if err := os.WriteFile(path, []byte(activationJSON), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		writePrivateStateFile(t, path, []byte(activationJSON))
 	}
 	first, err := OpenStateFile(firstPath)
 	if err != nil {
@@ -325,6 +325,50 @@ func TestStateMutationReloadsLatestAcrossIndependentHandles(t *testing.T) {
 	}
 }
 
+func TestConcurrentIndependentStateHandlesPreserveEveryActivation(t *testing.T) {
+	const writers = 8
+	path := filepath.Join(t.TempDir(), StateFileName)
+	handles := make([]*State, writers)
+	candidates := make([]*ActivationCandidate, writers)
+	for i := range writers {
+		state, err := OpenStateFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		handles[i] = state
+		plugin := testPluginNamed(
+			t,
+			filepath.Join(t.TempDir(), fmt.Sprintf("plugin-%d", i)),
+			DialectClaude,
+			fmt.Sprintf("concurrent-%d", i),
+			ScopeUser,
+			fmt.Sprintf("content-%d", i),
+			false,
+		)
+		candidates[i] = testActivationCandidate(t, plugin)
+	}
+
+	results := make(chan error, writers)
+	for i := range writers {
+		go func() {
+			results <- handles[i].Enable(candidates[i], "")
+		}()
+	}
+	for range writers {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reopened, err := OpenStateFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activations := reopened.Activations(); len(activations) != writers {
+		t.Fatalf("concurrent activations = %d, want %d: %#v", len(activations), writers, activations)
+	}
+}
+
 func TestCancelledMutationWaitingForFileLockDoesNotCommit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), StateFileName)
 	state, err := OpenStateFile(path)
@@ -365,21 +409,19 @@ func TestCancelledMutationWaitingForFileLockDoesNotCommit(t *testing.T) {
 }
 
 func TestStateRejectsSymlinkAndLoosePermissions(t *testing.T) {
-	if os.PathSeparator == '\\' {
-		t.Skip("Windows permissions and symlinks have different semantics")
-	}
 	dir := t.TempDir()
 	real := filepath.Join(dir, "real.json")
 	body := []byte(`{"version":1,"activations":[]}`)
-	if err := os.WriteFile(real, body, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writePrivateStateFile(t, real, body)
 	link := filepath.Join(dir, "link.json")
 	if err := os.Symlink(real, link); err != nil {
-		t.Fatal(err)
+		t.Skipf("symlinks unavailable: %v", err)
 	}
 	if _, err := OpenStateFile(link); err == nil || !strings.Contains(err.Error(), "symbolic link") {
 		t.Fatalf("symlink error = %v", err)
+	}
+	if os.PathSeparator == '\\' {
+		return
 	}
 	if err := os.Chmod(real, 0o644); err != nil {
 		t.Fatal(err)
@@ -396,6 +438,9 @@ func TestFailedSaveRollsBackInMemoryActivation(t *testing.T) {
 	}
 	state, err := OpenStateFile(filepath.Join(parentFile, StateFileName))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(parentFile, pluginStateRecoveryDirectory)); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(parentFile); err != nil {
@@ -415,11 +460,92 @@ func TestFailedSaveRollsBackInMemoryActivation(t *testing.T) {
 
 func TestStateParsingBoundsInput(t *testing.T) {
 	path := filepath.Join(t.TempDir(), StateFileName)
-	if err := os.WriteFile(path, make([]byte, maxStateBytes+1), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writePrivateStateFile(t, path, make([]byte, maxStateBytes+1))
 	if _, err := OpenStateFile(path); err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestStateMutationRejectsOversizeBeforePublicationArtifacts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state", StateFileName)
+	state, err := OpenStateFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plugin := testPlugin(t, filepath.Join(t.TempDir(), "plugin"), "oversize", false)
+	candidate := testActivationCandidate(t, plugin)
+	hookCalled := false
+	pluginStateBeforePublicationTestHook = func() { hookCalled = true }
+	t.Cleanup(func() { pluginStateBeforePublicationTestHook = nil })
+	err = state.EnableWithNativeIDs(candidate, "", []string{strings.Repeat("n", maxStateBytes)})
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversize mutation error = %v", err)
+	}
+	if hookCalled {
+		t.Fatal("oversize mutation reached the publication seam")
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("oversize mutation created state: %v", err)
+	}
+	if got := state.Status(plugin, ""); got != (ActivationStatus{}) {
+		t.Fatalf("oversize mutation remained active in memory: %+v", got)
+	}
+	entries, err := os.ReadDir(filepath.Join(filepath.Dir(path), pluginStateRecoveryDirectory))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("oversize mutation left publication artifacts: %v", entries)
+	}
+}
+
+func TestPluginStateRecoveryDoesNotInspectAnotherAuthorityNamespace(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "state")
+	path := filepath.Join(parent, StateFileName)
+	state, err := OpenStateFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignDir := filepath.Join(parent, ".native-mcp-state-recovery")
+	if err := fileprivacy.EnsurePrivateDir(foreignDir); err != nil {
+		t.Fatal(err)
+	}
+	foreignLedger := filepath.Join(foreignDir, ".switchboard-undo-cleanup-"+strings.Repeat("a", 32))
+	foreignBytes := []byte("deliberately not a plugin-state cleanup ledger\n")
+	foreign, err := fileprivacy.Create(foreignLedger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := foreign.Write(foreignBytes); err != nil {
+		_ = foreign.Close()
+		t.Fatal(err)
+	}
+	if err := foreign.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	plugin := testPlugin(t, filepath.Join(t.TempDir(), "plugin"), "isolated-recovery", false)
+	if err := state.Enable(testActivationCandidate(t, plugin), ""); err != nil {
+		t.Fatalf("plugin mutation inspected another authority's ledger: %v", err)
+	}
+	got, err := os.ReadFile(foreignLedger)
+	if err != nil || string(got) != string(foreignBytes) {
+		t.Fatalf("foreign recovery ledger = %q, %v", got, err)
+	}
+}
+
+func writePrivateStateFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	f, err := fileprivacy.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

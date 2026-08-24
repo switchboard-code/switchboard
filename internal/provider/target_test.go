@@ -1,11 +1,40 @@
 package provider
 
 import (
+	"errors"
 	"math"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+type fixedOutputAllower struct {
+	Provider
+	allowance int
+	observed  *outputAllowanceCall
+}
+
+type outputAllowanceCall struct {
+	target     RouteTarget
+	catalogMax int
+}
+
+func (f fixedOutputAllower) OutputTokenAllowance(target RouteTarget, catalogMax int) int {
+	if f.observed != nil {
+		*f.observed = outputAllowanceCall{target: target, catalogMax: catalogMax}
+	}
+	return f.allowance
+}
+
+type fixedOutputResolver struct {
+	fixedOutputAllower
+	resolved int
+	err      error
+}
+
+func (f fixedOutputResolver) ResolveOutputTokenAllowance(RouteTarget, int) (int, error) {
+	return f.resolved, f.err
+}
 
 func TestRouteTargetIDSeparatesExplicitInferenceParameters(t *testing.T) {
 	base := RouteTarget{Provider: "openai", Surface: "api", ModelID: "gpt-test"}
@@ -167,28 +196,63 @@ func TestRouteTargetDisplayIsReadableAndUnambiguous(t *testing.T) {
 	}
 }
 
-func TestEffectiveOutputTokenReserveMatchesMessagesAdapter(t *testing.T) {
-	target := RouteTarget{Provider: "anthropic"}
-	if got := EffectiveOutputTokenReserve(target, 64_000); got != 8_192 {
-		t.Fatalf("default reserve = %d, want 8192", got)
+func TestEffectiveOutputTokenAllowanceUsesExplicitThenCatalogLimit(t *testing.T) {
+	target := RouteTarget{Provider: "generic"}
+	if got := EffectiveOutputTokenAllowance(nil, target, 64_000); got != 64_000 {
+		t.Fatalf("catalog allowance = %d, want 64000", got)
 	}
 	target.Params.MaxOutputTokens = 1_234
-	if got := EffectiveOutputTokenReserve(target, 64_000); got != 1_234 {
+	if got := EffectiveOutputTokenAllowance(nil, target, 64_000); got != 1_234 {
 		t.Fatalf("explicit reserve = %d, want 1234", got)
-	}
-	target.Params.Reasoning = &Reasoning{Enabled: true, Effort: "high"}
-	if got := EffectiveOutputTokenReserve(target, 64_000); got != 16_384+8_192 {
-		t.Fatalf("thinking reserve = %d, want adapter-raised allowance", got)
 	}
 }
 
-func TestEffectiveOutputTokenReserveFailsClosedWithoutADefault(t *testing.T) {
+func TestEffectiveOutputTokenAllowanceFailsClosedWithoutADefault(t *testing.T) {
 	target := RouteTarget{Provider: "openaicompat"}
-	if got := EffectiveOutputTokenReserve(target, 0); got != math.MaxInt {
+	if got := EffectiveOutputTokenAllowance(nil, target, 0); got != math.MaxInt {
 		t.Fatalf("unknown server default reserve = %d, want MaxInt", got)
 	}
 	target.Params.MaxOutputTokens = 2_048
-	if got := EffectiveOutputTokenReserve(target, 0); got != 2_048 {
+	if got := EffectiveOutputTokenAllowance(nil, target, 0); got != 2_048 {
 		t.Fatalf("explicit compatible reserve = %d, want 2048", got)
+	}
+}
+
+func TestEffectiveOutputTokenAllowanceGivesBoundAdapterFirstSay(t *testing.T) {
+	target := RouteTarget{Provider: "wire-specific"}
+	target.Params.MaxOutputTokens = 1_234
+	var observed outputAllowanceCall
+	bound := fixedOutputAllower{allowance: 7_777, observed: &observed}
+	if got := EffectiveOutputTokenAllowance(bound, target, 64_000); got != 7_777 {
+		t.Fatalf("bound adapter allowance = %d, want 7777 ahead of explicit and catalog values", got)
+	}
+	if !reflect.DeepEqual(observed.target, target) || observed.catalogMax != 64_000 {
+		t.Fatalf("adapter saw target=%+v catalogMax=%d, want target=%+v catalogMax=64000",
+			observed.target, observed.catalogMax, target)
+	}
+	target.Params.MaxOutputTokens = 0
+	if got := EffectiveOutputTokenAllowance(bound, target, 0); got != 7_777 {
+		t.Fatalf("bound adapter allowance = %d, want 7777 when generic evidence is unknown", got)
+	}
+}
+
+func TestOutputAllowanceResolverPreservesTypedErrorAtPreSendBoundary(t *testing.T) {
+	wantErr := errors.New("invalid wire parameters")
+	bound := fixedOutputResolver{
+		fixedOutputAllower: fixedOutputAllower{allowance: 7_777},
+		resolved:           8_888,
+		err:                wantErr,
+	}
+	target := RouteTarget{Provider: "wire-specific", Params: Params{MaxOutputTokens: 1_234}}
+	if got := EffectiveOutputTokenAllowance(bound, target, 64_000); got != math.MaxInt {
+		t.Fatalf("ranking allowance = %d, want unknown sentinel on typed conflict", got)
+	}
+	if _, err := ResolveOutputTokenAllowance(bound, target, 64_000); !errors.Is(err, wantErr) {
+		t.Fatalf("pre-send resolver error = %v, want %v", err, wantErr)
+	}
+
+	bound.err = nil
+	if got, err := ResolveOutputTokenAllowance(bound, target, 64_000); err != nil || got != 8_888 {
+		t.Fatalf("resolved allowance = %d, %v, want 8888 with resolver ahead of scalar allower", got, err)
 	}
 }

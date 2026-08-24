@@ -3,15 +3,36 @@ package bisect
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/switchboard-code/switchboard/internal/checkpoint"
+	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 )
 
 func state(content string) checkpoint.FileState {
 	return checkpoint.FileState{Existed: true, Mode: 0o644, Content: []byte(content)}
+}
+
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Clean(dir)
+}
+
+func configureRunner(t *testing.T, workspace string, runner *Runner) *Runner {
+	t.Helper()
+	runner.Workspace = workspace
+	runner.JournalDir = canonicalTempDir(t)
+	if err := fileprivacy.EnsurePrivateDir(runner.JournalDir); err != nil {
+		t.Fatal(err)
+	}
+	return runner
 }
 
 // probeByContent verifies by reading a file, the way a real verifier reads
@@ -31,7 +52,7 @@ func probeByContent(t *testing.T, path string) func(context.Context) Verdict {
 }
 
 func TestRunFindsTheTurnThatWentRed(t *testing.T) {
-	dir := t.TempDir()
+	dir := canonicalTempDir(t)
 	f := filepath.Join(dir, "f.go")
 	if err := os.WriteFile(f, []byte("broken\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -39,7 +60,7 @@ func TestRunFindsTheTurnThatWentRed(t *testing.T) {
 
 	// Four turns: before 0 and 1 the file was fine, turn 2 broke it, and
 	// it has been broken since.
-	r := &Runner{
+	r := configureRunner(t, dir, &Runner{
 		States: []map[string]checkpoint.FileState{
 			{f: state("fine v0\n")},
 			{f: state("fine v1\n")},
@@ -47,7 +68,7 @@ func TestRunFindsTheTurnThatWentRed(t *testing.T) {
 			{f: state("broken\n")}, // before turn 3 it was already broken
 		},
 		Verify: probeByContent(t, f),
-	}
+	})
 	res, err := r.Run(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -64,15 +85,15 @@ func TestRunFindsTheTurnThatWentRed(t *testing.T) {
 }
 
 func TestRunSaysGreenWhenNothingFails(t *testing.T) {
-	dir := t.TempDir()
+	dir := canonicalTempDir(t)
 	f := filepath.Join(dir, "f.go")
 	if err := os.WriteFile(f, []byte("fine\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	r := &Runner{
+	r := configureRunner(t, dir, &Runner{
 		States: []map[string]checkpoint.FileState{{f: state("fine v0\n")}},
 		Verify: probeByContent(t, f),
-	}
+	})
 	res, err := r.Run(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -86,15 +107,15 @@ func TestRunSaysGreenWhenNothingFails(t *testing.T) {
 }
 
 func TestRunSaysWhenTheBreakPredatesTheRecord(t *testing.T) {
-	dir := t.TempDir()
+	dir := canonicalTempDir(t)
 	f := filepath.Join(dir, "f.go")
 	if err := os.WriteFile(f, []byte("broken\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	r := &Runner{
+	r := configureRunner(t, dir, &Runner{
 		States: []map[string]checkpoint.FileState{{f: state("broken\n")}},
 		Verify: probeByContent(t, f),
-	}
+	})
 	res, err := r.Run(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -107,7 +128,7 @@ func TestRunSaysWhenTheBreakPredatesTheRecord(t *testing.T) {
 // A file a turn created restores to absent when probing before it, and
 // comes back when the bisect is done.
 func TestRunRemovesAndRestoresCreatedFiles(t *testing.T) {
-	dir := t.TempDir()
+	dir := canonicalTempDir(t)
 	f := filepath.Join(dir, "f.go")
 	created := filepath.Join(dir, "created.go")
 	if err := os.WriteFile(f, []byte("broken\n"), 0o644); err != nil {
@@ -117,7 +138,7 @@ func TestRunRemovesAndRestoresCreatedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	sawAbsent := false
-	r := &Runner{
+	r := configureRunner(t, dir, &Runner{
 		States: []map[string]checkpoint.FileState{
 			{f: state("fine\n"), created: {}}, // before turn 0, created.go was not there
 			{f: state("broken\n"), created: {}},
@@ -135,7 +156,7 @@ func TestRunRemovesAndRestoresCreatedFiles(t *testing.T) {
 			}
 			return Verdict{Passed: true}
 		},
-	}
+	})
 	res, err := r.Run(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -152,14 +173,14 @@ func TestRunRemovesAndRestoresCreatedFiles(t *testing.T) {
 }
 
 func TestRunRestoresOnCancellation(t *testing.T) {
-	dir := t.TempDir()
+	dir := canonicalTempDir(t)
 	f := filepath.Join(dir, "f.go")
 	if err := os.WriteFile(f, []byte("broken\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	probes := 0
-	r := &Runner{
+	r := configureRunner(t, dir, &Runner{
 		States: []map[string]checkpoint.FileState{
 			{f: state("fine v0\n")},
 			{f: state("fine v1\n")},
@@ -176,13 +197,41 @@ func TestRunRestoresOnCancellation(t *testing.T) {
 			}
 			return Verdict{Passed: true}
 		},
-	}
+	})
 	_, err := r.Run(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want the cancellation surfaced", err)
 	}
 	if got, _ := os.ReadFile(f); string(got) != "broken\n" {
 		t.Errorf("a cancelled bisect left the tree in the past: %q", got)
+	}
+}
+
+func TestRunRestoresTheExactCurrentMode(t *testing.T) {
+	dir := canonicalTempDir(t)
+	f := filepath.Join(dir, "mode.go")
+	currentMode := bisectRestorableMode(0o700 | fs.ModeSticky)
+	if err := os.WriteFile(f, []byte("broken\n"), currentMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(f, currentMode); err != nil {
+		t.Fatal(err)
+	}
+	r := configureRunner(t, dir, &Runner{
+		States: []map[string]checkpoint.FileState{{
+			f: {Existed: true, Mode: 0o600, Content: []byte("fine\n")},
+		}},
+		Verify: probeByContent(t, f),
+	})
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bisectRestorableMode(info.Mode()); got != currentMode {
+		t.Fatalf("restored mode = %v, want %v", got, currentMode)
 	}
 }
 
@@ -196,14 +245,14 @@ func TestRunWithNoTurnsRefuses(t *testing.T) {
 // A restore failure outranks any answer, cancellation included: the
 // caller must never be told less than that the tree is wrong.
 func TestRunSurfacesARestoreFailureBesideCancellation(t *testing.T) {
-	dir := t.TempDir()
+	dir := canonicalTempDir(t)
 	f := filepath.Join(dir, "f.go")
 	if err := os.WriteFile(f, []byte("broken\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	probes := 0
-	r := &Runner{
+	r := configureRunner(t, dir, &Runner{
 		States: []map[string]checkpoint.FileState{
 			{f: state("fine v0\n")},
 			{f: state("fine v1\n")},
@@ -227,7 +276,7 @@ func TestRunSurfacesARestoreFailureBesideCancellation(t *testing.T) {
 			}
 			return Verdict{FirstFail: "broken"}
 		},
-	}
+	})
 	_, err := r.Run(ctx)
 	var restoreFail *RestoreError
 	if !errors.As(err, &restoreFail) {

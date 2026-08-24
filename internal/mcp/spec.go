@@ -4,10 +4,13 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 )
 
 // SpecFileName is the file consulted in ~/.switchboard and in a workspace's
@@ -16,6 +19,8 @@ import (
 // TUI settings change, and a hand-maintained server list does not belong in
 // a file the program rewrites.
 const SpecFileName = "mcp.toml"
+
+const maxSpecFileBytes = 1 << 20
 
 type specEntry struct {
 	Command       string            `toml:"command"`
@@ -42,14 +47,30 @@ type specEntry struct {
 // LoadSpecs reads one server file. A missing file is an empty list, not an
 // error: most machines and most repositories have none.
 func LoadSpecs(path string) ([]Spec, error) {
+	return LoadSpecsRooted(filepath.Dir(path), filepath.Base(path))
+}
+
+// LoadSpecsRooted binds the declaration to an authority root. Repository
+// callers pass the workspace and user callers pass the home directory, so a
+// parent-directory rename cannot redirect the read outside that authority.
+func LoadSpecsRooted(root, name string) ([]Spec, error) {
+	return loadSpecsRootedWithHook(root, name, nil)
+}
+
+func loadSpecsRootedWithHook(root, name string, beforeOpen func()) ([]Spec, error) {
 	var file struct {
 		MCP map[string]specEntry `toml:"mcp"`
 	}
-	metadata, err := toml.DecodeFile(path, &file)
+	path := filepath.Join(root, filepath.FromSlash(name))
+	data, err := rootedfs.ReadFileWithHook(root, name, maxSpecFileBytes, beforeOpen)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
+		return nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+	metadata, err := toml.Decode(string(data), &file)
+	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 

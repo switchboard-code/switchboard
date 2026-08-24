@@ -43,11 +43,11 @@ func writeCLIError(w io.Writer, err error) int {
 	}
 	var parseErr *cliParseError
 	if errors.As(err, &parseErr) {
-		fmt.Fprintln(w, parseErr.Error())
+		fmt.Fprintln(w, cliText(parseErr.Error()))
 		writeRootHelp(w)
 		return 2
 	}
-	fmt.Fprintln(w, "sb: "+err.Error())
+	fmt.Fprintln(w, "sb: "+cliText(err.Error()))
 	return 1
 }
 
@@ -102,16 +102,19 @@ func run() error {
 		if v == "" {
 			v = "dev"
 		}
-		fmt.Println("sb " + v)
+		fmt.Println(cliText("sb " + v))
 		return nil
 	}
+	if err := validateSessionInvocation(opts); err != nil {
+		return err
+	}
+	args = consumeWorkflowArguments(&opts, args)
 	if err := validateSubcommandFlags(opts, args); err != nil {
 		return err
 	}
 	if handled, err := runCLISubcommand(context.Background(), os.Stdout, opts, args); handled {
 		return err
 	}
-
 	switch opts.output {
 	case "", "text":
 	case "json", "stream-json":
@@ -136,6 +139,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	workspace, err = filepath.EvalSymlinks(workspace)
+	if err != nil {
+		return fmt.Errorf("resolving workspace identity: %w", err)
+	}
+	workspace = filepath.Clean(workspace)
 
 	cat, err := catalog.Load()
 	if err != nil {
@@ -162,8 +170,34 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	retryRecovery, err := recoverInterruptedRetry(store, workspace)
+	if err != nil {
+		return err
+	}
+	retryRecoveryNotice := interruptedRetryRecoveryNotice(retryRecovery)
+	if retryRecoveryNotice != "" && (opts.list || opts.prompt != "" || opts.workflow != "") {
+		fmt.Fprintln(os.Stderr, "sb: "+cliText(retryRecoveryNotice))
+	}
 	if opts.list {
 		return listSessions(store, workspace)
+	}
+	id, status, unresolved, err := store.UnresolvedRetry(workspace)
+	if err != nil {
+		return fmt.Errorf("checking for an interrupted /retry handoff: %w", err)
+	}
+	if unresolved {
+		interactiveRetrySurface := !opts.repl && opts.prompt == "" && opts.workflow == "" && isTerminal(os.Stdin) && isTerminal(os.Stdout)
+		note, retryErr := constrainUnresolvedRetryStartup(&opts, id, status, interactiveRetrySurface)
+		if retryErr != nil {
+			return retryErr
+		}
+		if note != "" {
+			if retryRecoveryNotice == "" {
+				retryRecoveryNotice = note
+			} else {
+				retryRecoveryNotice += "; " + note
+			}
+		}
 	}
 
 	mode, err := permission.ParseMode(opts.mode)
@@ -178,9 +212,8 @@ func run() error {
 	// non-interactive path still gets the explanatory error from resolveTier,
 	// because a wizard on a pipe would hang whatever is driving it.
 	onboarded := false
-	if len(cfg.Tiers) == 0 && opts.model == "" && opts.resume == "" && !opts.cont &&
-		!opts.repl && opts.prompt == "" && isTerminal(os.Stdin) && isTerminal(os.Stdout) {
-		if err := runOnboarding(reg, cat, cfg); err != nil {
+	if shouldRunOnboarding(opts, len(cfg.Tiers), isTerminal(os.Stdin), isTerminal(os.Stdout)) {
+		if err := runOnboarding(reg, cat, cfg, workspace); err != nil {
 			return err
 		}
 		onboarded = true
@@ -191,7 +224,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer sess.Close()
+	// A newly created startup log stays hidden until the complete runtime is
+	// assembled. Any return before durable publication discards the owned stage, so a failed
+	// MCP/LSP/tool setup cannot replace a real prior session under --continue.
+	defer sess.CloseDiscardingStaged()
 
 	capability := execution.Detect()
 	sandboxMode := cfg.Sandbox
@@ -217,6 +253,13 @@ func run() error {
 	// The undo recorder captures prior file states before write and edit
 	// mutate them, scoped per turn by the loop.
 	undoRec := checkpoint.NewRecorder()
+	cleanupDir, err := store.WorkspaceDir(workspace)
+	if err != nil {
+		return fmt.Errorf("opening checkpoint cleanup directory: %w", err)
+	}
+	if err := undoRec.ConfigureRestoreCleanup(cleanupDir, workspace); err != nil {
+		return err
+	}
 	registry.SetCheckpoints(undoRec)
 
 	// Structural search joins the suite only where the machine has the
@@ -254,11 +297,11 @@ func run() error {
 	// Whether anyone can answer a question is settled here, before the servers
 	// connect, because the elicitation capability is declared at initialize
 	// and a client that advertised it with no user attached would be promising
-	// an answer it cannot produce. Piped -p is the surface with no one to ask,
-	// the same condition that leaves the asker unset further down; every other
-	// surface gets a relay now and fills it when its dialog exists.
+	// an answer it cannot produce. Piped -p and headless workflows are surfaces
+	// with no one to ask, the same condition that leaves the permission asker
+	// unset further down. Every other surface gets a relay for its dialog.
 	var questions *questionRelay
-	if opts.prompt == "" || isTerminal(os.Stdin) {
+	if plainSurfaceCanAsk(opts, isTerminal(os.Stdin)) {
 		questions = &questionRelay{}
 		registry.SetQuestioner(questions)
 	}
@@ -284,6 +327,9 @@ func run() error {
 		return err
 	}
 	defer mcpEnv.Close()
+	if retryRecoveryNotice != "" && opts.prompt == "" && opts.workflow == "" {
+		mcpEnv.add(mcpNote{"warn", retryRecoveryNotice})
+	}
 	// Whatever exec left running goes with the session. A background process
 	// this program started and then forgot is this program's fault, and the
 	// exit is the last moment it can still be sure the group is its own.
@@ -325,16 +371,6 @@ func run() error {
 		mcpEnv.add(mcpNote{"", lspNote})
 	}
 
-	// A fallback substitution renders before any content is sent and is
-	// recorded on the session (§5.4): the user must know which server this
-	// conversation is actually going to.
-	if fallbackNote != "" {
-		mcpEnv.add(mcpNote{"warn", fallbackNote})
-		if err := sess.AppendNote("warn", fallbackNote); err != nil {
-			return err
-		}
-	}
-
 	// §6 is only live if something wires it. The loop assembles a request from
 	// the session by default, so without this the zones, the breakpoint
 	// manager, and the tracker are all present and never consulted.
@@ -358,6 +394,10 @@ func run() error {
 		System:      agent.SystemPrompt(workspace, mode, capability),
 		Hooks:       hookSet,
 		Checkpoints: undoRec,
+		ContextWindow: func(target provider.RouteTarget) int {
+			return effectiveContextWindow(cfg, reg, cat, target)
+		},
+		OutputAllowance: reg.outputTokenAllowance,
 	}
 	// Even the initial process binding goes through the session boundary: a
 	// resumed continuity capsule hydrates its todo list, while a fresh or
@@ -372,7 +412,6 @@ func run() error {
 	budget := &budgetState{}
 	budget.set(cfg.Budget)
 	wireBudget(loop, primaryGate(budget, loop, cat))
-	wireCommandReviewer(loop, cfg, cat, reg, tier, budget)
 
 	// The delegate tool joins after the loop exists because its subagents
 	// share the loop's permission engine and asker; it still lands before the
@@ -383,6 +422,26 @@ func run() error {
 	}
 	for _, n := range agentNotes {
 		mcpEnv.add(mcpNote{"warn", n})
+	}
+
+	// Resume is admitted only after the exact frozen system and tool zones have
+	// been assembled. The preliminary binding above exists solely so runtime
+	// components can be constructed; no resumed binding is recorded until the
+	// full replay passes destination, capability, context/output, and remaining
+	// hard-budget checks against the concrete primary or availability fallback.
+	if resumed {
+		tier, client, fallbackNote, err = finalizeStartupResume(ctx, sess, loop, cfg, cat, reg, budget, &opts)
+		if err != nil {
+			return err
+		}
+	}
+	wireCommandReviewer(loop, cfg, cat, reg, tier, budget)
+
+	// A fallback substitution renders before any content is sent and is
+	// recorded on the session (§5.4): the user must know which server this
+	// conversation is actually going to.
+	if fallbackNote != "" {
+		mcpEnv.add(mcpNote{"warn", fallbackNote})
 	}
 
 	// The sticky primary starts wherever routing landed, and the watcher feeds
@@ -408,7 +467,16 @@ func run() error {
 	// The TUI is the default interactive surface; the REPL remains for
 	// scripting, for gates, and for terminals that are not terminals. A single
 	// -p prompt keeps the plain renderer either way.
-	if !opts.repl && opts.prompt == "" && isTerminal(os.Stdin) && isTerminal(os.Stdout) {
+	tuiSurface := !opts.repl && opts.prompt == "" && opts.workflow == "" && isTerminal(os.Stdin) && isTerminal(os.Stdout)
+	if intent := sess.State().RetryIntent; intent != nil && !tuiSurface {
+		action := "show the explicit recovery action"
+		if intent.Status == session.RetryIntentPending {
+			action = "resume its proven-unstarted replay"
+		}
+		return fmt.Errorf("session %s has an unresolved /retry handoff (%s); reopen it in the interactive TUI so Switchboard can %s without duplicating provider or tool work",
+			sess.ID(), intent.Status, action)
+	}
+	if tuiSurface {
 		updateCheck := cfg.UpdateCheck && os.Getenv("SB_NO_UPDATE_CHECK") == ""
 		return runTUI(loop, store, cfg, cat, capability, workspace, tier, reg, sticky, routeDec, sess, resumed, updateCheck, trustStore, trustErr, mcpEnv, lspServer, lspNote, undoRec, agents, agentNotes, budget, skillList, onboarded, questions, ruleSetForSession)
 	}
@@ -431,27 +499,19 @@ func run() error {
 	// needing approval is refused with a reason rather than answered by
 	// whatever bytes happened to be next in the pipe. Widening -mode is the
 	// deliberate way to let a scripted run do more.
+	authoredPrompt := opts.prompt
 	piped := opts.prompt != "" && !isTerminal(os.Stdin)
 	if piped {
-		data, err := io.ReadAll(os.Stdin)
+		data, err := readPipedInput(os.Stdin)
 		if err != nil {
-			return fmt.Errorf("reading piped stdin: %w", err)
+			return err
 		}
 		opts.prompt = attachPipedInput(opts.prompt, data)
 	} else {
-		loop.Asker = &terminalAsker{in: in, out: out}
-		// The ask tool follows the asker: a surface that can answer a
-		// permission prompt can answer a question, and the piped run that
-		// left the asker unset built no relay above, so the tool refuses with
-		// the reason rather than reading an answer out of the pipe.
-		questions.set(&terminalQuestioner{in: in, out: out})
+		attachPlainSurfaceRelays(opts, isTerminal(os.Stdin), loop, questions, in, out)
 	}
-	var observer agent.Observer = out
-	if opts.output == "stream-json" {
-		stream := newStreamObserver(os.Stdout, out)
-		stream.writeStreamInit(sess.ID(), tier.ID, string(tier.Target.ID()), string(mode))
-		observer = stream
-	}
+	observer := selectPlainObserver(opts.output, os.Stdout, out,
+		sess.ID(), tier.ID, string(tier.Target.ID()), string(mode))
 	loop.SetObserver(observer)
 	subagentForward.set(out)
 
@@ -471,7 +531,7 @@ func run() error {
 	}
 	r.route = routeDec
 	r.sticky = sticky
-	r.watcher = newWatcher(out, sticky, len(cfg.Tiers)-1, r.moveTo)
+	r.watcher = newWatcher(observer, sticky, len(cfg.Tiers)-1, r.moveTo)
 	r.watcher.setPaused(!cfg.RouteAutoOn())
 	loop.SetObserver(r.watcher)
 
@@ -482,9 +542,7 @@ func run() error {
 	// workspace's lock for nothing and print a feature notice on a surface
 	// that cannot use it.
 	if opts.prompt == "" && opts.workflow == "" {
-		if dir, err := store.WorkspaceDir(workspace); err != nil {
-			r.schedulesErr = ": " + err.Error()
-		} else if ledger, err := schedule.Open(dir); err != nil {
+		if ledger, err := openWorkspaceSchedule(store, workspace); err != nil {
 			if errors.Is(err, schedule.ErrLocked) {
 				r.schedulesErr = ": another sb process in this workspace holds them"
 			} else {
@@ -496,6 +554,13 @@ func run() error {
 		}
 	}
 
+	// Scripted startup can still fail without sending a turn: a secret gate may
+	// refuse -p, or a workflow name/runner may be unavailable. Resolve those
+	// facts before publication so the rejected empty child cannot replace the
+	// previous real session as --continue's Latest candidate.
+	if err := publishSessionAfterStartupPreflight(sess, opts.prompt, opts.allowSecrets, opts.workflow); err != nil {
+		return err
+	}
 	r.banner(sess, resumed)
 	if r.schedulesErr != "" {
 		out.Notice("warn", "schedules are unavailable"+r.schedulesErr)
@@ -514,17 +579,11 @@ func run() error {
 	// because it needs the ladder, the permission engine, and the budget the
 	// session was built with.
 	if opts.workflow != "" {
-		return runHeadlessWorkflow(ctx, out, opts.workflow)
+		return runHeadlessWorkflow(ctx, out, opts.workflow, opts.allowSecrets)
 	}
 
 	if opts.prompt != "" {
-		// The gate has no one to ask on this surface, so a key-shaped string
-		// refuses the run outright; -allow-secrets is the deliberate widening,
-		// the way -mode is for permissions.
-		if err := refuseLeakedSecrets(opts.prompt, opts.allowSecrets); err != nil {
-			return err
-		}
-		err := r.once(ctx, opts.prompt)
+		err := r.onceAuthored(ctx, opts.prompt, authoredPrompt)
 		if opts.output == "json" || opts.output == "stream-json" {
 			rep := buildHeadlessReport(loop.Session.State(), cat, r.tier, err)
 			rep.PermissionMode = string(loop.Perms.Mode())
@@ -546,6 +605,67 @@ func run() error {
 		return err
 	}
 	return r.interactive(ctx)
+}
+
+func shouldRunOnboarding(opts options, tierCount int, stdinTerminal, stdoutTerminal bool) bool {
+	return tierCount == 0 && opts.model == "" && opts.resume == "" && !opts.cont &&
+		!opts.repl && opts.prompt == "" && opts.workflow == "" && stdinTerminal && stdoutTerminal
+}
+
+// plainSurfaceCanAsk is false for every -workflow invocation, even from a
+// terminal. The headless workflow flag promises an unattended surface; its
+// delegates inherit the primary loop's nil asker and therefore fail closed on
+// an approval instead of stealing bytes from stdin or hanging a CI job.
+func plainSurfaceCanAsk(opts options, stdinTerminal bool) bool {
+	return opts.workflow == "" && (opts.prompt == "" || stdinTerminal)
+}
+
+func attachPlainSurfaceRelays(opts options, stdinTerminal bool, loop *agent.Loop, questions *questionRelay, in *bufio.Reader, out *renderer) {
+	if !plainSurfaceCanAsk(opts, stdinTerminal) {
+		return
+	}
+	loop.Asker = &terminalAsker{in: in, out: out}
+	// The ask tool follows the asker: a surface that can answer a permission
+	// prompt can answer a question. An unattended surface built no relay above,
+	// so its tool refuses rather than reading an answer out of the input stream.
+	if questions != nil {
+		questions.set(&terminalQuestioner{in: in, out: out})
+	}
+}
+
+func publishSessionAfterStartupPreflight(sess *session.Session, prompt string, allowSecrets bool, workflow string) error {
+	if workflow != "" {
+		if _, err := prepareHeadlessWorkflow(workflow, allowSecrets); err != nil {
+			return err
+		}
+	}
+	if prompt != "" {
+		// The gate has no one to ask on this surface, so a key-shaped string
+		// refuses the run outright; -allow-secrets is the deliberate widening,
+		// the way -mode is for permissions.
+		if err := refuseLeakedSecrets(prompt, allowSecrets); err != nil {
+			return err
+		}
+	}
+	if sess.PublicationPending() {
+		if err := publishSessionDurably(sess, "assembled session"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// publishSessionDurably keeps a visibility-uncertain failure out of the
+// rollback path. Once a marker is discoverable the session has been adopted,
+// even if its persistence barrier failed; the only honest response is to stop
+// and require a restart, leaving the visible log intact for recovery.
+func publishSessionDurably(sess *session.Session, label string) error {
+	outcome, err := sess.PublishDurably()
+	disposition, resultErr := publicationResult(outcome, err, label)
+	if disposition == publicationDurable {
+		return nil
+	}
+	return resultErr
 }
 
 func validateExecutionPosture(mode permission.Mode, sandbox execution.SandboxMode) error {
@@ -579,7 +699,7 @@ func openSession(
 	)
 	switch {
 	case opts.resume != "":
-		sess, err = store.Open(opts.resume)
+		sess, err = store.OpenInWorkspace(opts.resume, workspace)
 	case opts.cont:
 		sess, err = store.Latest(workspace)
 		if errors.Is(err, session.ErrNoSessions) {
@@ -590,12 +710,12 @@ func openSession(
 		if buildErr != nil {
 			return nil, config.Tier{}, nil, false, "", buildErr
 		}
-		sess, err = store.Create(workspace, tier.Target.ID(), cat.Revision)
+		sess, err = store.CreateStaged(workspace, tier.Target.ID(), cat.Revision)
 		if err == nil {
-			err = persistRuntimeBinding(sess, tier, opts.tier != "" || opts.model != "")
+			err = persistRuntimeBindingFallback(sess, tier, opts.tier != "" || opts.model != "", note)
 		}
 		if err != nil && sess != nil {
-			_ = sess.Close()
+			_ = sess.CloseDiscardingStaged()
 		}
 		return sess, tier, client, false, note, err
 	}
@@ -603,33 +723,25 @@ func openSession(
 	if err != nil {
 		return nil, config.Tier{}, nil, false, "", err
 	}
-
 	state := sess.State()
-	var tier config.Tier
+	tier, configured, err := resumeTier(cfg, state, opts)
 	var client provider.Provider
 	var note string
-	if opts.model != "" || opts.tier != "" {
-		tier, client, note, err = resolveTier(ctx, reg, cfg, cat, opts, "", chosen)
-	} else {
-		var configured bool
-		tier, configured, err = tierForSessionState(cfg, state)
-		if err == nil {
-			if configured {
-				tier, client, note, err = reg.probeTierFallback(ctx, tier)
-			} else {
-				tier, client, err = reg.probeTier(ctx, tier)
-			}
+	if err == nil {
+		if configured {
+			tier, client, note, err = reg.probeTierFallback(ctx, tier)
+		} else {
+			tier, client, err = reg.probeTier(ctx, tier)
 		}
 	}
 	if err != nil {
 		sess.Close()
 		return nil, config.Tier{}, nil, false, "", err
 	}
-	pinned := opts.model != "" || opts.tier != "" || (state.RuntimeBinding.Target != "" && state.RuntimeBinding.Pinned)
-	if err := persistRuntimeBinding(sess, tier, pinned); err != nil {
-		sess.Close()
-		return nil, config.Tier{}, nil, false, "", fmt.Errorf("saving resumed runtime binding: %w", err)
-	}
+	// This is deliberately a probe-only preliminary binding. Startup still has
+	// to assemble MCP, LSP, skills, delegate, and the exact frozen system zone;
+	// finalizeStartupResume validates that complete replay and is the only place
+	// that records the resumed runtime binding.
 	return sess, tier, client, true, note, nil
 }
 
@@ -696,7 +808,7 @@ func resolveTier(ctx context.Context, reg *providers, cfg *config.Config, cat *c
 	bootstrapRequest := provider.Request{Messages: []provider.Message{provider.UserText(opts.prompt)}}
 	input := route.Input{
 		Prompt:     opts.prompt,
-		Candidates: candidatesForContext(cfg, cat, prefix.RequestTokens(bootstrapRequest), prefix.RequestTokenCeiling(bootstrapRequest), nil),
+		Candidates: withLiveCandidateCapabilities(candidatesForContext(cfg, cat, prefix.RequestTokens(bootstrapRequest), prefix.RequestTokenCeiling(bootstrapRequest), nil), reg),
 		// Tool capability is established by the live probe below. Applying the
 		// catalog filter first would make an unlisted but tool-capable local model
 		// impossible to bootstrap in headless mode.
@@ -867,11 +979,14 @@ func noTargetError(ctx context.Context, client *ollama.Client, cfg *config.Confi
 	var b strings.Builder
 	b.WriteString("no tiers configured and no -model given.\n")
 	if cfg.Path != "" {
-		fmt.Fprintf(&b, "\nConfigure a ladder in %s:\n\n", cfg.Path)
+		fmt.Fprintf(&b, "\nConfigure a ladder in %s:\n\n", cliText(cfg.Path))
 		b.WriteString("  [tiers.t1]\n  label = \"light\"\n  model = \"ollama/<model>\"\n\n")
 		b.WriteString("  [tiers.t2]\n  label = \"deep\"\n  model = \"ollama/<model>\"\n")
 	}
 	if len(models) > 0 {
+		for i := range models {
+			models[i] = cliText(models[i])
+		}
 		fmt.Fprintf(&b, "\nModels this server has pulled:\n  %s", strings.Join(models, "\n  "))
 	}
 	return errors.New(b.String())
@@ -879,12 +994,12 @@ func noTargetError(ctx context.Context, client *ollama.Client, cfg *config.Confi
 
 func listTiers(cfg *config.Config, cat *catalog.Catalog) error {
 	if len(cfg.Tiers) == 0 {
-		fmt.Printf("no tiers configured in %s\n", cfg.Path)
+		fmt.Printf("no tiers configured in %s\n", cliText(cfg.Path))
 		return nil
 	}
-	fmt.Printf("catalog %s (%s)\n\n", cat.Revision, cat.Source)
+	fmt.Printf("catalog %s (%s)\n\n", cliText(cat.Revision), cliText(cat.Source))
 	for _, t := range cfg.Tiers {
-		fmt.Println(t)
+		fmt.Println(cliText(t.String()))
 		info, confidence, ok := cat.Lookup(t.Target)
 		if !ok {
 			fmt.Println("      no catalog entry")
@@ -924,17 +1039,18 @@ func listSessions(store *session.Store, workspace string) error {
 		return err
 	}
 	if len(infos) == 0 {
-		fmt.Printf("no sessions recorded for %s\n", workspace)
+		fmt.Printf("no sessions recorded for %s\n", cliText(workspace))
 		return nil
 	}
 	for _, info := range infos {
 		// The same first-words label the /resume picker shows; the read
 		// stops at the head of each log and takes no lock.
-		line := fmt.Sprintf("%s  %s  %d bytes", info.ID, info.Modified.Local().Format("2006-01-02 15:04:05"), info.Size)
+		line := fmt.Sprintf("%s  %s  %d bytes  %s", info.ID, info.Modified.Local().Format("2006-01-02 15:04:05"), info.Size,
+			resumeHealthChips(info.Health, true))
 		if opening := openingLabel(info.Path); opening != "" {
 			line += "  " + opening
 		}
-		fmt.Println(line)
+		fmt.Println(cliText(line))
 	}
 	return nil
 }

@@ -9,9 +9,44 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/switchboard-code/switchboard/internal/workspace"
 )
+
+func TestWorkspaceFitPreservesGraphemeClusters(t *testing.T) {
+	got := workspaceFit("x🧑🏽‍💻suffix", 4)
+	if ansi.StringWidth(got) > 4 {
+		t.Fatalf("fitted workspace label is %d cells: %q", ansi.StringWidth(got), got)
+	}
+	if got != "x🧑🏽‍💻…" {
+		t.Fatalf("workspace fit split a grapheme: %q", got)
+	}
+}
+
+func TestWorkspaceLoadingRowsFitTinyWidths(t *testing.T) {
+	for _, width := range []int{1, 2, 10} {
+		v := &workspaceView{loading: "loading workspace source"}
+		assertTUIViewBounds(t, v.listView(width, 2, darkTheme(), false), width, 2)
+
+		v = &workspaceView{rows: []workspaceRow{{location: workspace.Location{Path: "main.go"}}}}
+		assertTUIViewBounds(t, v.previewView(width, 2, darkTheme()), width, 2)
+	}
+}
+
+func TestWorkspaceSanitizeExposesTerminalAndBidiControls(t *testing.T) {
+	got := workspaceSanitize("safe\x1b]2;forged\a\u202e.go\nnext")
+	for _, unsafe := range []string{"\x1b", "\a", "\u202e", "\n"} {
+		if strings.Contains(got, unsafe) {
+			t.Fatalf("workspace text retained control %q: %q", unsafe, got)
+		}
+	}
+	for _, visible := range []string{`\x1b`, `\x07`, `\u202e`, `\x0a`} {
+		if !strings.Contains(got, visible) {
+			t.Fatalf("workspace text hid %q: %q", visible, got)
+		}
+	}
+}
 
 func workspaceModel(t *testing.T, root string) *tuiModel {
 	t.Helper()
@@ -375,13 +410,98 @@ func TestWorkspaceEditorRefusesChangedRevision(t *testing.T) {
 	}
 }
 
+func TestWorkspaceEditorReturnInvalidatesEvenAfterError(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := workspaceModel(t, root)
+	drainWorkspace(t, m, cmdFiles(m, "main.go"))
+	v := activeWorkspaceView(t, m)
+	oldGeneration := v.generation
+	oldPreviewRequest := v.previewRequest
+	beforeEpoch := m.workspaceRuntime.epoch.Load()
+
+	cmd := m.onWorkspaceEditorDone(workspaceEditorDoneMsg{
+		view: v, sessionID: v.sessionID, generation: oldGeneration,
+		path: "main.go", err: errors.New("editor exited after saving"),
+	})
+	if !v.stale || !v.previewStale {
+		t.Fatalf("failed editor return stale=%v previewStale=%v, want both", v.stale, v.previewStale)
+	}
+	if v.generation == oldGeneration || v.previewRequest == oldPreviewRequest {
+		t.Fatalf("failed editor return kept old async binding: generation=%d request=%d", v.generation, v.previewRequest)
+	}
+	if got := m.workspaceRuntime.epoch.Load(); got != beforeEpoch+1 {
+		t.Fatalf("workspace epoch = %d, want %d", got, beforeEpoch+1)
+	}
+	if msg, ok := cmd().(noticeMsg); !ok || msg.level != "error" {
+		t.Fatalf("failed editor return notice = %#v", msg)
+	}
+
+	// A preview already in flight when the editor opened cannot repaint the
+	// stale panel with the pre-editor document after the process returns.
+	beforeContent := string(v.preview.Content)
+	_, _ = m.Update(workspacePreviewMsg{
+		view: v, sessionID: v.sessionID, generation: oldGeneration,
+		request: oldPreviewRequest, expected: workspace.Location{Path: "main.go"},
+		document: workspace.Document{Location: workspace.Location{Path: "main.go"}, Content: []byte("old\n")},
+	})
+	if string(v.preview.Content) != beforeContent {
+		t.Fatal("a pre-editor preview repainted the panel after invalidation")
+	}
+}
+
 func TestWorkspaceInvalidationMessageMarksIndexDirtyAfterBatchBoundary(t *testing.T) {
 	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	m := workspaceModel(t, root)
-	drainWorkspace(t, m, cmdFiles(m, ""))
+	drainWorkspace(t, m, cmdFiles(m, "main.go"))
+	v := activeWorkspaceView(t, m)
+	if close, cmd := v.key(tea.KeyMsg{Type: tea.KeyEnter}); close || cmd != nil || !v.source {
+		t.Fatalf("enter source = close %v cmd %v source %v", close, cmd != nil, v.source)
+	}
 	before := m.workspaceRuntime.epoch.Load()
 	_, _ = m.Update(workspaceInvalidatedMsg{})
 	if after := m.workspaceRuntime.epoch.Load(); after != before+1 {
 		t.Fatalf("invalidation epoch = %d, want %d", after, before+1)
+	}
+	if !v.stale || !v.previewStale {
+		t.Fatalf("active source was not visibly invalidated: stale=%v previewStale=%v", v.stale, v.previewStale)
+	}
+	if view := stripANSI(v.view(90, 12, darkTheme())); !strings.Contains(view, "stale: reopen before editing") {
+		t.Fatalf("stale source did not explain how to refresh it:\n%s", view)
+	}
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if cmd == nil {
+		t.Fatal("stale source silently accepted navigation")
+	}
+	result := cmd()
+	if notice, ok := result.(noticeMsg); !ok || notice.level != "warn" || !strings.Contains(notice.text, "workspace changed") {
+		t.Fatalf("stale source action = %#v, want refresh warning", result)
+	}
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	if m.full != nil {
+		t.Fatal("q did not close the stale source panel")
+	}
+}
+
+func TestWorkspaceInvalidationRejectsPendingPanelLoad(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "late.go"), []byte("package late\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := workspaceModel(t, root)
+	cmd := cmdFiles(m, "late")
+	v := activeWorkspaceView(t, m)
+	_, _ = m.Update(workspaceInvalidatedMsg{})
+	if !v.stale {
+		t.Fatal("pending workspace panel was not marked stale")
+	}
+	_, follow := m.Update(cmd())
+	if follow != nil || len(v.rows) != 0 {
+		t.Fatalf("pre-invalidation load landed after the boundary: follow=%v rows=%+v", follow != nil, v.rows)
 	}
 }

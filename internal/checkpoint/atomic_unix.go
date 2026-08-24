@@ -2,14 +2,8 @@
 
 package checkpoint
 
-import "os"
-
-func replacePath(from, to string) error {
-	return os.Rename(from, to)
-}
-
 func syncDirectory(path string) error {
-	dir, err := os.Open(path)
+	dir, err := openCheckpointPathRead(path)
 	if err != nil {
 		return err
 	}

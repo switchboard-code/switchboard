@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -89,8 +90,8 @@ func (f diskFile) sameContent(other diskFile) bool {
 	return f.mode == other.mode && f.digest == other.digest
 }
 
-func readDiskFile(path string) (diskFile, error) {
-	linfo, err := os.Lstat(path)
+func readDiskFile(parent *os.Root, leaf, display string, beforeOpen func()) (diskFile, error) {
+	linfo, err := parent.Lstat(leaf)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return diskFile{}, nil
@@ -98,32 +99,36 @@ func readDiskFile(path string) (diskFile, error) {
 		return diskFile{}, err
 	}
 	if !linfo.Mode().IsRegular() {
-		return diskFile{}, fmt.Errorf("%s is not a regular file", path)
+		return diskFile{}, fmt.Errorf("%s is not a regular file", display)
+	}
+	if linfo.Size() > maxWorkspaceFileBytes {
+		return diskFile{}, fmt.Errorf("%s is %d bytes; mutation file limit is %d", display, linfo.Size(), maxWorkspaceFileBytes)
 	}
 
-	f, err := os.Open(path)
+	f, opened, err := openRegularWorkspaceFile(parent, leaf, display, linfo, beforeOpen)
 	if err != nil {
 		return diskFile{}, err
 	}
 	defer f.Close()
-	opened, err := f.Stat()
+	content, err := io.ReadAll(io.LimitReader(f, maxWorkspaceFileBytes+1))
 	if err != nil {
 		return diskFile{}, err
 	}
-	if !os.SameFile(linfo, opened) {
-		return diskFile{}, fmt.Errorf("%s changed identity while it was opened", path)
-	}
-	content, err := io.ReadAll(f)
-	if err != nil {
-		return diskFile{}, err
+	if int64(len(content)) > maxWorkspaceFileBytes {
+		return diskFile{}, fmt.Errorf("%s grew beyond the %d-byte mutation file limit", display, maxWorkspaceFileBytes)
 	}
 	finished, err := f.Stat()
 	if err != nil {
 		return diskFile{}, err
 	}
 	if !os.SameFile(opened, finished) || opened.Size() != finished.Size() ||
-		!opened.ModTime().Equal(finished.ModTime()) || restorableFileMode(opened.Mode()) != restorableFileMode(finished.Mode()) {
-		return diskFile{}, fmt.Errorf("%s changed while it was being read", path)
+		finished.Size() != int64(len(content)) || !opened.ModTime().Equal(finished.ModTime()) ||
+		restorableFileMode(opened.Mode()) != restorableFileMode(finished.Mode()) {
+		return diskFile{}, fmt.Errorf("%s changed while it was being read", display)
+	}
+	linked, linkErr := parent.Lstat(leaf)
+	if linkErr != nil || !linked.Mode().IsRegular() || !os.SameFile(finished, linked) {
+		return diskFile{}, errors.Join(linkErr, fmt.Errorf("%s changed identity while it was being read", display))
 	}
 	return diskFile{
 		existed: true,
@@ -134,13 +139,14 @@ func readDiskFile(path string) (diskFile, error) {
 	}, nil
 }
 
-func restorableFileMode(mode fs.FileMode) fs.FileMode {
-	return mode & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky)
-}
-
 type fileMutation struct {
 	r            *Registry
 	abs          string
+	root         *os.Root
+	parent       *os.Root
+	parentInfo   fs.FileInfo
+	parentRel    string
+	leaf         string
 	before       diskFile
 	readToken    string
 	readTokenSet bool
@@ -159,25 +165,55 @@ func (r *Registry) prepareFileMutation(abs string, allowMissing bool) (*fileMuta
 	// it. A genuinely sequential follow-up observes the updated token here.
 	recorded, versionKnown := r.versions.get(abs)
 	unlock := lockPath(abs)
+	var root *os.Root
+	var parent *os.Root
 	fail := func(format string, args ...any) (*fileMutation, Result, bool) {
+		if parent != nil {
+			_ = parent.Close()
+		}
+		if root != nil {
+			_ = root.Close()
+		}
 		unlock()
 		res, _ := errorf(format, args...)
 		return nil, res, false
 	}
 
-	if err := validateResolvedTarget(r.root, abs); err != nil {
+	var rel string
+	var err error
+	root, rel, err = r.openResolvedWorkspace(abs)
+	if err != nil {
 		return fail("cannot safely access %s: %v", r.display(abs), err)
 	}
-	before, err := readDiskFile(abs)
-	if err != nil {
+	if rel == "." {
+		return fail("cannot safely access %s: path names the workspace root", r.display(abs))
+	}
+	parentRel := filepath.Dir(rel)
+	leaf := filepath.Base(rel)
+	parentInfo := fs.FileInfo(nil)
+	parent, parentInfo, err = bindWorkspaceParent(root, parentRel, false)
+	before := diskFile{}
+	if err == nil {
+		before, err = readDiskFile(parent, leaf, r.display(abs), nil)
+	}
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fail("cannot read %s: %v", r.display(abs), err)
 	}
-	if !before.existed {
-		if !allowMissing {
-			return fail("cannot read %s: file does not exist", r.display(abs))
+	if err != nil {
+		if parent != nil {
+			_ = parent.Close()
+			parent = nil
 		}
+		parentInfo = nil
+		before = diskFile{}
+	}
+	if !before.existed && !allowMissing {
+		return fail("cannot read %s: file does not exist", r.display(abs))
+	}
+	if !before.existed {
 		return &fileMutation{
-			r: r, abs: abs, before: before,
+			r: r, abs: abs, root: root, parent: parent, parentInfo: parentInfo,
+			parentRel: parentRel, leaf: leaf, before: before,
 			readToken: recorded, readTokenSet: versionKnown, unlock: unlock,
 		}, Result{}, true
 	}
@@ -191,7 +227,8 @@ func (r *Registry) prepareFileMutation(abs string, allowMissing bool) (*fileMuta
 		return fail("%s changed since it was read. Read it again before writing.", r.display(abs))
 	}
 	return &fileMutation{
-		r: r, abs: abs, before: before,
+		r: r, abs: abs, root: root, parent: parent, parentInfo: parentInfo,
+		parentRel: parentRel, leaf: leaf, before: before,
 		readToken: recorded, readTokenSet: versionKnown, unlock: unlock,
 	}, Result{}, true
 }
@@ -214,6 +251,14 @@ func (m *fileMutation) close() {
 		return
 	}
 	m.closed = true
+	if m.parent != nil {
+		_ = m.parent.Close()
+		m.parent = nil
+	}
+	if m.root != nil {
+		_ = m.root.Close()
+		m.root = nil
+	}
 	m.unlock()
 }
 
@@ -226,15 +271,33 @@ type publishResult struct {
 // hook is test-only fault injection run after the durable temporary file is
 // ready and before the source compare-and-swap check.
 func (m *fileMutation) publish(ctx context.Context, content []byte, mode fs.FileMode, hook func()) error {
+	// The preimage reader and every later mutation of this path share one
+	// complete-file bound. Refuse an oversized post-image before preparing a
+	// checkpoint or temporary: discovering the limit only during post-rename
+	// verification would report failure after the file had already changed and
+	// would leave a result the tool itself could no longer read or edit.
+	if int64(len(content)) > maxWorkspaceFileBytes {
+		return fmt.Errorf("%s would be %d bytes; mutation file limit is %d",
+			m.r.display(m.abs), len(content), maxWorkspaceFileBytes)
+	}
 	mode = restorableFileMode(mode)
 	if m.before.existed && bytes.Equal(m.before.content, content) && m.before.mode == mode {
 		return nil
 	}
 
-	m.prepareCheckpoint()
-	result, err := publishFile(ctx, m.r.root, m.abs, m.before, content, mode, hook)
+	publisher, err := m.prepareCheckpoint()
+	if err != nil {
+		return err
+	}
+	result, err := publishFile(ctx, m, publisher, content, mode, hook)
 	if result.published {
-		m.commitCheckpoint(true, mode, sha256.Sum256(content))
+		postMode := mode
+		postDigest := sha256.Sum256(content)
+		if result.after.existed {
+			postMode = result.after.mode
+			postDigest = result.after.digest
+		}
+		m.commitCheckpoint(true, postMode, postDigest)
 	} else {
 		m.abortCheckpoint()
 	}
@@ -247,7 +310,7 @@ func (m *fileMutation) publish(ctx context.Context, content []byte, mode fs.File
 		}
 		return err
 	}
-	m.r.versions.record(m.abs, hashContent(content))
+	m.r.versions.record(m.abs, hashContent(content), result.after.info)
 	return nil
 }
 
@@ -260,15 +323,33 @@ type lifecycleCheckpointer interface {
 	Abort(abs string)
 }
 
-func (m *fileMutation) prepareCheckpoint() {
+type atomicFilePublisher interface {
+	PublishFileCAS(
+		ctx context.Context,
+		path string,
+		parent *os.Root,
+		leaf string,
+		expectedExisted bool,
+		expectedMode fs.FileMode,
+		expectedContent []byte,
+		desiredMode fs.FileMode,
+		desiredContent []byte,
+		beforePublication func(),
+	) (published bool, err error)
+}
+
+func (m *fileMutation) prepareCheckpoint() (atomicFilePublisher, error) {
 	if m.r.checkpoints == nil {
-		return
+		return nil, errors.New("atomic workspace mutation requires a checkpoint recorder")
 	}
-	if exact, ok := m.r.checkpoints.(exactStateCheckpointer); ok {
-		exact.RecordState(m.abs, m.before.existed, m.before.mode, m.before.content)
-		return
+	exact, exactOK := m.r.checkpoints.(exactStateCheckpointer)
+	_, lifecycleOK := m.r.checkpoints.(lifecycleCheckpointer)
+	publisher, publisherOK := m.r.checkpoints.(atomicFilePublisher)
+	if !exactOK || !lifecycleOK || !publisherOK {
+		return nil, errors.New("checkpoint recorder does not support atomic workspace publication")
 	}
-	m.r.checkpoints.Record(m.abs)
+	exact.RecordState(m.abs, m.before.existed, m.before.mode, m.before.content)
+	return publisher, nil
 }
 
 func (m *fileMutation) commitCheckpoint(existed bool, mode fs.FileMode, digest [sha256.Size]byte) {
@@ -283,73 +364,50 @@ func (m *fileMutation) abortCheckpoint() {
 	}
 }
 
-func publishFile(ctx context.Context, root, path string, before diskFile, content []byte, mode fs.FileMode, hook func()) (out publishResult, retErr error) {
-	parentInfo, err := ensureSafeParent(root, filepath.Dir(path))
-	if err != nil {
-		return out, err
+func publishFile(ctx context.Context, mutation *fileMutation, publisher atomicFilePublisher, content []byte, mode fs.FileMode, hook func()) (out publishResult, retErr error) {
+	if mutation == nil || mutation.root == nil {
+		return out, errors.New("workspace mutation has no root capability")
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".switchboard-write-*")
-	if err != nil {
-		return out, err
+	if publisher == nil {
+		return out, errors.New("workspace mutation has no atomic publisher")
 	}
-	tmpPath := tmp.Name()
-	defer func() {
-		_ = tmp.Close()
-		if !out.published {
-			_ = os.Remove(tmpPath)
+	if mutation.parent == nil {
+		parent, info, err := bindWorkspaceParent(mutation.root, mutation.parentRel, true)
+		if err != nil {
+			return out, err
 		}
-	}()
-	if _, err := io.Copy(tmp, bytes.NewReader(content)); err != nil {
+		mutation.parent, mutation.parentInfo = parent, info
+	}
+	if err := mutation.r.verifyWorkspaceParent(mutation.root, mutation.parentRel, mutation.parentInfo); err != nil {
 		return out, err
 	}
-	// Write first, chmod second: on Unix, writing may clear setuid/setgid
-	// bits. Applying the captured mode after the bytes preserves it exactly.
-	if err := tmp.Chmod(mode); err != nil {
-		return out, err
+	out.published, retErr = publisher.PublishFileCAS(
+		ctx,
+		mutation.abs,
+		mutation.parent,
+		mutation.leaf,
+		mutation.before.existed,
+		mutation.before.mode,
+		mutation.before.content,
+		mode,
+		content,
+		hook,
+	)
+	if retErr == nil && !out.published {
+		retErr = errors.New("atomic workspace publication returned without committing")
 	}
-	if err := tmp.Sync(); err != nil {
-		return out, err
+	if retErr != nil || !out.published {
+		return out, retErr
 	}
-	if err := tmp.Close(); err != nil {
-		return out, err
-	}
-
-	if hook != nil {
-		hook()
-	}
-	if err := ctx.Err(); err != nil {
-		return out, err
-	}
-	currentParent, err := ensureSafeParent(root, filepath.Dir(path))
+	after, err := readDiskFile(mutation.parent, mutation.leaf, mutation.r.display(mutation.abs), nil)
 	if err != nil {
 		return out, err
-	}
-	if !os.SameFile(parentInfo, currentParent) {
-		return out, fmt.Errorf("parent directory for %s changed identity before commit", path)
-	}
-	current, err := readDiskFile(path)
-	if err != nil {
-		return out, err
-	}
-	if !sameSource(before, current) {
-		return out, fmt.Errorf("%s changed before commit; refusing to overwrite it", path)
-	}
-	if err := replaceMutationPath(tmpPath, path); err != nil {
-		return out, err
-	}
-	out.published = true
-	if err := syncMutationDirectory(filepath.Dir(path)); err != nil {
-		return out, err
-	}
-	after, err := readDiskFile(path)
-	if err != nil {
-		return out, err
-	}
-	want := diskFile{existed: true, mode: mode, content: content, digest: sha256.Sum256(content)}
-	if !want.sameContent(after) {
-		return out, fmt.Errorf("verifying %s after atomic replace: post-image mismatch", path)
 	}
 	out.after = after
+	want := diskFile{existed: true, mode: mode, content: content, digest: sha256.Sum256(content)}
+	if !want.sameContent(after) {
+		return out, fmt.Errorf("verifying %s after atomic replace: post-image mismatch", mutation.abs)
+	}
 	return out, nil
 }
 
@@ -361,64 +419,4 @@ func sameSource(before, current diskFile) bool {
 		return true
 	}
 	return before.info != nil && current.info != nil && os.SameFile(before.info, current.info)
-}
-
-// ensureSafeParent creates missing directories one component at a time from
-// the already-resolved workspace root and refuses symlinks. It then resolves
-// the finished path again, so a path swapped between Plan and Run cannot turn
-// a creation into a write outside the workspace.
-func ensureSafeParent(root, parent string) (fs.FileInfo, error) {
-	rel, err := filepath.Rel(root, parent)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return nil, fmt.Errorf("parent is outside the workspace")
-	}
-	cur := root
-	if rel != "." {
-		for _, component := range strings.Split(rel, string(filepath.Separator)) {
-			cur = filepath.Join(cur, component)
-			info, statErr := os.Lstat(cur)
-			if os.IsNotExist(statErr) {
-				if err := os.Mkdir(cur, 0o755); err != nil && !os.IsExist(err) {
-					return nil, err
-				}
-				info, statErr = os.Lstat(cur)
-			}
-			if statErr != nil {
-				return nil, statErr
-			}
-			if info.Mode()&fs.ModeSymlink != 0 || !info.IsDir() {
-				return nil, fmt.Errorf("%s is not a real directory", cur)
-			}
-		}
-	}
-	resolved, err := filepath.EvalSymlinks(parent)
-	if err != nil {
-		return nil, err
-	}
-	if filepath.Clean(resolved) != filepath.Clean(parent) {
-		return nil, fmt.Errorf("parent directory changed through a symlink")
-	}
-	info, err := os.Lstat(parent)
-	if err != nil {
-		return nil, err
-	}
-	if !info.IsDir() || info.Mode()&fs.ModeSymlink != 0 {
-		return nil, fmt.Errorf("parent is not a real directory")
-	}
-	return info, nil
-}
-
-func validateResolvedTarget(root, path string) error {
-	rel, err := filepath.Rel(root, path)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("path is outside the workspace")
-	}
-	resolved, err := resolveExistingPrefix(filepath.Clean(path))
-	if err != nil {
-		return err
-	}
-	if filepath.Clean(resolved) != filepath.Clean(path) {
-		return fmt.Errorf("path changed through a symlink after it was resolved")
-	}
-	return nil
 }

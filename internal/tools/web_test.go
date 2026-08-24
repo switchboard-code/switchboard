@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -151,6 +152,84 @@ func TestWebfetchReducesHTMLToItsText(t *testing.T) {
 		if strings.Contains(res.Content, gone) {
 			t.Errorf("markup or code leaked into the text (%q):\n%s", gone, res.Content)
 		}
+	}
+}
+
+func TestWebfetchRedactsCompleteTextBeforeContextCap(t *testing.T) {
+	body := strings.Repeat("x", webTextLimit-len(truncationBoundaryToken)+1) + truncationBoundaryToken
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = fmt.Fprint(w, body)
+	}))
+	defer srv.Close()
+
+	tool := &webfetchTool{client: srv.Client()}
+	plan, err := tool.Plan(json.RawMessage(fmt.Sprintf(`{"url":%q}`, srv.URL)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := plan.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.Content, truncationBoundaryToken) || strings.Contains(res.Content, "ghp_") {
+		t.Fatalf("web text cap exposed a credential fragment: %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "[redacted: a GitHub token]") {
+		t.Fatalf("web text was not redacted before its cap: %q", res.Content)
+	}
+}
+
+func TestWebToolsWithholdResponsesThatCrossTheWireCap(t *testing.T) {
+	token := truncationBoundaryToken
+	prefix := strings.Repeat("x", webFetchLimit-len(token)+1)
+	body := prefix + token
+
+	for _, test := range []struct {
+		name        string
+		contentType string
+		endpoint    string
+		plan        func(*http.Client, string) (Plan, error)
+	}{
+		{
+			name:        "fetch",
+			contentType: "text/plain",
+			plan: func(client *http.Client, endpoint string) (Plan, error) {
+				return (&webfetchTool{client: client}).Plan(json.RawMessage(fmt.Sprintf(`{"url":%q}`, endpoint)))
+			},
+		},
+		{
+			name:        "search",
+			contentType: "text/html",
+			endpoint:    "/html/",
+			plan: func(client *http.Client, endpoint string) (Plan, error) {
+				return (&websearchTool{client: client, endpoint: endpoint}).Plan(json.RawMessage(`{"query":"bounded"}`))
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", test.contentType)
+				_, _ = io.WriteString(w, body)
+			}))
+			defer srv.Close()
+
+			endpoint := srv.URL + test.endpoint
+			plan, err := test.plan(srv.Client(), endpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := plan.Run(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.IsError || !strings.Contains(result.Content, "content withheld") {
+				t.Fatalf("oversized response was not withheld: %#v", result)
+			}
+			if strings.Contains(result.Content, token) || strings.Contains(result.Content, "ghp_") {
+				t.Fatalf("wire cap exposed a credential fragment: %q", result.Content)
+			}
+		})
 	}
 }
 

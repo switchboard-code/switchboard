@@ -14,11 +14,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/switchboard-code/switchboard/internal/checkpoint"
+	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 )
 
 // StateFileName is deliberately separate from config.toml. The TUI rewrites
@@ -28,6 +30,8 @@ import (
 const StateFileName = "plugins.json"
 
 const maxStateBytes = 1 << 20
+
+var pluginStateBeforePublicationTestHook func()
 
 // Activation is Switchboard's decision about one exact native plugin. A
 // native client's enabled or trusted state is never copied here. RealPath is
@@ -98,44 +102,24 @@ func OpenState() (*State, error) {
 // is empty. Malformed, duplicate, or oversized input fails closed rather than
 // partially applying security decisions.
 func OpenStateFile(path string) (*State, error) {
-	s := &State{path: path, records: make(map[string]Activation)}
-	pathInfo, err := os.Lstat(path)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
-	}
-	if err == nil && pathInfo.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("reading %s: plugin state must not be a symbolic link", path)
-	}
-	f, err := os.Open(path)
+	directory, err := openPluginStateDirectory(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return s, nil
-		}
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, err
 	}
-	defer f.Close()
-	openedInfo, err := f.Stat()
+	defer directory.close()
+	snapshot, err := readPluginStateSnapshot(directory)
 	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, err
 	}
-	if pathInfo != nil && !os.SameFile(pathInfo, openedInfo) {
-		return nil, fmt.Errorf("reading %s: plugin state changed while it was opened", path)
-	}
-	if !openedInfo.Mode().IsRegular() {
-		return nil, fmt.Errorf("reading %s: plugin state is not a regular file", path)
-	}
-	if runtime.GOOS != "windows" && openedInfo.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("reading %s: plugin state permissions are %04o, want 0600", path, openedInfo.Mode().Perm())
-	}
+	return decodePluginState(directory.statePath(), snapshot)
+}
 
-	limited := io.LimitReader(f, maxStateBytes+1)
-	raw, err := io.ReadAll(limited)
-	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+func decodePluginState(path string, snapshot pluginStateSnapshot) (*State, error) {
+	s := &State{path: path, records: make(map[string]Activation)}
+	if !snapshot.existed {
+		return s, nil
 	}
-	if len(raw) > maxStateBytes {
-		return nil, fmt.Errorf("reading %s: plugin state exceeds %d bytes", path, maxStateBytes)
-	}
+	raw := snapshot.content
 	if err := rejectDuplicateJSONKeys(raw); err != nil {
 		return nil, fmt.Errorf("reading %s: %w", path, err)
 	}
@@ -660,7 +644,12 @@ func (s *State) mutate(ctx context.Context, apply func(*State) (bool, error)) er
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	lock, err := acquirePluginStateLock(ctx, s.path)
+	directory, err := openPluginStateDirectory(s.path)
+	if err != nil {
+		return err
+	}
+	defer directory.close()
+	lock, err := acquirePluginStateLockInDirectory(ctx, directory)
 	if err != nil {
 		return err
 	}
@@ -668,7 +657,19 @@ func (s *State) mutate(ctx context.Context, apply func(*State) (bool, error)) er
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	latest, err := OpenStateFile(s.path)
+	if err := checkpoint.RecoverFilePublicationCleanupBound(
+		directory.journalPath, directory.path, directory.journalRoot, directory.root,
+	); err != nil {
+		return fmt.Errorf("recovering interrupted plugin state publication: %w", err)
+	}
+	if err := directory.validateLinked(); err != nil {
+		return err
+	}
+	snapshot, err := readPluginStateSnapshot(directory)
+	if err != nil {
+		return err
+	}
+	latest, err := decodePluginState(directory.statePath(), snapshot)
 	if err != nil {
 		return err
 	}
@@ -679,13 +680,51 @@ func (s *State) mutate(ctx context.Context, apply func(*State) (bool, error)) er
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	published := false
 	if changed {
-		if err := latest.saveContext(ctx); err != nil {
+		raw, err := latest.encodeState()
+		if err != nil {
+			return err
+		}
+		if err := directory.validateLinked(); err != nil {
+			return err
+		}
+		published, err = checkpoint.PublishStandaloneFileCASBound(
+			ctx,
+			directory.journalPath,
+			directory.path,
+			directory.journalRoot,
+			directory.root,
+			directory.statePath(),
+			directory.root,
+			directory.name,
+			snapshot.existed,
+			snapshot.mode,
+			snapshot.content,
+			0o600,
+			raw,
+			maxStateBytes,
+			fileprivacy.Secure,
+			pluginStateBeforePublicationTestHook,
+		)
+		linkedErr := directory.validateLinked()
+		if published {
+			s.key = append(s.key[:0], latest.key...)
+			s.records = cloneActivationMap(latest.records)
+		}
+		if err != nil || linkedErr != nil {
+			return errors.Join(err, linkedErr)
+		}
+	}
+	if !changed {
+		if err := directory.validateLinked(); err != nil {
 			return err
 		}
 	}
-	s.key = append(s.key[:0], latest.key...)
-	s.records = cloneActivationMap(latest.records)
+	if !changed || !published {
+		s.key = append(s.key[:0], latest.key...)
+		s.records = cloneActivationMap(latest.records)
+	}
 	return nil
 }
 
@@ -697,16 +736,9 @@ func cloneActivationMap(records map[string]Activation) map[string]Activation {
 	return cloned
 }
 
-func (s *State) save() error {
-	return s.saveContext(context.Background())
-}
-
-func (s *State) saveContext(ctx context.Context) error {
+func (s *State) encodeState() ([]byte, error) {
 	if err := s.ensureRecoveryKeyLocked(); err != nil {
-		return fmt.Errorf("creating plugin recovery key: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return fmt.Errorf("creating %s: %w", filepath.Dir(s.path), err)
+		return nil, fmt.Errorf("creating plugin recovery key: %w", err)
 	}
 	file := struct {
 		Version     int          `json:"version"`
@@ -723,32 +755,16 @@ func (s *State) saveContext(ctx context.Context) error {
 		return file.Activations[i].RealPath < file.Activations[j].RealPath
 	})
 
-	tmp, err := os.CreateTemp(filepath.Dir(s.path), StateFileName+".*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	encoder := json.NewEncoder(tmp)
+	var encoded bytes.Buffer
+	encoder := json.NewEncoder(&encoded)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(file); err != nil {
-		tmp.Close()
-		return err
+		return nil, err
 	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
+	if encoded.Len() > maxStateBytes {
+		return nil, fmt.Errorf("plugin state exceeds %d bytes", maxStateBytes)
 	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), s.path)
+	return append([]byte(nil), encoded.Bytes()...), nil
 }
 
 func requireJSONEOF(decoder *json.Decoder) error {

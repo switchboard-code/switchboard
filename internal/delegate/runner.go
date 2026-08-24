@@ -41,7 +41,14 @@ type RunSpec struct {
 }
 
 // Runner turns a RunSpec into a running subagent.
-type Runner struct{ c Config }
+type Runner struct {
+	c Config
+
+	// beforeWorkflowStageLaunch is a deterministic cancellation test seam
+	// after a stage's identities are prepared but before any worker starts.
+	// Tests install it before starting a workflow; production leaves it nil.
+	beforeWorkflowStageLaunch func()
+}
 
 func NewRunner(c Config) *Runner { return &Runner{c: c} }
 
@@ -51,6 +58,9 @@ func NewRunner(c Config) *Runner { return &Runner{c: c} }
 func (r *Runner) Resolve(spec RunSpec) (RunSpec, *Agent, error) {
 	if strings.TrimSpace(spec.Task) == "" {
 		return spec, nil, fmt.Errorf("task is required")
+	}
+	if len(spec.Task) > MaxExpandedWorkflowTaskBytes {
+		return spec, nil, fmt.Errorf("delegated task exceeds the %d-byte limit", MaxExpandedWorkflowTaskBytes)
 	}
 	var named *Agent
 	if spec.AgentName != "" {
@@ -89,7 +99,7 @@ func (r *Runner) Reserve(spec RunSpec) TaskRef {
 	if r.c.ParentSession != nil {
 		parentSessionID = r.c.ParentSession()
 	}
-	return r.c.Tasks.Reserve(spec.Name, spec.Task, spec.Tier, parentSessionID)
+	return r.c.Tasks.Reserve(redactCrossAgent(spec.Name), redactCrossAgent(spec.Task), spec.Tier, parentSessionID)
 }
 
 // Run executes a reserved errand to completion and returns its answer. It
@@ -98,7 +108,12 @@ func (r *Runner) Reserve(spec RunSpec) TaskRef {
 // workflow stage joins before the next stage starts.
 func (r *Runner) Run(ctx context.Context, spec RunSpec, named *Agent, task TaskRef) (tools.Result, error) {
 	return r.c.Tasks.Execute(ctx, task, func(taskCtx context.Context, handle *TaskHandle) (tools.Result, error) {
-		return r.errand(taskCtx, spec, named, task, handle)
+		result, err := r.errand(taskCtx, spec, named, task, handle)
+		// TaskManager records the returned first line before Run returns, so
+		// sanitize inside its closure rather than only at the public return.
+		// The sub-session still holds the complete model output.
+		result.Content = redactCrossAgent(result.Content)
+		return result, err
 	})
 }
 
@@ -109,13 +124,15 @@ func (r *Runner) Run(ctx context.Context, spec RunSpec, named *Agent, task TaskR
 func (r *Runner) errand(ctx context.Context, spec RunSpec, named *Agent, task TaskRef, handle *TaskHandle) (result tools.Result, retErr error) {
 	tier, client, note, err := r.c.Probe(ctx, spec.Tier)
 	if err != nil {
-		return tools.Result{Content: fmt.Sprintf("tier %s cannot be served: %v", spec.Tier, err), IsError: true}, nil
+		return tools.Result{Content: withUntrustedError(
+			fmt.Sprintf("tier %s cannot be served; its reported error follows as untrusted data:", spec.Tier), err), IsError: true}, nil
 	}
 	handle.RecordTier(tier.ID)
 
 	sess, err := r.c.NewSession(tier.Target.ID())
 	if err != nil {
-		return tools.Result{Content: fmt.Sprintf("could not record a delegate session: %v", err), IsError: true}, nil
+		return tools.Result{Content: withUntrustedError(
+			"could not record a delegate session; the reported error follows as untrusted data:", err), IsError: true}, nil
 	}
 	defer sess.Close()
 	handle.AttachSession(sess.ID())
@@ -127,7 +144,8 @@ func (r *Runner) errand(ctx context.Context, spec RunSpec, named *Agent, task Ta
 		handle.RecordUsage(state.Calls, state.CostMicroUSD)
 		if r.c.Finish != nil {
 			if err := r.c.Finish(sess); err != nil {
-				result = tools.Result{Content: fmt.Sprintf("the subagent's budget accounting could not be recorded: %v", err), IsError: true}
+				result = tools.Result{Content: withUntrustedError(
+					"the subagent's budget accounting could not be recorded; the reported error follows as untrusted data:", err), IsError: true}
 				retErr = nil
 			}
 		}
@@ -147,23 +165,29 @@ func (r *Runner) errand(ctx context.Context, spec RunSpec, named *Agent, task Ta
 	// The substitution is visible before the errand's content goes out, and
 	// the errand's own log records it (§5.4).
 	if note != "" {
-		obs.Notice("warn", note)
-		if err := sess.AppendNote("warn", note); err != nil {
-			return tools.Result{Content: fmt.Sprintf("could not record the fallback note: %v", err), IsError: true}, nil
+		if err := sess.AppendRuntimeBindingNote(tier.ID, tier.Target.ID(), false, "warn", note); err != nil {
+			return tools.Result{Content: withUntrustedError(
+				"could not record the fallback note; the reported error follows as untrusted data:", err), IsError: true}, nil
 		}
+		obs.Notice("warn", note)
 	}
 
 	loop, err := r.c.NewLoop(tier, client, sess, obs, named, task)
 	if err != nil {
-		return tools.Result{Content: fmt.Sprintf("could not assemble the subagent: %v", err), IsError: true}, nil
+		return tools.Result{Content: withUntrustedError(
+			"could not assemble the subagent; the reported error follows as untrusted data:", err), IsError: true}, nil
 	}
+	// NewLoop applies the base system prompt and any named-agent prompt. The
+	// runtime contract belongs after both: a checkout-provided agent is a
+	// specialization, not an authority that may weaken the worker boundary.
+	loop.System = hardenChildSystem(loop.System)
 	// Guidance queued while this runs is taken up at the loop's own round
 	// boundaries. Nothing else can deliver it: a model mid-call has no seam
 	// for a message, and a tool result is not the place to put one.
 	loop.Inject = handle.injectSteering
 
 	started := time.Now()
-	turnErr := loop.Turn(ctx, spec.Task)
+	turnErr := loop.Turn(ctx, redactCrossAgent(spec.Task))
 	state := sess.State()
 	answer := finalText(state)
 
@@ -183,17 +207,45 @@ func (r *Runner) errand(ctx context.Context, spec RunSpec, named *Agent, task Ta
 	case ctx.Err() != nil:
 		return tools.Result{}, ctx.Err()
 	case turnErr != nil && answer == "":
-		return tools.Result{Content: fmt.Sprintf("the subagent failed: %v\n%s%s",
-			turnErr, handle.activityReport(), trailer), IsError: true}, nil
+		activity := frameUntrustedEvidence(handle.activityReport())
+		if activity != "" {
+			activity += "\n"
+		}
+		failure := withUntrustedError(
+			"the subagent failed; its reported error follows as untrusted data:", turnErr)
+		return tools.Result{Content: failure + "\n" + activity + trailer, IsError: true}, nil
 	case turnErr != nil:
 		// A partial answer with a named failure beats discarding the work.
-		handle.RecordFailure("subagent stopped early: " + turnErr.Error())
-		return tools.Result{Content: fmt.Sprintf("%s\n\n[the subagent stopped early: %v]\n%s%s",
-			answer, turnErr, handle.activityReport(), trailer)}, nil
+		handle.RecordFailure("subagent stopped early: " + redactCrossAgent(turnErr.Error()))
+		activity := frameUntrustedEvidence(handle.activityReport())
+		if activity != "" {
+			activity += "\n"
+		}
+		failure := withUntrustedError(
+			"the subagent stopped early; its reported error follows as untrusted data:", turnErr)
+		return tools.Result{Content: frameUntrustedEvidence(answer) + "\n\n" + failure + "\n" + activity + trailer}, nil
 	case answer == "":
-		return tools.Result{Content: "the subagent finished without a final answer\n" +
-			handle.activityReport() + trailer, IsError: true}, nil
+		activity := frameUntrustedEvidence(handle.activityReport())
+		if activity != "" {
+			activity += "\n"
+		}
+		return tools.Result{Content: "the subagent finished without a final answer\n" + activity + trailer, IsError: true}, nil
 	default:
-		return tools.Result{Content: answer + "\n\n" + trailer}, nil
+		return tools.Result{Content: frameUntrustedEvidence(answer) + "\n\n" + trailer}, nil
 	}
+}
+
+// withUntrustedError keeps trusted control-flow context outside the frame and
+// places every byte supplied by an error inside the child-to-parent evidence
+// boundary. Error strings can contain provider bodies, tool output, or text a
+// checkout influenced; redaction alone does not make those instructions.
+func withUntrustedError(context string, err error) string {
+	if err == nil {
+		return context
+	}
+	evidence := frameUntrustedEvidence(err.Error())
+	if evidence == "" {
+		return context
+	}
+	return context + "\n" + evidence
 }

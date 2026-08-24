@@ -97,14 +97,25 @@ func TestPreflightBoundIncludesExplicitOutputAboveCatalogDefault(t *testing.T) {
 	}
 }
 
+func TestPreflightBoundUsesAdaptiveWireAllowance(t *testing.T) {
+	cat, target := pricedTarget(t)
+	target.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "high"}
+	info, _, _ := cat.Lookup(target)
+	got := preflightBoundForTarget(info, target, 10_000)
+	want := preflightBoundWithOutput(info, 10_000, 8_192)
+	if got != want {
+		t.Fatalf("adaptive bound = %s, want the 8192-token wire allowance %s", got, want)
+	}
+}
+
 func TestOneShotBudgetUsesByteLevelHardBound(t *testing.T) {
 	cat, target := pricedTarget(t)
 	info, _, _ := cat.Lookup(target)
 	req := provider.Request{Messages: []provider.Message{
 		provider.UserText(strings.Repeat("🧪", 2_000)),
 	}}
-	floorBound := preflightBound(info, prefix.RequestTokens(req))
-	hardBound := preflightBound(info, prefix.RequestTokenCeiling(req))
+	floorBound := preflightBoundForTarget(info, target, prefix.RequestTokens(req))
+	hardBound := preflightBoundForTarget(info, target, prefix.RequestTokenCeiling(req))
 	if hardBound <= floorBound {
 		t.Fatalf("hard bound = %s, floor bound = %s", hardBound, floorBound)
 	}
@@ -200,7 +211,7 @@ func TestBudgetBlocksMoveNamesTheReason(t *testing.T) {
 func TestFailedAttemptDebtPersistsAcrossLaterModelCalls(t *testing.T) {
 	cat, target := pricedTarget(t)
 	info, _, _ := cat.Lookup(target)
-	bound := preflightBound(info, 10_000)
+	bound := preflightBoundForTarget(info, target, 10_000)
 	bs := &budgetState{}
 	bs.set(bound*2 - 1)
 	scope := func() string { return "session-a" }
@@ -257,7 +268,7 @@ func TestSuccessfulAttemptAddsNoRetryDebt(t *testing.T) {
 func TestConcurrentRetriesCannotSpendTheSameHeadroom(t *testing.T) {
 	cat, target := pricedTarget(t)
 	info, _, _ := cat.Lookup(target)
-	bound := preflightBound(info, 10_000)
+	bound := preflightBoundForTarget(info, target, 10_000)
 	bs := &budgetState{}
 	bs.set(3 * bound)
 	scope := func() string { return "shared-race" }
@@ -307,7 +318,7 @@ func TestConcurrentRetriesCannotSpendTheSameHeadroom(t *testing.T) {
 func TestSuccessfulUsageCannotLeaveAStaleSpendAdmissionGap(t *testing.T) {
 	cat, target := pricedTarget(t)
 	info, _, _ := cat.Lookup(target)
-	bound := preflightBound(info, 10_000)
+	bound := preflightBoundForTarget(info, target, 10_000)
 	bs := &budgetState{}
 	bs.set(2*bound - 1)
 	scope := func() string { return "shared" }
@@ -336,7 +347,7 @@ func TestSuccessfulUsageCannotLeaveAStaleSpendAdmissionGap(t *testing.T) {
 func TestPrimaryBudgetGuardLoadsRetryDebtAfterResume(t *testing.T) {
 	cat, target := pricedTarget(t)
 	info, _, _ := cat.Lookup(target)
-	bound := preflightBound(info, 10_000)
+	bound := preflightBoundForTarget(info, target, 10_000)
 	store, err := session.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -377,7 +388,7 @@ func TestPrimaryBudgetGuardLoadsRetryDebtAfterResume(t *testing.T) {
 func TestPrimaryGuardPersistsPendingAttemptBeforeProviderSend(t *testing.T) {
 	cat, target := pricedTarget(t)
 	info, _, _ := cat.Lookup(target)
-	bound := preflightBound(info, 10_000)
+	bound := preflightBoundForTarget(info, target, 10_000)
 	store, err := session.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -615,7 +626,7 @@ func TestPrimaryGuardRefusesSendWhenPendingAppendFails(t *testing.T) {
 func TestPrimaryGuardSettlementFailureRetainsReservationAfterUsage(t *testing.T) {
 	cat, target := pricedTarget(t)
 	info, _, _ := cat.Lookup(target)
-	bound := preflightBound(info, 10_000)
+	bound := preflightBoundForTarget(info, target, 10_000)
 	store, err := session.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -652,7 +663,7 @@ func TestPrimaryGuardSettlementFailureRetainsReservationAfterUsage(t *testing.T)
 func TestDurableConcurrentAdmissionIsAtomic(t *testing.T) {
 	cat, target := pricedTarget(t)
 	info, _, _ := cat.Lookup(target)
-	bound := preflightBound(info, 10_000)
+	bound := preflightBoundForTarget(info, target, 10_000)
 	store, err := session.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

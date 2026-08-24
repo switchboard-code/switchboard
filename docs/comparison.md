@@ -1,6 +1,6 @@
 # Product comparison
 
-This comparison is dated 2026-08-19. It separates repository-backed
+This comparison is dated 2026-08-23. It separates repository-backed
 Switchboard behavior, measured results, and external product reports.
 Competitor behavior changes quickly, so external claims should be rechecked
 before use in a release announcement.
@@ -25,13 +25,17 @@ one. It does not prove that another product lacks an internal mechanism.
 | Hard budget | Retry-inclusive dollar ceiling checked before routes, moves, and provider calls | No comparable model-selection budget gate found |
 | Cache state | Per-target modeled warmth with observed provider accounting | Cache discounts may be documented without a live routing belief |
 | Session branching | Append-only logs with fork, named pins, retry, recap, and line provenance | Resume and checkpoint features vary by product |
-| Terminal workbench | Searchable command palette, revision-aware file and literal search, exact Git diff, and built-in semantic LSP views | Terminal and IDE surfaces divide this work differently; integration breadth varies |
+| Resume integrity | Read-only health shows the exact surface, incomplete output, pending tool repair, continuity, recoverable tail, and blocking corruption; adoption is workspace-bound | [Claude Code sessions](https://code.claude.com/docs/en/sessions) describe continuous local saves, resume, branch, and compact; public guarantees differ at crash and corruption boundaries |
+| Stream crash durability | Assistant deltas are synced before display and collapse into one message on success; interrupted output stays visible but is withheld from later model requests | No comparable public visible-before-durable contract was found in the reviewed session guides |
+| Terminal workbench | Searchable command palette, revision-aware file and literal search, bounded Git diff with an omission inventory, and built-in semantic LSP views | Terminal and IDE surfaces divide this work differently; integration breadth varies |
 | Verification | User-armed watch, turn bisect, paired races, a second-rung audit of a turn's claims against its record, and a router evaluation gate | Hooks and test commands are common; no equivalent combined surface found |
 | Command safety | Sandbox off by default; opt-in verified confinement; explicit yolo mode for unconfined host access | Products expose sandbox or approval modes with different guarantees |
 | Standing permissions | Rules in the user's own file, refused when they reach as wide as a mode, yielding to a credential-bearing request, and answerable offline with `sb permissions -- <command>` under a stated scope | Persisted allowlists are common; no comparable dry-run with a stated coverage boundary was found |
+| Interaction safety | One FIFO modal lane, denial-first approvals, exact cancellation ownership, and 20-column bounded dialogs | Approval and question surfaces vary; this row makes no claim about another product's default selection |
 | CLI discovery | Static help before config or extension discovery; generated completion follows the dispatcher's closed grammar | Help and completion depth vary by product and release |
 | Scripting | `-output json` for one result object, `-output stream-json` for typed events as they happen, with a stable last line and exit codes a script can branch on | Streaming JSON output is common; the coverage and stability of the event vocabulary vary |
 | Extensions | Compatible native skills, local plugins, direct and trusted plugin MCP with server-initiated elicitation, hooks, and one subagent level with up to four independent calls in an all-delegate batch | The reviewed guides list skill, plugin, provider, and LSP surfaces that Switchboard does not yet match; this review did not rank ecosystems |
+| Delegation boundary | Child prompts end with a runtime contract; cross-agent text is credential-scanned and returned as untrusted evidence | [Claude Code's parallel-agent guide](https://code.claude.com/docs/en/agents) exposes broader orchestration choices; authority and evidence boundaries are product-specific |
 | Computer control | macOS Accessibility tool under the normal permission engine | Hosted or API computer-use surfaces exist; terminal integration varies |
 
 ## Routing, cost, and cache
@@ -86,6 +90,24 @@ fork, retry, or compaction boundary without changing the visible user prompt.
 An undelivered valid capsule is injected once into the appropriate opening or
 compact seed, stays bound to its message boundary, and never grants file-read
 or execution authority.
+
+Compaction has one shared TUI/REPL implementation. Its prompt treats transcript,
+repository, tool, and user-emphasis text as untrusted source data and requests
+exact sections for the active objective and execution frontier. The resulting
+handoff is credential-redacted, byte-bounded, and structurally validated before
+the new session can be published. This follows the high-signal context posture
+described in [Anthropic's context-engineering guidance](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
+and the outcome/constraint/frontier guidance in
+[OpenAI's model guidance](https://developers.openai.com/api/docs/guides/latest-model),
+while keeping the runtime checks independent of either provider.
+
+Streamed assistant output is write-ahead checkpointed before it is observable.
+A crash therefore may lose provider bytes that were never shown, but not text
+the user already saw. On resume, incomplete output is evidence rather than a
+completed turn, and dangling tool calls are closed once with an explicit
+unknown-outcome error. Fresh child logs for clear, compact, fork, retry, and
+race stay undiscoverable until adoption publishes them, preventing an aborted
+operation from becoming `--continue`'s newest session.
 
 `/blame <path>` replays recorded write and edit operations against the current
 file. A surviving line can therefore be attributed to a session, turn, tier,

@@ -54,6 +54,13 @@ const (
 )
 
 func (r *renderer) style(code, s string) string {
+	s = terminaltext.Escape(s)
+	return r.styleRendered(code, s)
+}
+
+// styleRendered is reserved for text already passed through terminaltext
+// while retaining intentional layout, such as streamed model prose.
+func (r *renderer) styleRendered(code, s string) string {
 	if !r.color {
 		return s
 	}
@@ -114,7 +121,7 @@ func (r *renderer) ThinkingDelta(text string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.sectionLocked("thinking")
-	r.writeLocked(r.style(dim, terminaltext.Display(text)))
+	r.writeLocked(r.styleRendered(dim, terminaltext.Display(text)))
 	r.flushLocked()
 }
 
@@ -184,7 +191,7 @@ func (r *renderer) Notice(level, text string) {
 	if level == "warn" || level == "error" {
 		prefix = "  " + level + ": "
 	}
-	r.lineLocked(r.style(dim, prefix+terminaltext.Display(text)))
+	r.lineLocked(r.styleRendered(dim, prefix+terminaltext.Display(text)))
 	r.flushLocked()
 }
 
@@ -266,8 +273,9 @@ func firstLine(s string) string {
 	}
 	line, _, _ := strings.Cut(s, "\n")
 	const width = 100
-	if len(line) > width {
-		return line[:width] + "..."
+	runes := []rune(line)
+	if len(runes) > width {
+		return string(runes[:width]) + "..."
 	}
 	return line
 }
@@ -351,11 +359,11 @@ func (a *terminalQuestioner) AskUser(_ context.Context, q tools.Question) (tools
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.sectionLocked("question")
-	r.lineLocked(r.style(bold, q.Question))
+	r.lineLocked(r.style(bold, terminaltext.Escape(q.Question)))
 	for i, opt := range q.Options {
-		line := "  [" + strconv.Itoa(i+1) + "] " + opt.Label
+		line := "  [" + strconv.Itoa(i+1) + "] " + terminaltext.Escape(opt.Label)
 		if opt.Detail != "" {
-			line += "  " + r.style(dim, opt.Detail)
+			line += "  " + r.style(dim, terminaltext.Escape(opt.Detail))
 		}
 		r.lineLocked(line)
 	}

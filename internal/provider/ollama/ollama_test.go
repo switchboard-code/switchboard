@@ -43,6 +43,37 @@ func drain(t *testing.T, s provider.EventStream) ([]provider.Event, error) {
 	}
 }
 
+func TestBuildRequestEmitsOnlyAnExplicitNumPredict(t *testing.T) {
+	decode := func(target provider.RouteTarget) *int {
+		t.Helper()
+		raw, err := New().buildRequest(target, provider.Request{}, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wire struct {
+			Options *struct {
+				NumPredict int `json:"num_predict"`
+			} `json:"options"`
+		}
+		if err := json.Unmarshal(raw, &wire); err != nil {
+			t.Fatal(err)
+		}
+		if wire.Options == nil {
+			return nil
+		}
+		return &wire.Options.NumPredict
+	}
+
+	target := Target("custom")
+	if got := decode(target); got != nil {
+		t.Fatalf("omitted max output emitted num_predict=%d", *got)
+	}
+	target.Params.MaxOutputTokens = 4_096
+	if got := decode(target); got == nil || *got != 4_096 {
+		t.Fatalf("explicit max output emitted num_predict=%v, want 4096", got)
+	}
+}
+
 // The fixture is a verbatim capture from Ollama 0.32.9 running
 // qwen3.5:9b-mlx, so the mapping is tested against what the server really
 // sends rather than against the documented shape.
@@ -176,6 +207,86 @@ func TestStreamTruncatedIsDistinguishable(t *testing.T) {
 	}
 }
 
+func TestStreamRefusesOversizeFrameWithoutDelimiter(t *testing.T) {
+	body := `{"message":{"role":"assistant","content":"` + strings.Repeat("x", maxStreamFrameBytes) + `"},"done":false}`
+	c := serveBody(t, body)
+
+	s, err := c.Stream(context.Background(), Target("m"), provider.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	_, err = drain(t, s)
+	var protocolErr *provider.ProtocolError
+	if !errors.As(err, &protocolErr) || !strings.Contains(err.Error(), "frame limit") {
+		t.Fatalf("err = %v, want bounded frame ProtocolError", err)
+	}
+}
+
+func TestStreamAcceptsLargeFramesWithoutATotalOutputCap(t *testing.T) {
+	part := strings.Repeat("x", maxStreamFrameBytes/2)
+	body := strings.Join([]string{
+		`{"message":{"role":"assistant","content":"` + part + `"},"done":false}`,
+		`{"message":{"role":"assistant","content":"` + part + `"},"done":false}`,
+		`{"message":{"role":"assistant","content":"` + part + `"},"done":false}`,
+		`{"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"}`,
+	}, "\n")
+	c := serveBody(t, body)
+
+	s, err := c.Stream(context.Background(), Target("m"), provider.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	events, err := drain(t, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for _, event := range events {
+		total += len(event.Text)
+	}
+	if total != 3*len(part) || total <= maxStreamFrameBytes {
+		t.Fatalf("total output = %d, want %d (> per-frame cap)", total, 3*len(part))
+	}
+}
+
+func TestStreamAcceptsExactFrameBoundary(t *testing.T) {
+	prefix := `{"message":{"role":"assistant","content":"`
+	suffix := `"},"done":true,"done_reason":"stop"}`
+	body := prefix + strings.Repeat("x", maxStreamFrameBytes-len(prefix)-len(suffix)) + suffix
+	c := serveBody(t, body)
+
+	s, err := c.Stream(context.Background(), Target("m"), provider.Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := drain(t, s); err != nil {
+		t.Fatalf("exact-boundary frame: %v", err)
+	}
+}
+
+func TestModelsBoundsBodyAndRejectsUnsafeIDs(t *testing.T) {
+	t.Run("oversize body", func(t *testing.T) {
+		c := serveBody(t, strings.Repeat(" ", provider.MaxProviderJSONBodyBytes+1))
+		if _, err := c.Models(context.Background()); err == nil || !strings.Contains(err.Error(), "response limit") {
+			t.Fatalf("err = %v, want response-limit refusal", err)
+		}
+	})
+
+	t.Run("credential shaped id", func(t *testing.T) {
+		token := "ghp_" + strings.Repeat("A", 40)
+		c := serveBody(t, `{"models":[{"name":"model-`+token+`"}]}`)
+		_, err := c.Models(context.Background())
+		if err == nil || strings.Contains(err.Error(), token) {
+			t.Fatalf("unsafe model ID was accepted or echoed: %v", err)
+		}
+	})
+}
+
 func TestStreamMidStreamErrorIsNotRetried(t *testing.T) {
 	c := serveBody(t, strings.Join([]string{
 		`{"message":{"role":"assistant","content":"start"},"done":false}`,
@@ -231,6 +342,29 @@ func TestHTTPErrorCarriesServerMessage(t *testing.T) {
 	}
 	if apiErr.Body != "model 'nope:1b' not found" {
 		t.Errorf("body = %q, want the unwrapped server message", apiErr.Body)
+	}
+}
+
+func TestHTTPErrorCredentialBodyIsRedactedBeforeItsCap(t *testing.T) {
+	token := "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for name, body := range map[string]string{
+		"complete":       `{"error":"rejected ` + token + `"}`,
+		"cross-boundary": strings.Repeat("x", provider.MaxAPIErrorBodyBytes-len(token)+1) + token,
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, body)
+			})
+			_, err := c.Stream(context.Background(), Target("m"), provider.Request{})
+			var apiErr *provider.APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("err = %v, want APIError", err)
+			}
+			if strings.Contains(apiErr.Body, token) || strings.Contains(apiErr.Body, "ghp_") {
+				t.Fatalf("API error body exposed a credential fragment: %q", apiErr.Body)
+			}
+		})
 	}
 }
 
@@ -295,6 +429,43 @@ func TestBuildRequestShape(t *testing.T) {
 	}
 	if len(got.Tools) != 1 || got.Tools[0].Function.Name != "read" {
 		t.Errorf("tools = %+v", got.Tools)
+	}
+}
+
+func TestReplayExcludesIncompleteAssistantFromOllamaWireAndEstimate(t *testing.T) {
+	const partial = "PARTIAL MUST NOT REPLAY"
+	base := provider.Request{Messages: []provider.Message{
+		provider.UserText("before"),
+		provider.UserText("after"),
+	}}
+	withPartial := base
+	withPartial.Messages = []provider.Message{
+		base.Messages[0],
+		{Role: provider.RoleAssistant, Incomplete: true, Content: []provider.Block{provider.Text{Text: partial}}},
+		base.Messages[1],
+	}
+	client := New()
+	target := Target("m")
+	body, err := client.buildRequest(target, withPartial, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), partial) {
+		t.Fatalf("incomplete assistant reached Ollama wire:\n%s", body)
+	}
+	if !strings.Contains(string(body), "before") || !strings.Contains(string(body), "after") {
+		t.Fatalf("projection removed surrounding durable messages:\n%s", body)
+	}
+	got, err := client.CountTokens(context.Background(), target, withPartial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := client.CountTokens(context.Background(), target, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("estimate with partial = %+v, want %+v", got, want)
 	}
 }
 
@@ -428,7 +599,7 @@ func TestProbeReportsCapabilities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.Reachable || !res.ModelPresent || !res.Vision {
+	if !res.Reachable || !res.ModelPresent || !res.VisionKnown || !res.Vision {
 		t.Errorf("probe = %+v", res)
 	}
 	if res.Tools == provider.ToolsNone {

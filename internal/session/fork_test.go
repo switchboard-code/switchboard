@@ -193,6 +193,45 @@ func TestForkRefusesACutInsideATurn(t *testing.T) {
 	}
 }
 
+func TestForkRefusesInjectedUserMessageAsATurnBoundary(t *testing.T) {
+	store, src := forkFixture(t)
+
+	if err := src.AppendMessage(provider.UserText("third question")); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.AppendMessage(provider.Message{Role: provider.RoleAssistant, Content: []provider.Block{
+		provider.ToolUse{ID: "call_2", Name: "read", Input: []byte(`{"path":"b.txt"}`)},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.AppendMessage(provider.Message{Role: provider.RoleTool, Content: []provider.Block{
+		provider.ToolResult{ToolUseID: "call_2", Name: "read", Content: "contents"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	injected := provider.UserText("[watch] tests are still red")
+	injected.Injected = true
+	if err := src.AppendMessage(injected); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.AppendMessage(provider.Message{
+		Role: provider.RoleAssistant,
+		Content: []provider.Block{
+			provider.Text{Text: "I will keep debugging."},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The injected report is user-role on provider wires, but it belongs to the
+	// turn already in progress. Treating it as an opening would let a fork keep
+	// the tool round while silently discarding that turn's closing answer.
+	_, err := store.Fork(src.ID(), 9)
+	if err == nil || !strings.Contains(err.Error(), "inside a turn") {
+		t.Fatalf("err = %v, want the injected mid-turn cut refused", err)
+	}
+}
+
 func TestForkBoundsAndProvenance(t *testing.T) {
 	store, src := forkFixture(t)
 

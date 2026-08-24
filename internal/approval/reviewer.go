@@ -154,6 +154,7 @@ func (r *ModelReviewer) Review(ctx context.Context, request permission.ReviewReq
 	defer stream.Close()
 
 	var response strings.Builder
+	limiter := provider.NewStreamLimiter(target.Params.MaxOutputTokens)
 	for {
 		event, nextErr := stream.Next()
 		if contextErr := reviewCtx.Err(); contextErr != nil {
@@ -164,6 +165,10 @@ func (r *ModelReviewer) Review(ctx context.Context, request permission.ReviewReq
 				nextErr = provider.ErrStreamIncomplete
 			}
 			return permission.ReviewResult{Reviewer: r.Identity}, errors.Join(nextErr, settle(provider.Usage{}, nextErr))
+		}
+		if limitErr := limiter.Admit(event); limitErr != nil {
+			cancel()
+			return permission.ReviewResult{Reviewer: r.Identity}, errors.Join(limitErr, settle(provider.Usage{}, limitErr))
 		}
 
 		switch event.Type {

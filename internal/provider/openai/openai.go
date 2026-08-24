@@ -12,6 +12,8 @@
 package openai
 
 import (
+	"fmt"
+
 	"github.com/switchboard-code/switchboard/internal/credential"
 	"github.com/switchboard-code/switchboard/internal/provider"
 	"github.com/switchboard-code/switchboard/internal/provider/openaicompat"
@@ -62,7 +64,8 @@ var SubscriptionOAuth = credential.OAuthSettings{
 
 // profiles record what each endpoint actually does.
 //
-// Neither has been run against the live service, so both claim the floor:
+// The developer API profile has not been run against the live service, so it
+// claims the floor:
 // tools, because that is what the adapter is for, and nothing else. Reasoning
 // is left unsupported so that asking for it is a capability error the caller
 // sees rather than a parameter silently dropped, which would return a cheaper,
@@ -74,26 +77,20 @@ var profiles = map[string]openaicompat.Profile{
 		Tools:       true,
 		StreamUsage: true,
 	},
-	Subscription: {
-		Provider:    Name,
-		BaseURL:     SubscriptionBaseURL,
-		Tools:       true,
-		StreamUsage: true,
-	},
 }
 
-// New builds a client for a serving surface. An unknown surface falls back to
-// the developer API, which is the one that behaves like the documented format.
+// New builds a client for a serving surface. A surface is a wire/capability
+// profile, not a label: an unknown value is refused instead of silently
+// becoming the developer API, and subscription is served only by NewResponses.
 //
 // Subscription is not served here and cannot be: that endpoint speaks the
 // Responses API, which is a different wire format. NewResponses serves it.
-func New(surface string, opts ...openaicompat.Option) *openaicompat.Client {
+func New(surface string, opts ...openaicompat.Option) (*openaicompat.Client, error) {
 	profile, ok := profiles[surface]
 	if !ok {
-		profile = profiles[FirstParty]
-		surface = FirstParty
+		return nil, fmt.Errorf("OpenAI serving surface %q is not a tested chat-completions profile", surface)
 	}
-	return openaicompat.NewFor(surface, profile, opts...)
+	return openaicompat.NewFor(surface, profile, opts...), nil
 }
 
 // SubscriptionNotes records what the endpoint wants, captured from it rather
@@ -125,10 +122,14 @@ const SubscriptionNotes = `
 // override, so a caller can tell whether one is in effect without knowing the
 // address.
 func DefaultBaseURL(surface string) string {
-	if p, ok := profiles[surface]; ok {
-		return p.BaseURL
+	switch surface {
+	case FirstParty:
+		return FirstPartyBaseURL
+	case Subscription:
+		return SubscriptionBaseURL
+	default:
+		return ""
 	}
-	return FirstPartyBaseURL
 }
 
 // DefaultOAuth returns the bundled client for a surface, which exists only for

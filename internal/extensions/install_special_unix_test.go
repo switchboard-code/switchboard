@@ -1,4 +1,4 @@
-//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
+//go:build aix || android || darwin || dragonfly || freebsd || illumos || linux || netbsd || openbsd || solaris
 
 package extensions
 
@@ -6,8 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestInstallRejectsSpecialSourceAndGitFiles(t *testing.T) {
@@ -15,7 +16,7 @@ func TestInstallRejectsSpecialSourceAndGitFiles(t *testing.T) {
 		t.Run(strings.ReplaceAll(relative, ".", "git"), func(t *testing.T) {
 			root := makePlugin(t, DialectCodex, `{"name":"special"}`)
 			plugin := discoverInstallPlugin(t, root, ScopeUser, DialectCodex)
-			if err := syscall.Mkfifo(filepath.Join(root, relative), 0o600); err != nil {
+			if err := unix.Mkfifo(filepath.Join(root, relative), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := Install(plugin, t.TempDir()); err == nil || !strings.Contains(err.Error(), "special file") {
@@ -33,7 +34,7 @@ func TestInstallNeverOverwritesSpecialDestination(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Mkfifo(destination, 0o600); err != nil {
+	if err := unix.Mkfifo(destination, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Install(plugin, cacheRoot); err == nil {

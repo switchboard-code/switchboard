@@ -8,9 +8,24 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/switchboard-code/switchboard/internal/checkpoint"
 	"github.com/switchboard-code/switchboard/internal/execution"
 	"github.com/switchboard-code/switchboard/internal/permission"
 )
+
+func TestMain(m *testing.M) {
+	switch os.Getenv("SB_TOOLS_EXEC_HELPER") {
+	case "safe":
+		_, _ = os.Stdout.WriteString("safe")
+		os.Exit(0)
+	case "list":
+		_, _ = os.Stdout.WriteString("marker.txt\n")
+		os.Exit(0)
+	case "fail":
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
 
 func newRegistry(t *testing.T) (*Registry, string) {
 	t.Helper()
@@ -19,7 +34,19 @@ func newRegistry(t *testing.T) (*Registry, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	recorder := newCheckpointRecorder(t, r.Root())
+	recorder.Begin("test mutation")
+	r.SetCheckpoints(recorder)
 	return r, r.Root()
+}
+
+func newCheckpointRecorder(t *testing.T, workspace string) *checkpoint.Recorder {
+	t.Helper()
+	recorder := checkpoint.NewRecorder()
+	if err := recorder.ConfigureRestoreCleanup(t.TempDir(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	return recorder
 }
 
 func run(t *testing.T, r *Registry, tool string, input any) Result {
@@ -284,8 +311,8 @@ func TestEditPreservesFileMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0o755 {
-		t.Errorf("mode = %o, want 755; an edit must not make a script unexecutable", fi.Mode().Perm())
+	if want := restorableFileMode(0o755); fi.Mode().Perm() != want.Perm() {
+		t.Errorf("mode = %o, want %o; an edit must preserve every mode bit this platform can restore", fi.Mode().Perm(), want.Perm())
 	}
 }
 
@@ -328,9 +355,14 @@ func TestExecPlanDescribesThePermissionRequest(t *testing.T) {
 }
 
 func TestExecPermissionArgvCannotRewriteRun(t *testing.T) {
+	t.Setenv("SB_TOOLS_EXEC_HELPER", "safe")
 	r, _ := newRegistry(t)
 	tool, _ := r.Get("exec")
-	plan, err := tool.Plan(json.RawMessage(`{"command":["printf","safe"]}`))
+	raw, err := json.Marshal(map[string]any{"command": []string{os.Args[0]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := tool.Plan(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,7 +436,8 @@ func TestExecRuns(t *testing.T) {
 	r, root := newRegistry(t)
 	writeFile(t, filepath.Join(root, "marker.txt"), "x")
 
-	res := run(t, r, "exec", map[string]any{"command": []string{"ls"}})
+	t.Setenv("SB_TOOLS_EXEC_HELPER", "list")
+	res := run(t, r, "exec", map[string]any{"command": []string{os.Args[0]}})
 	if res.IsError {
 		t.Fatalf("exec failed: %s", res.Content)
 	}
@@ -412,7 +445,8 @@ func TestExecRuns(t *testing.T) {
 		t.Errorf("command did not run in the workspace: %q", res.Content)
 	}
 
-	failed := run(t, r, "exec", map[string]any{"command": []string{"false"}})
+	t.Setenv("SB_TOOLS_EXEC_HELPER", "fail")
+	failed := run(t, r, "exec", map[string]any{"command": []string{os.Args[0]}})
 	if !failed.IsError {
 		t.Error("a non-zero exit must be reported as a tool error")
 	}

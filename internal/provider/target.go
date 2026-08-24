@@ -260,63 +260,42 @@ func DisplayRouteTargetID(id RouteTargetID) string {
 	return target.Display()
 }
 
-// EffectiveOutputTokenReserve returns the maximum output allowance the
-// concrete adapter will put on a request. A context window covers input and
-// output together, so routing and the last pre-stream check must share these
-// semantics rather than each guessing from catalog MaxOutput.
-func EffectiveOutputTokenReserve(target RouteTarget, catalogMax int) int {
-	requested := target.Params.MaxOutputTokens
-	switch target.Provider {
-	case "anthropic", "kimi":
-		const messagesDefault = 8_192
-		if requested <= 0 {
-			requested = messagesDefault
+// EffectiveOutputTokenAllowance returns the maximum output the bound adapter
+// will put on a request. Adapters with wire-specific limit semantics own them
+// through OutputTokenAllower; the generic fallback is exact only when the user
+// set a limit or the catalog supplies the server/model maximum.
+func EffectiveOutputTokenAllowance(bound Provider, target RouteTarget, catalogMax int) int {
+	if resolver, ok := bound.(OutputTokenAllowanceResolver); ok {
+		allowance, err := resolver.ResolveOutputTokenAllowance(target, catalogMax)
+		if err != nil {
+			return math.MaxInt
 		}
-		if reasoning := target.Params.Reasoning; reasoning != nil && reasoning.Enabled {
-			budget := 0
-			switch reasoning.Effort {
-			case "":
-				budget = 4_096
-			case "low":
-				budget = 1_024
-			case "medium":
-				budget = 4_096
-			case "high":
-				budget = 16_384
-			case "max":
-				budget = 32_768
-			default:
-				return maxOutputReserve(requested, catalogMax)
-			}
-			// The Messages API requires max_tokens to clear the thinking budget;
-			// the adapter raises a too-small/default request by this exact amount.
-			if requested <= budget {
-				requested = budget + messagesDefault
-			}
-		}
-		return requested
-	default:
-		if requested > 0 {
-			return requested
-		}
-		if catalogMax > 0 {
-			return catalogMax
-		}
-		// An omitted adapter limit delegates to a server/model default. With no
-		// catalog maximum, that is not bounded evidence and must fail closed for
-		// any finite context window.
-		return math.MaxInt
+		return allowance
 	}
+	if allower, ok := bound.(OutputTokenAllower); ok {
+		return allower.OutputTokenAllowance(target, catalogMax)
+	}
+	if target.Params.MaxOutputTokens > 0 {
+		return target.Params.MaxOutputTokens
+	}
+	if catalogMax > 0 {
+		return catalogMax
+	}
+	// An omitted adapter limit delegates to a server/model default. With no
+	// catalog maximum, that is not bounded evidence and must fail closed for
+	// any finite context window.
+	return math.MaxInt
 }
 
-func maxOutputReserve(a, b int) int {
-	if a < 0 || b < 0 {
-		return math.MaxInt
+// ResolveOutputTokenAllowance is the final pre-send form of
+// EffectiveOutputTokenAllowance. It preserves an adapter's typed local error
+// when configured parameters cannot produce a valid request; callers that are
+// only ranking candidates continue to use the sentinel-returning form above.
+func ResolveOutputTokenAllowance(bound Provider, target RouteTarget, catalogMax int) (int, error) {
+	if resolver, ok := bound.(OutputTokenAllowanceResolver); ok {
+		return resolver.ResolveOutputTokenAllowance(target, catalogMax)
 	}
-	if a > b {
-		return a
-	}
-	return b
+	return EffectiveOutputTokenAllowance(bound, target, catalogMax), nil
 }
 
 // ToolSupport records how reliably a target handles tool calls. Serial versus
@@ -338,6 +317,11 @@ type ProbeResult struct {
 	ModelPresent bool
 	Tools        ToolSupport
 	Vision       bool
+	// VisionKnown distinguishes a server that explicitly listed text-only
+	// input from one whose discovery protocol says nothing about modalities.
+	// Without it, false silently means both and cannot override a broad surface
+	// default without also inventing negative evidence for silent APIs.
+	VisionKnown bool
 
 	// ContextWindow is what the server said it will accept for this model,
 	// in tokens, or zero where the protocol offers no way to ask. A live

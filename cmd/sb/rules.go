@@ -29,6 +29,7 @@ package main
 import (
 	"fmt"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -44,8 +45,9 @@ const (
 	// its activation semantics too, and those are not written down.
 	rulesDir = ".switchboard/rules"
 
-	maxRuleFiles = 32
-	maxRuleBytes = 8 << 10
+	maxRuleFiles            = 32
+	maxRuleBytes            = 8 << 10
+	maxRuleDirectoryEntries = 256
 
 	// maxRulesPerSession bounds what the whole session can inject this way. A
 	// checkout with thirty rules that all match on the first turn would be the
@@ -71,6 +73,20 @@ type ruleSet struct {
 	workspace string
 }
 
+// resetSession starts a fresh delivery ledger without reloading repository
+// rules. The rule definitions belong to the workspace, but fired and count
+// describe what one session has already received; carrying them across an
+// adopted log can silently withhold instructions from its model context.
+func (s *ruleSet) resetSession() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fired = make(map[string]bool)
+	s.count = 0
+}
+
 // loadRules reads the rules directory once, at assembly, sorted by name.
 //
 // It needs no trust grant for the reason a skill needs none: nothing executes
@@ -79,9 +95,12 @@ type ruleSet struct {
 func loadRules(workspace string) (*ruleSet, []string) {
 	set := &ruleSet{fired: map[string]bool{}, workspace: filepath.Clean(workspace)}
 	dir := filepath.Join(workspace, filepath.FromSlash(rulesDir))
-	entries, err := os.ReadDir(dir)
+	entries, err := readWorkspaceDirectoryBounded(workspace, dir, maxRuleDirectoryEntries, nil)
 	if err != nil {
-		return set, nil
+		if os.IsNotExist(err) {
+			return set, nil
+		}
+		return set, []string{fmt.Sprintf("%s was not loaded: %v", rulesDir, err)}
 	}
 
 	var names []string
@@ -99,7 +118,7 @@ func loadRules(workspace string) (*ruleSet, []string) {
 		names = names[:maxRuleFiles]
 	}
 	for _, name := range names {
-		rule, err := readRule(filepath.Join(dir, name))
+		rule, err := readRule(workspace, filepath.Join(dir, name))
 		if err != nil {
 			notes = append(notes, fmt.Sprintf("%s/%s was not loaded: %v", rulesDir, name, err))
 			continue
@@ -112,13 +131,14 @@ func loadRules(workspace string) (*ruleSet, []string) {
 // readRule parses the frontmatter and body. The format is deliberately two
 // keys and no more: anything that looked like a program would want a runtime,
 // and this is a file that says a paragraph when a path is touched.
-func readRule(path string) (pathRule, error) {
-	data, err := os.ReadFile(path)
+func readRule(workspace, path string) (pathRule, error) {
+	return readRuleWithHook(workspace, path, nil)
+}
+
+func readRuleWithHook(workspace, path string, beforeOpen func()) (pathRule, error) {
+	data, err := readWorkspaceFileBounded(workspace, path, maxRuleBytes, beforeOpen)
 	if err != nil {
 		return pathRule{}, err
-	}
-	if len(data) > maxRuleBytes {
-		return pathRule{}, fmt.Errorf("it is %d bytes, over the %d byte limit for a rule", len(data), maxRuleBytes)
 	}
 	text := strings.ReplaceAll(string(data), "\r\n", "\n")
 	if !strings.HasPrefix(text, "---\n") {
@@ -209,7 +229,7 @@ func ruleCovers(rule pathRule, paths []string) bool {
 
 func matchRuleGlob(glob, path string) bool {
 	glob = strings.TrimSuffix(filepath.ToSlash(glob), "/")
-	if ok, err := filepath.Match(glob, path); err == nil && ok {
+	if ok, err := pathpkg.Match(glob, path); err == nil && ok {
 		return true
 	}
 	// A directory-shaped glob covers everything under it.
@@ -225,7 +245,7 @@ func matchRuleGlob(glob, path string) bool {
 		if parent == dir {
 			return false
 		}
-		if ok, err := filepath.Match(glob, parent); err == nil && ok {
+		if ok, err := pathpkg.Match(glob, parent); err == nil && ok {
 			return true
 		}
 		dir = parent

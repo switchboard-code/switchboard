@@ -20,7 +20,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/switchboard-code/switchboard/internal/childenv"
+	"github.com/switchboard-code/switchboard/internal/execution"
+	"github.com/switchboard-code/switchboard/internal/safeexec"
+	workspacefs "github.com/switchboard-code/switchboard/internal/workspace"
 )
 
 const maxLSPMessageBytes = 16 << 20
@@ -72,6 +74,11 @@ type Client struct {
 	problems  *ProblemStore
 	cmd       *exec.Cmd
 	root      string
+	// documentRoot is the exact physical workspace identity selected before
+	// the server starts. Every initial and retained-document read goes through
+	// it; root is only the LSP wire/cwd spelling and is never file authority.
+	documentRoot    *workspacefs.Root
+	documentRootErr error
 	// closeGrace is a test seam; zero uses closeTimeout.
 	closeGrace time.Duration
 }
@@ -107,10 +114,55 @@ func Start(ctx context.Context, argv []string, root string) (*Client, error) {
 }
 
 func startWithProblems(ctx context.Context, argv []string, root string, problems *ProblemStore) (*Client, error) {
+	return startWithCommand(ctx, argv, root, problems, func(argv []string, root string) (*exec.Cmd, error) {
+		return languageServerCommand(argv, root), nil
+	})
+}
+
+func startBoundWithProblems(
+	ctx context.Context,
+	executable safeexec.Executable,
+	argv []string,
+	root string,
+	environment []string,
+	problems *ProblemStore,
+) (*Client, error) {
+	return startWithCommand(ctx, argv, root, problems, func(argv []string, root string) (*exec.Cmd, error) {
+		if len(argv) == 0 || argv[0] != executable.Path() {
+			return nil, errors.New("language server executable binding does not match argv")
+		}
+		if len(environment) == 0 {
+			return nil, errors.New("language server has no trusted child environment")
+		}
+		cmd, err := executable.Command(argv[1:]...)
+		if err != nil {
+			return nil, fmt.Errorf("binding language server executable: %w", err)
+		}
+		cmd.Dir = root
+		cmd.Env = append([]string(nil), environment...)
+		return cmd, nil
+	})
+}
+
+func startWithCommand(
+	ctx context.Context,
+	argv []string,
+	root string,
+	problems *ProblemStore,
+	command func([]string, string) (*exec.Cmd, error),
+) (*Client, error) {
 	if len(argv) == 0 || strings.TrimSpace(argv[0]) == "" {
 		return nil, fmt.Errorf("language server command is empty")
 	}
-	cmd := languageServerCommand(argv, root)
+	documentRoot, err := workspacefs.Open(root)
+	if err != nil {
+		return nil, fmt.Errorf("binding language-server workspace: %w", err)
+	}
+	root = documentRoot.Path()
+	cmd, err := command(argv, root)
+	if err != nil {
+		return nil, err
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -125,7 +177,7 @@ func startWithProblems(ctx context.Context, argv []string, root string, problems
 		return nil, fmt.Errorf("starting %s: %w", argv[0], err)
 	}
 
-	c := newClientWithProblems(stdin, stdout, root, problems)
+	c := newClientWithDocumentRoot(stdin, stdout, root, problems, documentRoot, nil)
 	c.cmd = cmd
 	if err := c.initialize(ctx); err != nil {
 		c.Close()
@@ -137,7 +189,7 @@ func startWithProblems(ctx context.Context, argv []string, root string, problems
 func languageServerCommand(argv []string, root string) *exec.Cmd {
 	cmd := exec.CommandContext(context.Background(), argv[0], argv[1:]...)
 	cmd.Dir = root
-	cmd.Env = childenv.Current()
+	cmd.Env = execution.ScrubbedChildEnv()
 	return cmd
 }
 
@@ -149,15 +201,32 @@ func newClient(in io.WriteCloser, out io.Reader, root string) *Client {
 }
 
 func newClientWithProblems(in io.WriteCloser, out io.Reader, root string, problems *ProblemStore) *Client {
+	documentRoot, rootErr := workspacefs.Open(root)
+	if rootErr == nil {
+		root = documentRoot.Path()
+	}
+	return newClientWithDocumentRoot(in, out, root, problems, documentRoot, rootErr)
+}
+
+func newClientWithDocumentRoot(
+	in io.WriteCloser,
+	out io.Reader,
+	root string,
+	problems *ProblemStore,
+	documentRoot *workspacefs.Root,
+	documentRootErr error,
+) *Client {
 	if problems == nil {
 		problems = NewProblemStore(root)
 	}
 	c := &Client{
-		in:        in,
-		pending:   map[int64]chan *response{},
-		documents: map[string]*documentState{},
-		root:      filepath.Clean(root),
-		problems:  problems,
+		in:              in,
+		pending:         map[int64]chan *response{},
+		documents:       map[string]*documentState{},
+		root:            filepath.Clean(root),
+		problems:        problems,
+		documentRoot:    documentRoot,
+		documentRootErr: documentRootErr,
 		capabilities: Capabilities{
 			PositionEncoding: PositionEncodingUTF16,
 			Sync:             SyncOptions{OpenClose: true, Change: SyncFull},
@@ -591,9 +660,13 @@ func (c *Client) beginDocumentCall(ctx context.Context, feature Feature, method,
 	}
 
 	// Position resolution and synchronization consume the same single read.
-	data, err := readDocumentSnapshot(ctx, filepath.Clean(path))
+	data, err := c.readDocumentSnapshot(ctx, filepath.Clean(path))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			closeErr := c.closeDocumentLocked(path, capabilities)
+			return pendingCall{}, errors.Join(err, closeErr)
+		}
+		if documentAuthorityChanged(err) {
 			closeErr := c.closeDocumentLocked(path, capabilities)
 			return pendingCall{}, errors.Join(err, closeErr)
 		}

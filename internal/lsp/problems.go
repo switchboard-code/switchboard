@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf8"
+
+	"github.com/switchboard-code/switchboard/internal/credential"
 )
 
 const (
@@ -452,9 +454,9 @@ func (s *ProblemStore) normalizeProblem(uri, path string, navigable bool, proble
 	if problem.Severity < SeverityError || problem.Severity > SeverityHint {
 		problem.Severity = 0
 	}
-	problem.Code = truncateUTF8(problem.Code, maxProblemCodeBytes)
-	problem.Source = truncateUTF8(problem.Source, maxProblemSourceBytes)
-	problem.Message = truncateUTF8(problem.Message, maxProblemMessageBytes)
+	problem.Code = redactThenTruncateUTF8(problem.Code, maxProblemCodeBytes)
+	problem.Source = redactThenTruncateUTF8(problem.Source, maxProblemSourceBytes)
+	problem.Message = redactThenTruncateUTF8(problem.Message, maxProblemMessageBytes)
 
 	relatedLimit := len(problem.Related)
 	if relatedLimit > maxRelatedPerProblem {
@@ -465,7 +467,7 @@ func (s *ProblemStore) normalizeProblem(uri, path string, navigable bool, proble
 		item := problem.Related[i]
 		item.Path, item.Navigable = s.pathForURI(item.URI)
 		normalizePosition(&item.Line, &item.Column, &item.EndLine, &item.EndColumn)
-		item.Message = truncateUTF8(item.Message, maxProblemMessageBytes)
+		item.Message = redactThenTruncateUTF8(item.Message, maxProblemMessageBytes)
 		related[i] = item
 	}
 	problem.RelatedDropped = len(problem.Related) - relatedLimit
@@ -474,7 +476,7 @@ func (s *ProblemStore) normalizeProblem(uri, path string, navigable bool, proble
 }
 
 func (s *ProblemStore) protocolIssueLocked(message string) error {
-	message = truncateUTF8(message, maxProblemMessageBytes)
+	message = redactThenTruncateUTF8(message, maxProblemMessageBytes)
 	s.protocolIssues++
 	s.lastProtocolIssue = message
 	s.changedLocked()
@@ -592,6 +594,11 @@ func truncateUTF8(value string, limit int) string {
 		end--
 	}
 	return value[:end]
+}
+
+func redactThenTruncateUTF8(value string, limit int) string {
+	value = credential.Redact(value, credential.ScanPrompt(value))
+	return truncateUTF8(value, limit)
 }
 
 func sortProblems(problems []Problem) {

@@ -725,7 +725,7 @@ func runPluginsActionContext(ctx context.Context, w io.Writer, workspace string,
 					record.Plugin.ID, candidate.Plugin().RealPath, enableErr)
 			}
 			fmt.Fprintf(w, "installed and enabled %s at %s; executable components remain untrusted; the change applies on the next Switchboard run\n",
-				record.Plugin.ID, candidate.Plugin().RealPath)
+				cliText(record.Plugin.ID), cliText(candidate.Plugin().RealPath))
 			return nil
 		case "enable":
 			if record.ManagedDenied {
@@ -783,7 +783,7 @@ func runPluginsActionContext(ctx context.Context, w io.Writer, workspace string,
 		if err != nil {
 			return fmt.Errorf("%s %s: %w", action, record.Plugin.ID, err)
 		}
-		fmt.Fprintf(w, "%s %s; the change applies on the next Switchboard run\n", pluginActionPastTense(action), record.Plugin.ID)
+		fmt.Fprintf(w, "%s %s; the change applies on the next Switchboard run\n", pluginActionPastTense(action), cliText(record.Plugin.ID))
 		return nil
 	default:
 		return fmt.Errorf("unknown plugins action %q: use list, inspect, install, enable, disable, trust, or untrust", action)
@@ -833,25 +833,25 @@ func writePluginList(w io.Writer, inv *pluginInventory) {
 				recovery = record.Reference.RecoveryToken
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-				record.Plugin.ID, pluginActivationLabel(record), pluginNativeLabel(record),
-				pluginExecutionLabel(record), record.Plugin.RealPath, valueOrDash(recovery))
+				cliText(record.Plugin.ID), cliText(pluginActivationLabel(record)), cliText(pluginNativeLabel(record)),
+				cliText(pluginExecutionLabel(record)), cliText(record.Plugin.RealPath), cliText(valueOrDash(recovery)))
 		}
 		for _, reference := range inv.stale {
 			fmt.Fprintf(w, "%s\tsaved-unavailable\tunknown\t-\t%s\t%s\n",
-				reference.Activation.ID, reference.Activation.RealPath, reference.RecoveryToken)
+				cliText(reference.Activation.ID), cliText(reference.Activation.RealPath), cliText(reference.RecoveryToken))
 		}
 	}
 	writePluginDiagnostics(w, inv.diagnostics)
 }
 
 func writePluginInspect(w io.Writer, record pluginRecord) {
-	fmt.Fprintf(w, "plugin: %s\n", record.Plugin.ID)
-	fmt.Fprintf(w, "native ids: %s\n", valueOrDash(strings.Join(record.NativeIDs, ", ")))
-	fmt.Fprintf(w, "dialect: %s\nscope: %s\npath: %s\n", record.Plugin.Dialect, record.Plugin.Scope, record.Plugin.RealPath)
+	fmt.Fprintf(w, "plugin: %s\n", cliText(record.Plugin.ID))
+	fmt.Fprintf(w, "native ids: %s\n", cliText(valueOrDash(strings.Join(record.NativeIDs, ", "))))
+	fmt.Fprintf(w, "dialect: %s\nscope: %s\npath: %s\n", cliText(string(record.Plugin.Dialect)), cliText(string(record.Plugin.Scope)), cliText(record.Plugin.RealPath))
 	fmt.Fprintf(w, "state: %s\nnative: %s\nexecution: %s\ndigest: %s\n",
-		pluginActivationLabel(record), pluginNativeLabel(record), pluginExecutionLabel(record), record.Plugin.Digest)
+		cliText(pluginActivationLabel(record)), cliText(pluginNativeLabel(record)), cliText(pluginExecutionLabel(record)), cliText(record.Plugin.Digest))
 	if record.Reference != nil {
-		fmt.Fprintf(w, "recovery: %s\n", record.Reference.RecoveryToken)
+		fmt.Fprintf(w, "recovery: %s\n", cliText(record.Reference.RecoveryToken))
 	}
 	if len(record.Plugin.Components) == 0 {
 		fmt.Fprintln(w, "components: none")
@@ -862,14 +862,14 @@ func writePluginInspect(w io.Writer, record pluginRecord) {
 			if component.Inline {
 				path = "inline"
 			}
-			fmt.Fprintf(w, "  %s\t%s\t%s\n", component.Kind, component.Source, valueOrDash(path))
+			fmt.Fprintf(w, "  %s\t%s\t%s\n", cliText(string(component.Kind)), cliText(string(component.Source)), cliText(valueOrDash(path)))
 		}
 	}
 	for _, warning := range record.Plugin.Warnings {
-		fmt.Fprintf(w, "warning: %s: %s\n", warning.Code, warning.Message)
+		fmt.Fprintf(w, "warning: %s: %s\n", cliText(warning.Code), cliText(warning.Message))
 	}
 	for _, provenance := range record.Provenance {
-		fmt.Fprintf(w, "source: %s (%s)\n", provenance.NativeID, valueOrDash(provenance.RegistryPath))
+		fmt.Fprintf(w, "source: %s (%s)\n", cliText(provenance.NativeID), cliText(valueOrDash(provenance.RegistryPath)))
 	}
 }
 
@@ -917,7 +917,7 @@ func pluginExecutionLabel(record pluginRecord) string {
 
 func writePluginDiagnostics(w io.Writer, notes []mcpNote) {
 	for _, note := range notes {
-		fmt.Fprintf(w, "%s: %s\n", note.level, note.text)
+		fmt.Fprintf(w, "%s: %s\n", cliText(note.level), cliText(note.text))
 	}
 }
 

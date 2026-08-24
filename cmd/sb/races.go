@@ -22,7 +22,7 @@ func runRacesCLI(w io.Writer, store *session.Store, workspace string) error {
 	if err != nil {
 		return err
 	}
-	return racesReport(w, infos, "for "+workspace+"; /race <tier> <prompt> runs one")
+	return racesReport(w, infos, "for "+cliText(workspace)+"; /race <tier> <prompt> runs one")
 }
 
 // runRacesAllCLI tallies the corpus across every workspace: the paired
@@ -58,7 +58,7 @@ func racesReport(w io.Writer, infos []session.Info, where string) error {
 	for _, info := range infos {
 		found, err := session.ReadRaces(info.Path)
 		if err != nil {
-			fmt.Fprintf(w, "%-22s unreadable: %v\n", info.ID, err)
+			fmt.Fprintf(w, "%-22s unreadable: %s\n", cliText(info.ID), cliText(err.Error()))
 			continue
 		}
 		for _, race := range found {
@@ -121,7 +121,7 @@ func racesReport(w io.Writer, infos []session.Info, where string) error {
 		if t.censored > 0 {
 			line += fmt.Sprintf(", censored %d", t.censored)
 		}
-		fmt.Fprintln(w, line)
+		fmt.Fprintln(w, cliText(line))
 	}
 
 	fmt.Fprintf(w, "\n%d races; a tie is evidence the cheaper rung was enough, a censored race is evidence of nothing (§8.4)\n", races)

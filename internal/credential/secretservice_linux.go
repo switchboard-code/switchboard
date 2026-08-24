@@ -1,13 +1,14 @@
 package credential
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/switchboard-code/switchboard/internal/safeexec"
 )
 
 // OSStore is the freedesktop Secret Service, reached through `secret-tool`.
@@ -20,18 +21,58 @@ import (
 // can carry on to the sources that do work headlessly and the final message can
 // say the chain was short rather than empty.
 type OSStore struct {
-	bin string
+	bin       string // explicit absolute test fixture; production uses helper
+	helper    safeexec.Executable
+	helperErr error
 }
 
-func NewOSStore() *OSStore { return &OSStore{} }
+func NewOSStore() *OSStore {
+	return newSecretServiceStore("secret-tool",
+		"/usr/bin/secret-tool",
+		"/usr/local/bin/secret-tool",
+		"/bin/secret-tool",
+	)
+}
+
+func newSecretServiceStore(name string, preferred ...string) *OSStore {
+	helper, err := resolveLinuxHelper(name, preferred...)
+	return &OSStore{helper: helper, helperErr: err}
+}
 
 func (s *OSStore) Name() string { return "Secret Service keyring" }
 
-func (s *OSStore) tool() string {
+func (s *OSStore) command(ctx context.Context, args ...string) (*exec.Cmd, error) {
 	if s.bin != "" {
-		return s.bin
+		env, err := linuxHelperEnvironment(false)
+		if err != nil {
+			return nil, &Unavailable{Store: s.Name(), Reason: "the helper environment could not be safely prepared"}
+		}
+		cmd := exec.Command(s.bin, args...)
+		cmd.Env = env
+		return cmd, nil
 	}
-	return "secret-tool"
+	if s.helperErr != nil {
+		return nil, &Unavailable{
+			Store:  s.Name(),
+			Reason: "secret-tool was not found at a safe system location outside the current workspace; install libsecret-tools or use an environment variable or credential helper",
+		}
+	}
+	cmd, err := s.helper.Command(args...)
+	if err != nil {
+		return nil, &Unavailable{
+			Store:  s.Name(),
+			Reason: "the resolved secret-tool executable changed; refusing to send it credential material",
+		}
+	}
+	env, err := linuxHelperEnvironment(true)
+	if err != nil {
+		return nil, &Unavailable{
+			Store:  s.Name(),
+			Reason: "the helper environment could not be bound outside the current workspace; refusing to send credential material",
+		}
+	}
+	cmd.Env = env
+	return cmd, nil
 }
 
 // attributes are the lookup key. They are passed as separate argv elements, so
@@ -49,13 +90,19 @@ func (s *OSStore) Get(ctx context.Context, ref Ref) (Secret, error) {
 	}
 
 	args := append([]string{"lookup"}, attributes(ref)...)
-	cmd := exec.CommandContext(ctx, s.tool(), args...)
+	cmd, err := s.command(ctx, args...)
+	if err != nil {
+		return Secret{}, err
+	}
 
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr boundedHelperCapture
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	if err := runCredentialCommand(ctx, cmd); err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return Secret{}, contextErr
+		}
 		if unavailable := s.unavailable(err, stderr.String()); unavailable != nil {
 			return Secret{}, unavailable
 		}
@@ -65,7 +112,10 @@ func (s *OSStore) Get(ctx context.Context, ref Ref) (Secret, error) {
 		if strings.TrimSpace(stderr.String()) == "" {
 			return Secret{}, ErrNotFound
 		}
-		return Secret{}, fmt.Errorf("reading the keyring: %w%s", err, diagnostics(stderr.String()))
+		return Secret{}, fmt.Errorf("reading the keyring: %w%s", err, diagnostics(stderr.String(), stderr.overflow))
+	}
+	if stdout.overflow {
+		return Secret{}, fmt.Errorf("the keyring returned more than %d credential bytes; output withheld", maxHelperCaptureBytes)
 	}
 
 	// lookup writes the secret with no trailing newline.
@@ -87,19 +137,25 @@ func (s *OSStore) Set(ctx context.Context, ref Ref, value string) error {
 	}
 
 	args := append([]string{"store", "--label=Switchboard " + ref.String()}, attributes(ref)...)
-	cmd := exec.CommandContext(ctx, s.tool(), args...)
+	cmd, err := s.command(ctx, args...)
+	if err != nil {
+		return err
+	}
 	// The tool reads the secret from standard input, which keeps it out of argv
 	// and out of any process listing.
 	cmd.Stdin = strings.NewReader(value)
 
-	var stderr bytes.Buffer
+	var stderr boundedHelperCapture
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	if err := runCredentialCommand(ctx, cmd); err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
 		if unavailable := s.unavailable(err, stderr.String()); unavailable != nil {
 			return unavailable
 		}
-		return fmt.Errorf("storing in the keyring: %w%s", err, diagnostics(stderr.String()))
+		return fmt.Errorf("storing in the keyring: %w%s", err, diagnostics(stderr.String(), stderr.overflow))
 	}
 	return nil
 }
@@ -120,16 +176,22 @@ func (s *OSStore) Delete(ctx context.Context, ref Ref) error {
 	}
 
 	args := append([]string{"clear"}, attributes(ref)...)
-	cmd := exec.CommandContext(ctx, s.tool(), args...)
+	cmd, err := s.command(ctx, args...)
+	if err != nil {
+		return err
+	}
 
-	var stderr bytes.Buffer
+	var stderr boundedHelperCapture
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	if err := runCredentialCommand(ctx, cmd); err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
 		if unavailable := s.unavailable(err, stderr.String()); unavailable != nil {
 			return unavailable
 		}
-		return fmt.Errorf("removing from the keyring: %w%s", err, diagnostics(stderr.String()))
+		return fmt.Errorf("removing from the keyring: %w%s", err, diagnostics(stderr.String(), stderr.overflow))
 	}
 	return nil
 }

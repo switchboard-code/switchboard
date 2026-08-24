@@ -23,6 +23,7 @@ package router
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/switchboard-code/switchboard/internal/catalog"
@@ -274,9 +275,21 @@ func (h Heuristic) filter(in Input) (feasible []Candidate, excluded []string) {
 			excluded = append(excluded, fmt.Sprintf("%s is not an approved destination for this workspace", c.Target.Display()))
 
 		case !candidateFitsContext(c):
-			excluded = append(excluded, fmt.Sprintf(
-				"%s holds %d tokens and this turn may need up to %d input plus %d reserved output tokens",
-				c.Target.Display(), c.Info.ContextWindow, candidateContextTokens(c), c.ReservedOutputTokens))
+			if c.ReservedOutputTokens == math.MaxInt {
+				if c.Target.Params.MaxOutputTokens > 0 {
+					excluded = append(excluded, fmt.Sprintf(
+						"%s has no valid finite output allowance for its %d-token context window: configured max_output %d conflicts with the reasoning settings; raise max_output or lower or disable reasoning",
+						c.Target.Display(), c.Info.ContextWindow, c.Target.Params.MaxOutputTokens))
+				} else {
+					excluded = append(excluded, fmt.Sprintf(
+						"%s has no finite output bound for its %d-token context window; set a positive tier max_output with /models or in config",
+						c.Target.Display(), c.Info.ContextWindow))
+				}
+			} else {
+				excluded = append(excluded, fmt.Sprintf(
+					"%s holds %d tokens and this turn may need up to %d input plus %d reserved output tokens",
+					c.Target.Display(), c.Info.ContextWindow, candidateContextTokens(c), c.ReservedOutputTokens))
+			}
 
 		case c.CatalogKnown && c.Info.Metering != catalog.Local && c.Info.Metering != catalog.Plan && !c.Info.Free() && c.CeilingCost <= 0:
 			excluded = append(excluded, fmt.Sprintf(

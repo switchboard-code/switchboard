@@ -838,9 +838,17 @@ func (c *Client) listToolsWithLimits(ctx context.Context, limits listToolsLimits
 			p["cursor"] = cursor
 		}
 		params, _ := json.Marshal(p)
-		raw, secrets, _, err := c.callWithSecrets(ctx, "tools/list", params)
+		raw, secrets, credentials, err := c.callWithSecrets(ctx, "tools/list", params)
 		if err != nil {
 			return fmt.Errorf("tools/list: %w", err)
+		}
+		metadataSecrets := credentials
+		if _, ok := c.transport.(*httpTransport); ok {
+			// Every value applied to an HTTP request is server-visible and can
+			// therefore be laundered back through the successful response. Stdio
+			// has no analogous request-header set; restricting it to credentials
+			// avoids treating ordinary command arguments as secret metadata.
+			metadataSecrets = secrets
 		}
 		pages++
 		if len(raw) > limits.bytes-totalBytes {
@@ -866,6 +874,12 @@ func (c *Client) listToolsWithLimits(ctx context.Context, limits listToolsLimits
 			if !c.spec.toolEnabled(tool.Name) {
 				continue
 			}
+			var safe bool
+			tool, safe = redactToolMetadata(tool, metadataSecrets)
+			if !safe {
+				c.logf("warn", fmt.Sprintf("mcp %s: tool skipped: discovery metadata contains request credentials", redactSecrets(c.spec.Name, secrets)))
+				continue
+			}
 			if !c.configureModernHTTPTool(tool, secrets) {
 				continue
 			}
@@ -881,6 +895,117 @@ func (c *Client) listToolsWithLimits(ctx context.Context, limits listToolsLimits
 		seenCursors[res.NextCursor] = struct{}{}
 		cursor = res.NextCursor
 	}
+}
+
+// redactToolMetadata is the successful tools/list boundary. An HTTP server
+// sees the request's configured headers and can echo them into discovery
+// metadata; those values must not then become frozen provider definitions or
+// escape through Tools. Redact the exact request values rather than relying on
+// credential-shape scanning: configured credentials may be entirely opaque.
+//
+// Tool names are both provider-visible and protocol identifiers. Rewriting one
+// would make the provider's name disagree with the remote tools/call identity,
+// so a credential-bearing name fails closed instead. Descriptions and schemas
+// can be cloned and sanitized while preserving every unrelated schema byte.
+// The token walk decodes JSON escapes before matching, which covers nested
+// values, object keys, and non-string primitives without otherwise normalizing
+// the server's schema.
+func redactToolMetadata(tool ToolInfo, secrets []string) (ToolInfo, bool) {
+	if redacted := redactToolMetadataString(tool.Name, secrets); redacted != tool.Name {
+		return ToolInfo{}, false
+	}
+	tool.Description = redactToolMetadataString(tool.Description, secrets)
+	tool.InputSchema = redactToolSchema(tool.InputSchema, secrets)
+	return tool, true
+}
+
+func redactToolSchema(raw json.RawMessage, secrets []string) json.RawMessage {
+	if len(raw) == 0 || len(secrets) == 0 {
+		return raw
+	}
+	out := make([]byte, 0, len(raw))
+	for i := 0; i < len(raw); {
+		if raw[i] != '"' && !jsonPrimitiveStart(raw[i]) {
+			out = append(out, raw[i])
+			i++
+			continue
+		}
+		if raw[i] != '"' {
+			start := i
+			for i < len(raw) && !jsonTokenDelimiter(raw[i]) {
+				i++
+			}
+			token := string(raw[start:i])
+			redacted := redactToolMetadataString(token, secrets)
+			if redacted == token {
+				out = append(out, raw[start:i]...)
+				continue
+			}
+			// Replacing a schema number, boolean, or null with a string can
+			// invalidate keyword types (for example, maximum). Once a secret is
+			// carried as a non-string primitive, fail the complete schema closed
+			// instead of advertising malformed semantics to the provider.
+			return json.RawMessage(`{"type":"object","properties":{}}`)
+		}
+
+		start := i
+		i++
+		for i < len(raw) {
+			switch raw[i] {
+			case '\\':
+				i += 2
+			case '"':
+				i++
+				goto stringEnd
+			default:
+				i++
+			}
+		}
+
+	stringEnd:
+		token := raw[start:i]
+		var value string
+		if err := json.Unmarshal(token, &value); err != nil {
+			// InputSchema arrived inside a successfully decoded JSON response, so
+			// this can only happen if the token walk and encoding/json disagree.
+			// Do not make that disagreement a raw-metadata escape hatch.
+			return json.RawMessage(`{"type":"object","properties":{}}`)
+		}
+		redacted := redactToolMetadataString(value, secrets)
+		if redacted == value {
+			out = append(out, token...)
+			continue
+		}
+		encoded, _ := json.Marshal(redacted) // encoding a string cannot fail
+		out = append(out, encoded...)
+	}
+	return json.RawMessage(out)
+}
+
+func jsonPrimitiveStart(b byte) bool {
+	return b == '-' || b >= '0' && b <= '9' || b == 't' || b == 'f' || b == 'n'
+}
+
+func jsonTokenDelimiter(b byte) bool {
+	switch b {
+	case ' ', '\t', '\r', '\n', ',', ']', '}':
+		return true
+	default:
+		return false
+	}
+}
+
+func redactToolMetadataString(value string, secrets []string) string {
+	redacted := redactSecrets(value, secrets)
+	// A configured value can itself equal or occur inside the normal marker.
+	// Empty is the only universal replacement that cannot retain a non-empty
+	// secret; use it only for that marker-collision edge case.
+	for _, secret := range secrets {
+		if secret != "" && strings.Contains(redacted, secret) {
+			return ""
+		}
+	}
+	return redacted
 }
 
 func (c *Client) configureModernHTTPTool(tool ToolInfo, secrets []string) bool {

@@ -18,8 +18,13 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/switchboard-code/switchboard/internal/execution"
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
+	"github.com/switchboard-code/switchboard/internal/safeexec"
 )
 
 const (
@@ -28,6 +33,11 @@ const (
 	DefaultSearchBytes  = 4 << 20
 	defaultGitListBytes = 64 << 20
 	defaultGitPathBytes = 64 << 10
+	defaultGitListTime  = 10 * time.Second
+	defaultWalkEntries  = 400_000
+	defaultWalkDirs     = 50_000
+	defaultWalkDepth    = 128
+	defaultWalkBatch    = 256
 )
 
 var skippedDirectories = map[string]bool{
@@ -159,6 +169,7 @@ type Index struct {
 
 	gitCommand   func(context.Context, ...string) *exec.Cmd
 	gitListBytes int64
+	walkLimits   rootedfs.WalkLimits
 
 	mu       sync.RWMutex
 	snapshot Snapshot
@@ -172,12 +183,12 @@ func NewIndex(root *Root, fileLimit int) *Index {
 	}
 	return &Index{
 		root: root, cap: fileLimit, dirty: true,
-		gitCommand: defaultGitCommand, gitListBytes: defaultGitListBytes,
+		gitListBytes: defaultGitListBytes,
+		walkLimits: rootedfs.WalkLimits{
+			MaxEntries: defaultWalkEntries, MaxDirectories: defaultWalkDirs,
+			MaxDepth: defaultWalkDepth, ReadDirBatch: defaultWalkBatch,
+		},
 	}
-}
-
-func defaultGitCommand(ctx context.Context, args ...string) *exec.Cmd {
-	return exec.CommandContext(ctx, "git", args...)
 }
 
 func (i *Index) Snapshot() Snapshot {
@@ -229,6 +240,27 @@ type gitListBudget struct {
 }
 
 func (i *Index) listGit(ctx context.Context) ([]File, bool, int, error) {
+	// Git's own untracked scan is outside the descriptor walker, so byte and
+	// entry caps alone cannot bound CPU spent on ignored/non-output fanout.
+	// Fall back to the rooted walker if it cannot produce an inventory promptly.
+	gitCtx, cancel := context.WithTimeout(ctx, defaultGitListTime)
+	defer cancel()
+	capability, err := i.root.openCapability()
+	if err != nil {
+		return nil, false, 0, err
+	}
+	defer capability.Close()
+	var git safeexec.Executable
+	if i.gitCommand == nil {
+		roots, rootsErr := safeexec.WorkspaceAndCurrentAuthorityRoots(i.root.Path())
+		if rootsErr != nil {
+			return nil, false, 0, fmt.Errorf("resolving Git workspace authority: %w", rootsErr)
+		}
+		git, err = safeexec.ResolveOutside("git", roots...)
+		if err != nil {
+			return nil, false, 0, fmt.Errorf("resolving trusted git executable: %w", err)
+		}
+	}
 	seen := make(map[string]struct{}, min(i.cap, 4096))
 	files := make([]File, 0, min(i.cap, 4096))
 	budget := gitListBudget{}
@@ -248,12 +280,7 @@ func (i *Index) listGit(ctx context.Context) ([]File, bool, int, error) {
 		if _, ok := seen[name]; ok {
 			return
 		}
-		abs, err := i.root.Resolve(name)
-		if err != nil {
-			skipped++
-			return
-		}
-		info, err := os.Lstat(abs)
+		info, err := capability.Lstat(filepath.FromSlash(name))
 		if err != nil || !info.Mode().IsRegular() {
 			skipped++
 			return
@@ -262,8 +289,12 @@ func (i *Index) listGit(ctx context.Context) ([]File, bool, int, error) {
 		files = append(files, indexedFile(name, info.Size()))
 	}
 
-	trackedArgs := []string{"-C", i.root.Path(), "ls-files", "--cached", "-z", "--"}
-	truncated, omitted, err := i.streamGitNames(ctx, trackedArgs, &budget, func(raw []byte) {
+	// ls-files consults core.fsmonitor and will execute a repository-configured
+	// hook even though this is nominally an inventory read. Repository code may
+	// not run merely because the user opened /files, so override that executable
+	// config at the command line for both inventory passes.
+	trackedArgs := []string{"-c", "core.fsmonitor=false", "-C", i.root.Path(), "ls-files", "--cached", "-z", "--"}
+	truncated, omitted, err := i.streamGitNames(gitCtx, git, trackedArgs, &budget, func(raw []byte) {
 		consume(raw, true)
 	})
 	skipped += omitted
@@ -271,14 +302,17 @@ func (i *Index) listGit(ctx context.Context) ([]File, bool, int, error) {
 		return nil, false, 0, err
 	}
 	if !truncated {
-		untrackedArgs := []string{"-C", i.root.Path(), "ls-files", "--others", "--exclude-standard", "-z", "--"}
-		truncated, omitted, err = i.streamGitNames(ctx, untrackedArgs, &budget, func(raw []byte) {
+		untrackedArgs := []string{"-c", "core.fsmonitor=false", "-C", i.root.Path(), "ls-files", "--others", "--exclude-standard", "-z", "--"}
+		truncated, omitted, err = i.streamGitNames(gitCtx, git, untrackedArgs, &budget, func(raw []byte) {
 			consume(raw, false)
 		})
 		skipped += omitted
 		if err != nil {
 			return nil, false, 0, err
 		}
+	}
+	if err := i.root.verifyCapability(capability); err != nil {
+		return nil, false, 0, err
 	}
 	sort.Slice(files, func(a, b int) bool { return files[a].Path < files[b].Path })
 	return files, truncated, skipped, nil
@@ -290,103 +324,161 @@ func (i *Index) listGit(ctx context.Context) ([]File, bool, int, error) {
 // reaped; the retained prefix remains a usable, explicitly truncated snapshot.
 func (i *Index) streamGitNames(
 	ctx context.Context,
+	git safeexec.Executable,
 	args []string,
 	budget *gitListBudget,
 	consume func([]byte),
 ) (truncated bool, skipped int, err error) {
-	commandCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	cmd := i.gitCommand(commandCtx, args...)
+	var cmd *exec.Cmd
+	if i.gitCommand != nil {
+		cmd = i.gitCommand(ctx, args...)
+	} else {
+		var err error
+		// execution.RunProcess owns cancellation so it can stop the complete
+		// process group. CommandContext kills only Git itself; a wrapper's
+		// descendant can otherwise retain stdout and keep Wait blocked forever.
+		cmd, err = git.Command(args...)
+		if err != nil {
+			return false, 0, err
+		}
+	}
 	if cmd.Env == nil {
-		cmd.Env = stableGitEnv()
+		roots, rootsErr := safeexec.WorkspaceAndCurrentAuthorityRoots(i.root.Path())
+		if rootsErr != nil {
+			return false, 0, fmt.Errorf("resolving Git workspace authority: %w", rootsErr)
+		}
+		environ, envErr := safeexec.FilterEnvironmentPath(execution.ScrubbedChildEnv(), roots...)
+		if envErr != nil {
+			return false, 0, fmt.Errorf("preparing trusted Git interpreter path: %w", envErr)
+		}
+		cmd.Env = stableGitEnv(environ)
 	} else {
 		cmd.Env = append(cmd.Env, "GIT_OPTIONAL_LOCKS=0", "GIT_PAGER=cat", "LC_ALL=C")
 	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return false, 0, err
+	// Feed the parser through Cmd.Stdout instead of reading StdoutPipe directly.
+	// RunProcess can then wait for the parser's copy goroutine while owning the
+	// process group and its cancellation. A blocking ReadSlice has no way to
+	// observe ctx while a descendant retains the pipe after Git exits.
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	parser := gitNameStream{
+		byteLimit:  i.gitListBytes,
+		entryLimit: i.cap,
+		budget:     budget,
+		consume:    consume,
+		stop:       stop,
 	}
-	if err := cmd.Start(); err != nil {
-		return false, 0, err
+	cmd.Stdout = &parser
+	runErr := execution.RunProcess(runCtx, cmd)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, parser.skipped, ctxErr
 	}
-
-	reader := bufio.NewReaderSize(stdout, 32<<10)
-	var name []byte
-	oversizedName := false
-	for {
-		if err := ctx.Err(); err != nil {
-			cancel()
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-			return false, skipped, err
-		}
-		fragment, readErr := reader.ReadSlice(0)
-		if len(fragment) > 0 {
-			remaining := i.gitListBytes - budget.bytes
-			if remaining < int64(len(fragment)) {
-				truncated = true
-				break
-			}
-			budget.bytes += int64(len(fragment))
-			if budget.entries >= i.cap {
-				truncated = true
-				break
-			}
-			if !oversizedName {
-				if len(name)+len(fragment) > defaultGitPathBytes {
-					name = nil
-					oversizedName = true
-				} else {
-					name = append(name, fragment...)
-				}
-			}
-		}
-
-		switch {
-		case readErr == nil:
-			budget.entries++
-			if oversizedName {
-				skipped++
-			} else {
-				consume(name[:len(name)-1])
-			}
-			name = name[:0]
-			oversizedName = false
-		case errors.Is(readErr, bufio.ErrBufferFull):
-			continue
-		case errors.Is(readErr, io.EOF):
-			if len(name) != 0 || oversizedName {
-				cancel()
-				_ = cmd.Process.Kill()
-				_ = cmd.Wait()
-				return false, skipped, errors.New("git ls-files returned an unterminated path")
-			}
-			waitErr := cmd.Wait()
-			if err := ctx.Err(); err != nil {
-				return false, skipped, err
-			}
-			return false, skipped, waitErr
-		default:
-			cancel()
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-			return false, skipped, readErr
-		}
+	if parser.truncated {
+		// The parser initiated this cancellation after proving there was more
+		// output than the snapshot can retain. That is a successful truncated
+		// inventory, not a failed Git command.
+		return true, parser.skipped, nil
 	}
-
-	cancel()
-	_ = cmd.Process.Kill()
-	_ = cmd.Wait()
-	if err := ctx.Err(); err != nil {
-		return false, skipped, err
+	if runErr != nil {
+		return false, parser.skipped, runErr
 	}
-	return truncated, skipped, nil
+	if parser.unterminated() {
+		return false, parser.skipped, errors.New("git ls-files returned an unterminated path")
+	}
+	return false, parser.skipped, nil
 }
 
-func stableGitEnv() []string {
-	env := os.Environ()
-	env = append(env, "GIT_OPTIONAL_LOCKS=0", "GIT_PAGER=cat", "LC_ALL=C")
-	return env
+// gitNameStream parses NUL-delimited names as os/exec copies stdout. It keeps
+// only one bounded candidate name; cancellation on a cap means the runner can
+// terminate and reap Git's entire process group instead of waiting for a
+// wrapper descendant to close the pipe.
+type gitNameStream struct {
+	byteLimit  int64
+	entryLimit int
+	budget     *gitListBudget
+	consume    func([]byte)
+	stop       context.CancelFunc
+
+	name          []byte
+	oversizedName bool
+	skipped       int
+	truncated     bool
+}
+
+func (s *gitNameStream) Write(data []byte) (int, error) {
+	for _, b := range data {
+		if s.budget.bytes >= s.byteLimit {
+			s.truncate()
+			return len(data), nil
+		}
+		s.budget.bytes++
+		if !s.oversizedName {
+			if len(s.name) == defaultGitPathBytes {
+				s.name = nil
+				s.oversizedName = true
+			} else {
+				s.name = append(s.name, b)
+			}
+		}
+		if b != 0 {
+			continue
+		}
+		if s.budget.entries >= s.entryLimit {
+			s.truncate()
+			return len(data), nil
+		}
+		s.budget.entries++
+		if s.oversizedName {
+			s.skipped++
+		} else {
+			s.consume(s.name[:len(s.name)-1])
+		}
+		s.name = s.name[:0]
+		s.oversizedName = false
+	}
+	return len(data), nil
+}
+
+func (s *gitNameStream) truncate() {
+	if !s.truncated {
+		s.truncated = true
+		s.stop()
+	}
+}
+
+func (s *gitNameStream) unterminated() bool {
+	return len(s.name) != 0 || s.oversizedName
+}
+
+func stableGitEnv(environ []string) []string {
+	overrides := map[string]string{
+		"GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat", "PAGER": "cat",
+		"LC_ALL": "C", "LANG": "C", "GIT_TERMINAL_PROMPT": "0",
+		"GIT_NO_LAZY_FETCH": "1",
+	}
+	remove := map[string]bool{
+		"GIT_DIR": true, "GIT_WORK_TREE": true, "GIT_INDEX_FILE": true,
+		"GIT_OBJECT_DIRECTORY": true, "GIT_ALTERNATE_OBJECT_DIRECTORIES": true,
+		"GIT_COMMON_DIR": true, "GIT_NAMESPACE": true, "GIT_PREFIX": true,
+		"GIT_EXEC_PATH": true, "GIT_CEILING_DIRECTORIES": true,
+		"GIT_DISCOVERY_ACROSS_FILESYSTEM": true, "GIT_CONFIG": true,
+	}
+	out := make([]string, 0, len(environ)+len(overrides))
+	for _, entry := range environ {
+		key, _, ok := strings.Cut(entry, "=")
+		upper := strings.ToUpper(key)
+		if !ok || remove[upper] || strings.HasPrefix(upper, "GIT_CONFIG_") {
+			continue
+		}
+		if _, replaced := overrides[upper]; replaced {
+			continue
+		}
+		out = append(out, entry)
+	}
+	for key, value := range overrides {
+		out = append(out, key+"="+value)
+	}
+	return out
 }
 
 func excludedPath(name string) bool {
@@ -399,53 +491,37 @@ func excludedPath(name string) bool {
 }
 
 func (i *Index) listWalk(ctx context.Context) ([]File, bool, int, error) {
-	files := make([]File, 0, min(i.cap, 4096))
-	truncated := false
-	skipped := 0
-	err := filepath.WalkDir(i.root.Path(), func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			skipped++
-			if entry != nil && entry.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			if path != i.root.Path() && skippedDirectories[entry.Name()] {
-				skipped++
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if entry.Type()&os.ModeSymlink != 0 || !entry.Type().IsRegular() {
-			skipped++
-			return nil
-		}
-		if len(files) >= i.cap {
-			truncated = true
-			return filepath.SkipAll
-		}
-		rel, err := filepath.Rel(i.root.Path(), path)
-		if err != nil {
-			skipped++
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			skipped++
-			return nil
-		}
-		files = append(files, indexedFile(filepath.ToSlash(rel), info.Size()))
-		return nil
-	})
+	capability, err := i.root.openCapability()
 	if err != nil {
 		return nil, false, 0, err
 	}
+	defer capability.Close()
+	files := make([]File, 0, min(i.cap, 4096))
+	skipped := 0
+	status, err := rootedfs.WalkRegularFiles(ctx, capability, ".", i.walkLimits,
+		func(relative string, _ os.FileInfo) bool {
+			if skippedDirectories[filepath.Base(relative)] {
+				skipped++
+				return true
+			}
+			return false
+		},
+		func(relative string, _ *os.Root, _ string, info os.FileInfo) error {
+			if len(files) >= i.cap {
+				return fs.SkipAll
+			}
+			files = append(files, indexedFile(filepath.ToSlash(relative), info.Size()))
+			return nil
+		})
+	if err != nil {
+		return nil, false, 0, err
+	}
+	if err := i.root.verifyCapability(capability); err != nil {
+		return nil, false, 0, err
+	}
+	skipped += status.Omitted
 	sort.Slice(files, func(a, b int) bool { return files[a].Path < files[b].Path })
-	return files, truncated, skipped, nil
+	return files, status.Partial(), skipped, nil
 }
 
 func indexedFile(path string, size int64) File {

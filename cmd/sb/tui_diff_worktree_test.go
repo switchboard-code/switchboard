@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/switchboard-code/switchboard/internal/scm"
+	"github.com/switchboard-code/switchboard/internal/trust"
 )
 
 func TestOpenDiffIncludesOnlyUntrackedFile(t *testing.T) {
@@ -209,7 +210,7 @@ func TestRenderDiffOmittedIsBoundedDeterministicAndTerminalSafe(t *testing.T) {
 
 func runOpenDiff(t *testing.T, workspace string) diffLoadedMsg {
 	t.Helper()
-	cmd := openDiff(workspace, false)
+	cmd := openDiff(workspace, false, grantTUIDiffTrust(t, workspace))
 	if cmd == nil {
 		t.Fatal("openDiff returned no command")
 	}
@@ -218,6 +219,18 @@ func runOpenDiff(t *testing.T, workspace string) diffLoadedMsg {
 		t.Fatalf("openDiff returned %T, want diffLoadedMsg", msg)
 	}
 	return msg
+}
+
+func grantTUIDiffTrust(t *testing.T, workspace string) *trust.Store {
+	t.Helper()
+	store, err := trust.OpenFile(filepath.Join(t.TempDir(), "trust.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Grant(workspace); err != nil {
+		t.Fatal(err)
+	}
+	return store
 }
 
 func plainTUIDiff(msg diffLoadedMsg) string {

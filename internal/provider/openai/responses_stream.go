@@ -16,6 +16,15 @@ import (
 // server that never sends a newline from consuming memory without limit.
 const maxResponsesLine = 8 << 20
 
+const maxAccumulatedResponseItems = 4096
+
+const (
+	// Wire envelopes are not output bytes, so they get independent headroom
+	// while remaining finite even when a server sends only ignored fields.
+	maxAccumulatedWireBytes = 8 * provider.ProviderStreamHardBytes
+	maxAccumulatedWireLines = 4 * provider.ProviderStreamMaxEvents
+)
+
 // responsesStream decodes Responses API events into canonical events.
 //
 // The shape differs from both other formats in the same way: output is a list
@@ -23,9 +32,13 @@ const maxResponsesLine = 8 << 20
 // are tracked by their own id, because the argument deltas reference that and
 // not the output index.
 type responsesStream struct {
-	ctx     context.Context
-	body    io.ReadCloser
-	scanner *bufio.Scanner
+	ctx       context.Context
+	body      io.ReadCloser
+	scanner   *bufio.Scanner
+	events    *provider.StreamLimiter
+	accum     *provider.StreamLimiter
+	wireBytes int
+	wireLines int
 
 	pending []provider.Event
 
@@ -37,6 +50,7 @@ type responsesStream struct {
 	// blocks.
 	index     map[string]int
 	nextIndex int
+	tools     int
 
 	usage      provider.Usage
 	sawToolUse bool
@@ -54,13 +68,15 @@ type responsesItemAccum struct {
 	arguments strings.Builder
 }
 
-func newResponsesStream(ctx context.Context, body io.ReadCloser) *responsesStream {
+func newResponsesStream(ctx context.Context, body io.ReadCloser, outputTokenAllowance int) *responsesStream {
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, 64<<10), maxResponsesLine)
 	return &responsesStream{
 		ctx:     ctx,
 		body:    body,
 		scanner: sc,
+		events:  provider.NewStreamLimiter(0),
+		accum:   provider.NewStreamLimiter(outputTokenAllowance),
 		items:   map[string]*responsesItemAccum{},
 		index:   map[string]int{},
 	}
@@ -108,7 +124,11 @@ func (s *responsesStream) readLine() error {
 		return provider.ErrStreamIncomplete
 	}
 
-	line := strings.TrimSpace(s.scanner.Text())
+	rawLine := s.scanner.Text()
+	if err := s.admitWireLine(rawLine); err != nil {
+		return err
+	}
+	line := strings.TrimSpace(rawLine)
 	if line == "" || strings.HasPrefix(line, ":") {
 		return nil
 	}
@@ -119,8 +139,13 @@ func (s *responsesStream) readLine() error {
 		return nil
 	}
 
+	payload = strings.TrimSpace(payload)
+	if err := s.events.AdmitPayloadBytes(); err != nil {
+		return s.limitError("event count")
+	}
+
 	var ev responsesEvent
-	if err := json.Unmarshal([]byte(strings.TrimSpace(payload)), &ev); err != nil {
+	if err := json.Unmarshal([]byte(payload), &ev); err != nil {
 		return &provider.ProtocolError{Provider: Name, Detail: "decoding a stream event", Err: err}
 	}
 	return s.handle(ev)
@@ -136,29 +161,66 @@ func (s *responsesStream) handle(ev responsesEvent) error {
 		if message == "" {
 			message = "the endpoint reported a failure with no message"
 		}
-		return &provider.APIError{Provider: Name, StatusCode: 0, Body: message}
+		return &provider.APIError{Provider: Name, StatusCode: 0, Body: provider.SanitizeAPIErrorText(message)}
 
 	case "response.output_item.added":
 		if ev.Item == nil {
 			return nil
 		}
+		previous, exists := s.items[ev.Item.ID]
+		if !exists && len(s.items) >= maxAccumulatedResponseItems {
+			return s.limitError("distinct item count")
+		}
+		_, indexed := s.index[ev.Item.ID]
+		if !indexed && len(s.index) >= maxAccumulatedResponseItems {
+			return s.limitError("distinct block count")
+		}
+		parts := []string{ev.Item.Type, ev.Item.CallID, ev.Item.Name, ev.Item.Arguments, ev.Item.ID}
+		if previous != nil {
+			parts = []string{
+				growthBeyond(len(previous.kind), ev.Item.Type),
+				growthBeyond(len(previous.callID), ev.Item.CallID),
+				growthBeyond(len(previous.name), ev.Item.Name),
+				growthBeyond(previous.arguments.Len(), ev.Item.Arguments),
+				ev.Item.ID,
+			}
+		}
+		if indexed {
+			parts[len(parts)-1] = ""
+		}
+		if err := s.admitAccumulated(parts...); err != nil {
+			return err
+		}
+		if _, err := s.indexForAdmitted(ev.Item.ID); err != nil {
+			return err
+		}
 		acc := &responsesItemAccum{kind: ev.Item.Type, callID: ev.Item.CallID, name: ev.Item.Name}
 		acc.arguments.WriteString(ev.Item.Arguments)
 		s.items[ev.Item.ID] = acc
-		s.indexFor(ev.Item.ID)
 
 	case "response.output_text.delta":
+		index, err := s.indexFor(ev.ItemID)
+		if err != nil {
+			return err
+		}
 		s.pending = append(s.pending, provider.Event{
-			Type: provider.EventTextDelta, Index: s.indexFor(ev.ItemID), Text: ev.Delta,
+			Type: provider.EventTextDelta, Index: index, Text: ev.Delta,
 		})
 
 	case "response.reasoning_summary_text.delta":
+		index, err := s.indexFor(ev.ItemID)
+		if err != nil {
+			return err
+		}
 		s.pending = append(s.pending, provider.Event{
-			Type: provider.EventThinkingDelta, Index: s.indexFor(ev.ItemID), Text: ev.Delta,
+			Type: provider.EventThinkingDelta, Index: index, Text: ev.Delta,
 		})
 
 	case "response.function_call_arguments.delta":
 		if acc, ok := s.items[ev.ItemID]; ok {
+			if err := s.admitAccumulated(ev.Delta); err != nil {
+				return err
+			}
 			acc.arguments.WriteString(ev.Delta)
 		}
 
@@ -166,9 +228,35 @@ func (s *responsesStream) handle(ev responsesEvent) error {
 		if ev.Item == nil || ev.Item.Type != "function_call" {
 			return nil
 		}
+		if s.tools >= maxAccumulatedResponseItems {
+			return s.limitError("tool count")
+		}
+		acc := s.items[ev.Item.ID]
+		_, indexed := s.index[ev.Item.ID]
+		if !indexed && len(s.index) >= maxAccumulatedResponseItems {
+			return s.limitError("distinct block count")
+		}
+		parts := []string{ev.Item.CallID, ev.Item.Name, ev.Item.Arguments, ev.Item.ID}
+		if acc != nil {
+			parts = []string{
+				growthBeyond(len(acc.callID), ev.Item.CallID),
+				growthBeyond(len(acc.name), ev.Item.Name),
+				growthBeyond(acc.arguments.Len(), ev.Item.Arguments),
+				ev.Item.ID,
+			}
+		}
+		if indexed {
+			parts[len(parts)-1] = ""
+		}
+		if err := s.admitAccumulated(parts...); err != nil {
+			return err
+		}
+		index, err := s.indexForAdmitted(ev.Item.ID)
+		if err != nil {
+			return err
+		}
 		// The done event carries the complete arguments, so it is preferred
 		// over the accumulated deltas rather than appended to them.
-		acc := s.items[ev.Item.ID]
 		if acc == nil {
 			acc = &responsesItemAccum{kind: ev.Item.Type, callID: ev.Item.CallID, name: ev.Item.Name}
 		}
@@ -188,9 +276,10 @@ func (s *responsesStream) handle(ev responsesEvent) error {
 			s.err = err
 			return nil
 		}
+		s.tools++
 		s.sawToolUse = true
 		s.pending = append(s.pending, provider.Event{
-			Type: provider.EventToolUse, Index: s.indexFor(ev.Item.ID), ToolUse: use,
+			Type: provider.EventToolUse, Index: index, ToolUse: use,
 		})
 
 	case "response.completed", "response.incomplete":
@@ -208,14 +297,77 @@ func (s *responsesStream) handle(ev responsesEvent) error {
 
 // indexFor assigns a canonical block index per item, in the order items are
 // first seen. The wire's output_index counts items and cannot be used directly.
-func (s *responsesStream) indexFor(itemID string) int {
+func (s *responsesStream) indexFor(itemID string) (int, error) {
+	return s.indexForMode(itemID, false)
+}
+
+// indexForAdmitted records an id whose retained bytes were admitted together
+// with the rest of the same wire fragment. This keeps one accumulator event
+// admission per fragment rather than charging the id as a synthetic second
+// event.
+func (s *responsesStream) indexForAdmitted(itemID string) (int, error) {
+	return s.indexForMode(itemID, true)
+}
+
+func (s *responsesStream) indexForMode(itemID string, admitted bool) (int, error) {
 	if idx, ok := s.index[itemID]; ok {
-		return idx
+		return idx, nil
+	}
+	if len(s.index) >= maxAccumulatedResponseItems {
+		return 0, s.limitError("distinct block count")
+	}
+	if !admitted {
+		if err := s.admitAccumulated(itemID); err != nil {
+			return 0, err
+		}
 	}
 	idx := s.nextIndex
 	s.index[itemID] = idx
 	s.nextIndex++
-	return idx
+	return idx, nil
+}
+
+func (s *responsesStream) limitError(kind string) error {
+	return &provider.ProtocolError{
+		Provider: Name,
+		Detail:   fmt.Sprintf("event stream exceeded its %s limit", kind),
+		Err:      provider.ErrStreamLimit,
+	}
+}
+
+func (s *responsesStream) admitAccumulated(parts ...string) error {
+	sizes := make([]int, len(parts))
+	hasPayload := false
+	for i, part := range parts {
+		sizes[i] = len(part)
+		hasPayload = hasPayload || len(part) > 0
+	}
+	if hasPayload {
+		if err := s.accum.AdmitPayloadBytes(sizes...); err != nil {
+			return s.limitError("accumulated bytes or fragment count")
+		}
+	}
+	return nil
+}
+
+func (s *responsesStream) admitWireLine(line string) error {
+	size := len(line) + 1
+	if s.wireLines >= maxAccumulatedWireLines {
+		return s.limitError("wire line count")
+	}
+	if s.wireBytes > maxAccumulatedWireBytes || size > maxAccumulatedWireBytes-s.wireBytes {
+		return s.limitError("wire bytes")
+	}
+	s.wireLines++
+	s.wireBytes += size
+	return nil
+}
+
+func growthBeyond(retained int, replacement string) string {
+	if len(replacement) <= retained {
+		return ""
+	}
+	return replacement[retained:]
 }
 
 func (s *responsesStream) applyUsage(u *responsesUsage) {

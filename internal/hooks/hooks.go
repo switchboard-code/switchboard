@@ -15,17 +15,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/switchboard-code/switchboard/internal/credential"
 	"github.com/switchboard-code/switchboard/internal/execution"
 	"github.com/switchboard-code/switchboard/internal/permission"
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 )
 
 const FileName = "hooks.toml"
+
+const maxHookFileBytes = 1 << 20
 
 const (
 	defaultTimeout = 30 * time.Second
@@ -94,13 +99,29 @@ type hookEntry struct {
 // silently dead table, because a typo in "pre_tool" would otherwise disable
 // the gate its author believes is standing.
 func Load(path, workspace string) (*Set, error) {
+	return LoadRooted(filepath.Dir(path), filepath.Base(path), workspace)
+}
+
+// LoadRooted binds the declaration to an authority root. Repository callers
+// pass the workspace; a renamed parent or symlink can therefore never redirect
+// a pre-trust inspection outside the checkout.
+func LoadRooted(root, name, workspace string) (*Set, error) {
+	return loadRootedWithHook(root, name, workspace, nil)
+}
+
+func loadRootedWithHook(root, name, workspace string, beforeOpen func()) (*Set, error) {
 	var file struct {
 		Hooks map[string][]hookEntry `toml:"hooks"`
 	}
-	if _, err := toml.DecodeFile(path, &file); err != nil {
+	path := filepath.Join(root, filepath.FromSlash(name))
+	data, err := rootedfs.ReadFileWithHook(root, name, maxHookFileBytes, beforeOpen)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return &Set{workspace: workspace}, nil
 		}
+		return nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+	if _, err := toml.Decode(string(data), &file); err != nil {
 		return nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 
@@ -184,6 +205,9 @@ func (s *Set) PreTool(ctx context.Context, req permission.Request) (string, bool
 			return fmt.Sprintf("blocked by a pre_tool hook that did not answer within %s", h.timeout()), true
 		}
 		if res.ExitCode != 0 {
+			if res.Truncated {
+				return "blocked by hook: output withheld because it exceeded the bounded capture", true
+			}
 			msg := strings.TrimSpace(res.Output)
 			if msg == "" {
 				msg = fmt.Sprintf("a pre_tool hook exited %d", res.ExitCode)
@@ -201,10 +225,7 @@ func (s *Set) PostTool(ctx context.Context, req permission.Request, resultConten
 	if s.Empty() {
 		return ""
 	}
-	excerpt := resultContent
-	if len(excerpt) > maxHookOutput {
-		excerpt = excerpt[:maxHookOutput]
-	}
+	excerpt := postToolResultExcerpt(resultContent)
 	var notes []string
 	for _, h := range s.hooks {
 		if h.Event != PostTool || !h.matches(req.Tool) {
@@ -226,6 +247,8 @@ func (s *Set) PostTool(ctx context.Context, req permission.Request, resultConten
 			notes = append(notes, fmt.Sprintf("[post_tool hook failed to run: %v]", err))
 		case res.TimedOut:
 			notes = append(notes, fmt.Sprintf("[post_tool hook did not finish within %s]", h.timeout()))
+		case res.Truncated:
+			notes = append(notes, "[post_tool hook output withheld because it exceeded the bounded capture]")
 		case res.ExitCode != 0:
 			notes = append(notes, fmt.Sprintf("[post_tool hook exited %d: %s]", res.ExitCode, strings.TrimSpace(res.Output)))
 		case strings.TrimSpace(res.Output) != "":
@@ -233,6 +256,16 @@ func (s *Set) PostTool(ctx context.Context, req permission.Request, resultConten
 		}
 	}
 	return strings.Join(notes, "\n")
+}
+
+// postToolResultExcerpt keeps the hook payload bounded without turning a
+// recognized credential into an unrecognizable prefix. Complete credentials
+// inside the bound stay intact for the common provider/session redaction gate;
+// one crossing the bound is replaced before a hook can echo the fragment into
+// the result that reaches that gate.
+func postToolResultExcerpt(resultContent string) string {
+	excerpt, _ := credential.SafePrefixForTruncation(resultContent, maxHookOutput)
+	return excerpt
 }
 
 func (s *Set) run(ctx context.Context, h Hook, p payload) (execution.Result, error) {

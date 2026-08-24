@@ -1,28 +1,37 @@
 # Switchboard
 
 A terminal coding agent where the model is a slot, not a fixed property of the
-tool. You configure a ladder of models, cheapest at the bottom. Before each user
-turn, the deterministic router chooses the lowest suitable feasible rung.
+tool. You configure a policy-ordered ladder of models, usually with lower-cost
+targets near the bottom. Before each user turn, the deterministic router chooses
+a feasible rung from request signals and that user-defined order.
 Repeated tool calls, error spikes, new test failures, and hedging can propose a
 move; round, feasibility, and budget gates decide whether it applies. Every
 session is an append-only record that can be priced, replayed, and searched.
-Free and open source (MIT), for macOS and Linux.
+Free and open source (MIT), for macOS, Linux, and Windows.
 
-Version 1.2 adds a searchable TUI workbench with revision-aware file and text
-search, an exact read-only Git diff that includes untracked files, bounded
-turn-scoped review of recorded agent mutations, semantic language-server views,
-atomic revision-checked edits and undo, durable continuity capsules, visible
-parallel delegate tasks, static side-effect-free CLI help and completion, and
-bounded startup extension diagnostics with a retained-detail drill-down. The
-line-oriented REPL and headless mode remain deliberately smaller than the TUI.
+Version 1.21 adds crash-durable streamed output, read-only resume health,
+validated seven-section compaction, transactional retry recovery, concrete
+serving-target output caps, denial-first modal queuing, and staged subagent
+workflows. The searchable workbench, deterministic model ladder, accounting,
+trust model, extensions, and computer use remain. The line-oriented REPL and
+headless mode remain deliberately smaller than the TUI.
+
+Current sessions checkpoint streamed assistant text before it becomes visible,
+show read-only resume health, withhold incomplete output from later provider
+requests, and repair dangling tool calls without re-execution. Compaction uses
+one validated seven-section handoff in the TUI and REPL. Clear, compact, fork,
+retry, and race children remain undiscoverable until adoption publishes them;
+transactional retry rolls files forward if that commit fails. Model context,
+vision, serving-surface identity, and output allowance are checked from the
+same concrete provider evidence used by the wire request and hard budget.
 
 Commands run without a sandbox by default. Auto mode uses a configured low-cost
 reviewer only under active verified confinement; host-direct, shared-loopback,
 opaque, sensitive, external, and Windows commands remain human-approved. A
 confined explicit full-network request can remain reviewable. Yolo mode runs
-edits, commands, and external tools host-direct without prompts; only an
-explicit deny rule refuses. Verified Seatbelt or bubblewrap confinement is
-available on request.
+edits, commands, and external tools without permission prompts; explicit deny
+rules and outbound secret checks still apply. Verified Seatbelt or bubblewrap
+confinement is available on request.
 
 ## Links
 
@@ -32,7 +41,8 @@ available on request.
 - Configuration: https://github.com/switchboard-code/switchboard/blob/main/docs/configuration.md
 - Routing and accounting: https://github.com/switchboard-code/switchboard/blob/main/docs/routing.md
 - Sessions and TUI: https://github.com/switchboard-code/switchboard/blob/main/docs/session.md
-- Version 1.2 notes: https://github.com/switchboard-code/switchboard/blob/main/docs/release-1.2.md
+- Current release: https://github.com/switchboard-code/switchboard/releases/tag/v1.21.0
+- Workbench 1.2 notes: https://github.com/switchboard-code/switchboard/blob/main/docs/release-1.2.md
 - Security and execution modes: https://github.com/switchboard-code/switchboard/blob/main/docs/security.md
 - Skills, plugins, commands, and MCP: https://github.com/switchboard-code/switchboard/blob/main/docs/extensions.md
 - Eval evidence: https://github.com/switchboard-code/switchboard/blob/main/docs/eval.md

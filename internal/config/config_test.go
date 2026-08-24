@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/switchboard-code/switchboard/internal/credential"
 	"github.com/switchboard-code/switchboard/internal/provider"
 )
 
@@ -17,6 +18,61 @@ func write(t *testing.T, body string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestSnapshotIsDeepAndIndependent(t *testing.T) {
+	temperature := 0.25
+	reasoning := &provider.Reasoning{Enabled: true, Effort: "high"}
+	routeAuto := true
+	target := provider.RouteTarget{
+		Provider: "ollama", Surface: "local", ModelID: "primary",
+		Params: provider.Params{Temperature: &temperature, Reasoning: reasoning},
+	}
+	cfg := &Config{
+		Tiers: []Tier{{
+			ID: "t1", Target: target,
+			Fallbacks: []provider.RouteTarget{{Provider: "ollama", Surface: "local", ModelID: "fallback"}},
+		}},
+		Slots:     map[string]string{"advisor": "t1"},
+		Providers: map[string]ProviderSettings{"ollama": {BaseURL: "http://before"}},
+		Auth: map[string]credential.Settings{"ollama": {
+			Helper: []string{"helper", "before"},
+			OAuth: credential.OAuthSettings{
+				Scopes: []string{"before"}, ExtraAuthParams: map[string]string{"aud": "before"},
+			},
+		}},
+		Destinations: []string{"ollama"},
+		Profiles:     map[string][]Tier{"review": {{ID: "t2", Target: target}}},
+		RouteAuto:    &routeAuto,
+	}
+
+	snapshot := cfg.Snapshot()
+	cfg.Tiers[0].Target.Params.Reasoning.Effort = "low"
+	*cfg.Tiers[0].Target.Params.Temperature = 0.75
+	cfg.Tiers[0].Fallbacks[0].ModelID = "changed"
+	cfg.Slots["advisor"] = "t2"
+	cfg.Providers["ollama"] = ProviderSettings{BaseURL: "http://after"}
+	cfg.Auth["ollama"].Helper[1] = "after"
+	cfg.Auth["ollama"].OAuth.Scopes[0] = "after"
+	cfg.Auth["ollama"].OAuth.ExtraAuthParams["aud"] = "after"
+	cfg.Destinations[0] = "openai"
+	cfg.Profiles["review"][0].Target.ModelID = "changed"
+	*cfg.RouteAuto = false
+
+	if got := snapshot.Tiers[0].Target.Params.Reasoning.Effort; got != "high" {
+		t.Fatalf("snapshot reasoning changed to %q", got)
+	}
+	if got := *snapshot.Tiers[0].Target.Params.Temperature; got != 0.25 {
+		t.Fatalf("snapshot temperature changed to %v", got)
+	}
+	if snapshot.Tiers[0].Fallbacks[0].ModelID != "fallback" ||
+		snapshot.Slots["advisor"] != "t1" || snapshot.Providers["ollama"].BaseURL != "http://before" ||
+		snapshot.Auth["ollama"].Helper[1] != "before" || snapshot.Auth["ollama"].OAuth.Scopes[0] != "before" ||
+		snapshot.Auth["ollama"].OAuth.ExtraAuthParams["aud"] != "before" ||
+		snapshot.Destinations[0] != "ollama" || snapshot.Profiles["review"][0].Target.ModelID != "primary" ||
+		!*snapshot.RouteAuto {
+		t.Fatalf("snapshot retained mutable aliases: %+v", snapshot)
+	}
 }
 
 func TestMissingFileIsNotAnError(t *testing.T) {
@@ -103,6 +159,72 @@ effort = "high"
 	}
 }
 
+func TestTierBindsExplicitMaxOutput(t *testing.T) {
+	path := write(t, `
+[tiers.t1]
+model = "ollama/custom"
+max_output = 4096
+fallback = ["openaicompat/custom-backup"]
+`)
+	c, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tier, _ := c.Tier("t1")
+	if got := tier.Target.Params.MaxOutputTokens; got != 4096 {
+		t.Fatalf("max output = %d, want 4096", got)
+	}
+	withoutCap, err := ParseTarget("ollama/custom", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tier.Target.ID() == withoutCap.ID() {
+		t.Fatal("an explicit output cap did not participate in target identity")
+	}
+	if len(tier.Fallbacks) != 1 || tier.Fallbacks[0].Params.MaxOutputTokens != 4096 {
+		t.Fatalf("rung max_output did not bind its fallback: %+v", tier.Fallbacks)
+	}
+	withoutFallbackCap, err := ParseTarget("openaicompat/custom-backup", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tier.Fallbacks[0].ID() == withoutFallbackCap.ID() {
+		t.Fatal("the rung cap did not participate in fallback target identity")
+	}
+}
+
+func TestTierMaxOutputMustBePositiveWhenPresent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "zero",
+			body: "[tiers.t1]\nmodel = \"ollama/custom\"\nmax_output = 0\n",
+			want: "tier t1 max_output 0 must be positive",
+		},
+		{
+			name: "negative",
+			body: "[tiers.t1]\nmodel = \"ollama/custom\"\nmax_output = -1\n",
+			want: "tier t1 max_output -1 must be positive",
+		},
+		{
+			name: "profile",
+			body: "[profiles.review.tiers.t1]\nmodel = \"ollama/custom\"\nmax_output = 0\n",
+			want: "profile review tier t1 max_output 0 must be positive",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadFile(write(t, tc.body))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadFile error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 // Model identifiers legitimately contain slashes, so the provider split has to
 // take the first one only.
 func TestModelNamesMayContainSlashes(t *testing.T) {
@@ -142,6 +264,25 @@ func TestMalformedModelReference(t *testing.T) {
 		if _, err := ParseTarget(ref, "", ""); err == nil {
 			t.Errorf("%q should not parse as a target", ref)
 		}
+	}
+}
+
+func TestUnsafeModelIDsNeverReachConfig(t *testing.T) {
+	token := "ghp_" + strings.Repeat("A", 40)
+	for name, ref := range map[string]string{
+		"credential": "ollama/model-" + token,
+		"control":    "ollama/model\nspoof",
+		"oversize":   "ollama/" + strings.Repeat("m", provider.MaxProviderModelIDBytes+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseTarget(ref, "", "")
+			if err == nil {
+				t.Fatal("unsafe model ID was accepted")
+			}
+			if strings.Contains(err.Error(), token) {
+				t.Fatalf("error exposed credential-shaped model ID: %v", err)
+			}
+		})
 	}
 }
 
@@ -277,9 +418,21 @@ func TestTierFallbacksRoundTripAndValidate(t *testing.T) {
 	if fbs[0].Surface == "" {
 		t.Error("a fallback must resolve its provider's default surface")
 	}
+	for i, fallback := range fbs {
+		if fallback.Params.MaxOutputTokens != 0 {
+			t.Fatalf("legacy fallback %d acquired max_output %d", i+1, fallback.Params.MaxOutputTokens)
+		}
+	}
 
 	if err := c.Save(); err != nil {
 		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "max_output") {
+		t.Fatalf("saving a legacy uncapped rung invented max_output:\n%s", data)
 	}
 	again, err := LoadFile(path)
 	if err != nil {
@@ -325,7 +478,7 @@ func TestBindTierPreservesFallbacksThroughSaveAndLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.BindTier("t1", "replacement", "ollama/new", "", ""); err != nil {
+	if err := c.BindTierWithMaxOutput("t1", "replacement", "ollama/new", "", "", 3072); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Save(); err != nil {
@@ -338,9 +491,17 @@ func TestBindTierPreservesFallbacksThroughSaveAndLoad(t *testing.T) {
 	if len(loaded.Tiers) != 1 || loaded.Tiers[0].Target.ModelID != "new" {
 		t.Fatalf("replacement target did not survive: %+v", loaded.Tiers)
 	}
+	if got := loaded.Tiers[0].Target.Params.MaxOutputTokens; got != 3072 {
+		t.Fatalf("replacement max output = %d, want 3072", got)
+	}
 	fallbacks := loaded.Tiers[0].Fallbacks
 	if len(fallbacks) != 2 || fallbacks[0].ModelID != "first" || fallbacks[1].ModelID != "second" {
 		t.Fatalf("BindTier erased or reordered configured fallbacks: %+v", fallbacks)
+	}
+	for i, fallback := range fallbacks {
+		if fallback.Params.MaxOutputTokens != 3072 {
+			t.Fatalf("fallback %d max output = %d, want rung cap 3072", i+1, fallback.Params.MaxOutputTokens)
+		}
 	}
 }
 
@@ -352,9 +513,6 @@ func TestSaveRefusesUnrepresentableTargetsWithoutChangingFile(t *testing.T) {
 		mutate func(*Config)
 		want   string
 	}{
-		{name: "primary max output", want: "tier t1 target", mutate: func(c *Config) {
-			c.Tiers[0].Target.Params.MaxOutputTokens = 2_048
-		}},
 		{name: "primary temperature", want: "tier t1 target", mutate: func(c *Config) {
 			c.Tiers[0].Target.Params.Temperature = &temperature
 		}},
@@ -365,6 +523,12 @@ func TestSaveRefusesUnrepresentableTargetsWithoutChangingFile(t *testing.T) {
 			c.Tiers[0].Fallbacks = []provider.RouteTarget{{Provider: "ollama", Surface: "remote", ModelID: "fallback"}}
 		}},
 		{name: "fallback parameters", want: "tier t1 fallback 1", mutate: func(c *Config) {
+			fallback := base
+			fallback.Params.MaxOutputTokens = 512
+			c.Tiers[0].Fallbacks = []provider.RouteTarget{fallback}
+		}},
+		{name: "fallback cap differs from rung", want: "different from the rung", mutate: func(c *Config) {
+			c.Tiers[0].Target.Params.MaxOutputTokens = 2048
 			fallback := base
 			fallback.Params.MaxOutputTokens = 512
 			c.Tiers[0].Fallbacks = []provider.RouteTarget{fallback}
@@ -402,6 +566,7 @@ func TestSaveRoundTripsEveryRepresentableTargetIdentity(t *testing.T) {
 model = "anthropic/claude-test"
 surface = "bedrock"
 effort = "high"
+max_output = 3072
 fallback = ["ollama/first", "kimi/second"]
 `)
 	cfg, err := LoadFile(path)

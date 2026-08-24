@@ -12,6 +12,7 @@ import (
 
 	"github.com/switchboard-code/switchboard/internal/catalog"
 	"github.com/switchboard-code/switchboard/internal/config"
+	"github.com/switchboard-code/switchboard/internal/credential"
 )
 
 // compatServer stands in for anything that speaks the chat-completions
@@ -107,8 +108,13 @@ func TestEverySurfaceIsOfferedNotJustPricedModels(t *testing.T) {
 		}
 	}
 	// The priced entries are still there and still bind directly.
-	if !labels["anthropic/claude-opus-5"] {
+	if !labels["anthropic/first-party/claude-opus-5"] {
 		t.Error("a catalog entry stopped being offered")
+	}
+	api := modelChoice{ref: "openai/gpt-same", provider: "openai", surface: "first-party"}
+	plan := modelChoice{ref: "openai/gpt-same", provider: "openai", surface: "subscription"}
+	if modelChoiceLabel(api) == modelChoiceLabel(plan) {
+		t.Fatal("same-model rows on different serving surfaces are indistinguishable")
 	}
 }
 
@@ -137,10 +143,14 @@ func TestCompatibleEndpointTakesAnAddressThenBindsAModel(t *testing.T) {
 			return ""
 		},
 		func(tp textPromptMsg) string {
-			if !strings.HasPrefix(tp.title, "server address") {
-				t.Fatalf("unexpected prompt %q", tp.title)
+			switch {
+			case strings.HasPrefix(tp.title, "server address"):
+				return addr
+			case strings.HasPrefix(tp.title, "positive maximum output"):
+				return "4096"
 			}
-			return addr
+			t.Fatalf("unexpected prompt %q", tp.title)
+			return ""
 		})
 
 	notice, ok := msg.(noticeMsg)
@@ -165,6 +175,96 @@ func TestCompatibleEndpointTakesAnAddressThenBindsAModel(t *testing.T) {
 	if tier.Target.Provider != "openaicompat" || tier.Target.Surface != "generic" ||
 		tier.Target.ModelID != "gpt-oss-120b" {
 		t.Fatalf("t2 bound to %+v, want the compatible endpoint's model", tier.Target)
+	}
+	if tier.Target.Params.MaxOutputTokens != 4096 {
+		t.Fatalf("t2 max output = %d, want 4096", tier.Target.Params.MaxOutputTokens)
+	}
+}
+
+func TestFailedAddressSaveLeavesLiveConfigAndProvidersUnchanged(t *testing.T) {
+	key := config.ProviderSurfaceKey("openaicompat", "generic")
+	cfg := &config.Config{
+		Path: t.TempDir(), // a directory cannot be replaced by the config file
+		Providers: map[string]config.ProviderSettings{
+			key: {BaseURL: "http://original.invalid/v1", ContextWindow: 32_768},
+		},
+	}
+	reg := newProviders("http://127.0.0.1:1", cfg)
+	beforeGeneration := reg.generation
+	continued := false
+
+	msg, ok := askAddressCmd(asyncResultBinding{}, reg, cfg, "openaicompat", "generic", func() tea.Cmd {
+		continued = true
+		return nil
+	})().(textPromptMsg)
+	if !ok {
+		t.Fatal("address flow did not open a text prompt")
+	}
+	result := msg.submit("http://replacement.invalid/v1")()
+	notice, ok := result.(noticeMsg)
+	if !ok || notice.level != "error" || !strings.Contains(notice.text, "saving the address failed") {
+		t.Fatalf("failed address save = %#v, want error notice", result)
+	}
+	if got := cfg.ProviderForTarget("openaicompat", "generic"); got.BaseURL != "http://original.invalid/v1" || got.ContextWindow != 32_768 {
+		t.Fatalf("failed save changed live provider settings to %+v", got)
+	}
+	if reg.generation != beforeGeneration {
+		t.Fatal("failed address save reset cached providers")
+	}
+	if continued {
+		t.Fatal("failed address save advanced the browse flow")
+	}
+}
+
+func TestStandaloneBrowseRetryDoesNotReuseCachedUnauthenticatedClient(t *testing.T) {
+	const envName = "SB_TEST_COMPAT_BROWSE_KEY"
+	t.Setenv(envName, "stale-key")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer fresh-key" {
+			http.Error(w, "credential required", http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"fresh-model"}]}`)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		Providers: map[string]config.ProviderSettings{
+			config.ProviderSurfaceKey("openaicompat", "generic"): {BaseURL: server.URL + "/v1"},
+		},
+		Auth: map[string]credential.Settings{
+			"openaicompat": {Env: envName},
+		},
+	}
+	reg := newProviders("http://127.0.0.1:1", cfg)
+	if _, _, err := listSurfaceModels(t.Context(), reg, "openaicompat", "generic"); !refusedForAuth(err) {
+		t.Fatalf("priming request error = %v, want cached unauthenticated client", err)
+	}
+
+	// This is the continuation the auth-refusal picker assembles before the
+	// credential store worker runs. Its private registry must remain client-
+	// free until execution; otherwise it retains the stale Authorization.
+	next := browseSurfaceCmdWithCatalog(reg, &catalog.Catalog{Revision: "test"}, cfg, modelChoice{
+		provider: "openaicompat", surface: "generic",
+	}, func(modelChoice) tea.Cmd { return nil })
+	t.Setenv(envName, "fresh-key")
+	raw := next()
+	picker, ok := raw.(pickerMsg)
+	if !ok {
+		t.Fatalf("browse retry returned %T, want model picker", raw)
+	}
+	foundModel, offeredCredential := false, false
+	for _, item := range picker.items {
+		foundModel = foundModel || item.label == "openaicompat/fresh-model"
+		offeredCredential = offeredCredential || item.id == storeSecretID
+	}
+	if !foundModel || offeredCredential {
+		t.Fatalf("browse retry reused stale auth: foundModel=%v offeredCredential=%v items=%+v",
+			foundModel, offeredCredential, picker.items)
 	}
 }
 
@@ -193,10 +293,15 @@ func TestATypedModelIDIsAlwaysOffered(t *testing.T) {
 			return ""
 		},
 		func(tp textPromptMsg) string {
-			if !strings.HasPrefix(tp.title, "model id") {
+			switch {
+			case strings.HasPrefix(tp.title, "model id"):
+				return "kimi-for-coding"
+			case strings.HasPrefix(tp.title, "positive maximum output"):
+				return "4096"
+			default:
 				t.Fatalf("unexpected prompt %q", tp.title)
+				return ""
 			}
-			return "kimi-for-coding"
 		})
 
 	if notice, ok := msg.(noticeMsg); !ok || notice.level == "error" {
@@ -207,7 +312,8 @@ func TestATypedModelIDIsAlwaysOffered(t *testing.T) {
 		t.Fatal(err)
 	}
 	tier, ok := saved.Tier("t2")
-	if !ok || tier.Target.ModelID != "kimi-for-coding" || tier.Target.Provider != "kimi" {
+	if !ok || tier.Target.ModelID != "kimi-for-coding" || tier.Target.Provider != "kimi" ||
+		tier.Target.Params.MaxOutputTokens != 4096 {
 		t.Fatalf("t2 = %+v, want the typed kimi model", tier.Target)
 	}
 }
@@ -216,7 +322,7 @@ func TestATypedModelIDIsAlwaysOffered(t *testing.T) {
 // against a server the catalog has never heard of.
 func TestOnboardingBindsT1OnACompatibleEndpoint(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateTestHome(t, home)
 
 	cat, err := catalog.LoadBundled()
 	if err != nil {
@@ -255,6 +361,11 @@ func TestOnboardingBindsT1OnACompatibleEndpoint(t *testing.T) {
 		t.Fatalf("expected the optional key prompt, dialog is %T", m.dlg)
 	}
 	step(t, m, noticeMsg{text: "nothing entered, nothing stored"})
+	if _, asked := m.dlg.(*textDialog); !asked {
+		t.Fatalf("expected the required output-cap prompt, dialog is %T", m.dlg)
+	}
+	step(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("4096")})
+	step(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 
 	if m.cancelled || m.err != nil {
 		t.Fatalf("the wizard failed: cancelled=%v err=%v", m.cancelled, m.err)
@@ -270,6 +381,9 @@ func TestOnboardingBindsT1OnACompatibleEndpoint(t *testing.T) {
 	if tier.Target.Provider != "openaicompat" || tier.Target.ModelID != "qwen3-coder" {
 		t.Fatalf("t1 bound to %+v, want the compatible endpoint's model", tier.Target)
 	}
+	if tier.Target.Params.MaxOutputTokens != 4096 {
+		t.Fatalf("t1 max output = %d, want the chosen 4096", tier.Target.Params.MaxOutputTokens)
+	}
 }
 
 // A key prompt the user walks past used to close the dialog and advance
@@ -278,7 +392,7 @@ func TestOnboardingBindsT1OnACompatibleEndpoint(t *testing.T) {
 // carry the wizard forward.
 func TestSkippingTheKeyPromptStillBindsTheRung(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateTestHome(t, home)
 
 	cfg := &config.Config{Path: filepath.Join(home, config.FileName)}
 	m := &onboardModel{
@@ -288,7 +402,7 @@ func TestSkippingTheKeyPromptStillBindsTheRung(t *testing.T) {
 		th:   darkTheme(),
 		step: stepModel,
 		choice: modelChoice{
-			ref: "openaicompat/qwen3", provider: "openaicompat", surface: "generic",
+			ref: "openaicompat/qwen3", provider: "openaicompat", surface: "generic", catalogMaxOutput: 4096,
 		},
 	}
 	step(t, m, noticeMsg{text: "nothing entered, nothing stored"})
@@ -311,7 +425,7 @@ func TestSkippingTheKeyPromptStillBindsTheRung(t *testing.T) {
 // The checklist is where an address gets set before any model is picked, and
 // the row has to reopen with what it stored.
 func TestSetupChecklistSetsTheCompatibleEndpointAddress(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	isolateTestHome(t, t.TempDir())
 	m := modelsTestModel(t)
 
 	first, ok := setupChecklist(m)().(pickerMsg)
@@ -341,7 +455,7 @@ func TestSetupChecklistSetsTheCompatibleEndpointAddress(t *testing.T) {
 // The local row is the one people reach for when Ollama is on another
 // machine, so it has to change the address rather than print advice.
 func TestSetupChecklistSetsTheOllamaAddress(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	isolateTestHome(t, t.TempDir())
 	m := modelsTestModel(t)
 
 	first := setupChecklist(m)().(pickerMsg)
@@ -450,7 +564,7 @@ func TestAConnectedCompatibleEndpointListsInTheMainPicker(t *testing.T) {
 	}
 	var found bool
 	for _, it := range p.items {
-		found = found || it.label == "openaicompat/unsloth/Qwen3.8-27B-GGUF"
+		found = found || it.label == "openaicompat/generic/unsloth/Qwen3.8-27B-GGUF"
 	}
 	if !found {
 		var have []string
@@ -524,6 +638,40 @@ func TestAResumedNoticeDoesNotAdvanceTheWizard(t *testing.T) {
 	}
 	if m.quitting {
 		t.Fatal("a resumed notice bound the rung instead of waiting for the flow")
+	}
+}
+
+func TestOnboardingCredentialResetPrecedesContinuation(t *testing.T) {
+	cfg := &config.Config{Path: filepath.Join(t.TempDir(), config.FileName)}
+	reg := newProviders("http://127.0.0.1:1", cfg)
+	m := &onboardModel{
+		reg: reg, cat: &catalog.Catalog{Revision: "test"}, cfg: cfg, th: darkTheme(), step: stepConnect,
+	}
+	beforeGeneration := reg.generation
+	continued := false
+	after := func() tea.Msg {
+		continued = true
+		if reg.generation != beforeGeneration+1 {
+			return noticeMsg{level: "error", text: "continued before provider reset"}
+		}
+		return noticeMsg{text: "continued with fresh providers"}
+	}
+
+	_, resume := m.Update(noticeMsg{
+		text: "stored openaicompat/generic", resumed: true, refreshProviders: true, after: after,
+	})
+	if reg.generation != beforeGeneration+1 {
+		t.Fatalf("provider generation = %d, want %d before resuming", reg.generation, beforeGeneration+1)
+	}
+	if resume == nil {
+		t.Fatal("onboarding credential completion dropped its continuation")
+	}
+	result := resume()
+	if !continued {
+		t.Fatal("onboarding credential continuation did not run")
+	}
+	if notice, ok := result.(noticeMsg); !ok || notice.level == "error" {
+		t.Fatalf("onboarding continuation = %#v, want fresh-provider success", result)
 	}
 }
 

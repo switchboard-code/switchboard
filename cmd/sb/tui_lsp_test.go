@@ -209,16 +209,29 @@ func TestLSPEditorReturnInvalidatesWorkspaceAndSemanticResults(t *testing.T) {
 	_ = cmdOutline(m, "main.go")
 	view := activeLSPView(t, m)
 	before := m.workspaceRuntime.epoch.Load()
+	oldGeneration, oldRequest := view.generation, view.request
 
 	cmd := m.onLSPEditorDone(lspEditorDoneMsg{
-		view: view, sessionID: view.sessionID, generation: view.generation,
+		view: view, sessionID: view.sessionID, generation: oldGeneration,
 		path: "main.go", err: errors.New("editor exited after saving"),
 	})
 	if !view.stale || m.workspaceRuntime.epoch.Load() != before+1 {
 		t.Fatalf("editor return stale=%v epoch=%d, want stale and %d", view.stale, m.workspaceRuntime.epoch.Load(), before+1)
 	}
+	if view.generation == oldGeneration || view.request == oldRequest {
+		t.Fatalf("editor return kept old semantic binding: generation=%d request=%d", view.generation, view.request)
+	}
 	if msg, ok := cmd().(noticeMsg); !ok || msg.level != "error" {
 		t.Fatalf("failed editor return notice = %#v", msg)
+	}
+	_, _ = m.Update(lspLoadedMsg{
+		view: view, sessionID: view.sessionID, generation: oldGeneration, request: oldRequest,
+		rows: []lspRow{{id: "pre-editor", label: "pre-editor"}},
+	})
+	for _, row := range view.rows {
+		if row.id == "pre-editor" {
+			t.Fatal("a pre-editor semantic result repainted the panel after invalidation")
+		}
 	}
 }
 

@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"time"
+
+	"github.com/switchboard-code/switchboard/internal/credential"
 )
 
 type ToolDefinition struct {
@@ -29,6 +33,35 @@ type Request struct {
 	// stable for hashing (§5.1). The manager is phase 2a, so this is nil today
 	// and adapters must treat a non-nil plan they cannot render as an error.
 	CachePlan *CachePlan
+}
+
+// ReplayRequest projects the durable conversation onto the request a provider
+// may receive. Interrupted assistant output remains in the session for display
+// and diagnosis, but it is not a completed assistant turn and must not become
+// one merely because another call is made after a restart.
+//
+// The projection is intentionally provider-level so token estimation, cache
+// planning, routing, and every adapter can share one definition. It does not
+// mutate req or its Messages. Call it before constructing a CachePlan: message
+// indexes in a plan address the projected request, not the durable log.
+func ReplayRequest(req Request) Request {
+	var projected []Message
+	for i, message := range req.Messages {
+		if message.Role == RoleAssistant && message.Incomplete {
+			if projected == nil {
+				projected = make([]Message, 0, len(req.Messages)-1)
+				projected = append(projected, req.Messages[:i]...)
+			}
+			continue
+		}
+		if projected != nil {
+			projected = append(projected, message)
+		}
+	}
+	if projected != nil {
+		req.Messages = projected
+	}
+	return req
 }
 
 // CachePlan is request-level rather than metadata on blocks, because providers
@@ -68,6 +101,25 @@ type Provider interface {
 	Stream(ctx context.Context, target RouteTarget, req Request) (EventStream, error)
 	CountTokens(ctx context.Context, target RouteTarget, req Request) (TokenEstimate, error)
 	Probe(ctx context.Context, target RouteTarget) (ProbeResult, error)
+}
+
+// OutputTokenAllower is an optional adapter capability for surfaces whose
+// effective generation limit is not the literal configured value. The
+// Messages API is the motivating case: one reasoning dialect can raise
+// max_tokens to clear a token budget while another sends only an effort word.
+// Keeping that knowledge on the adapter prevents routing and budget code from
+// growing a second model-dialect table.
+type OutputTokenAllower interface {
+	OutputTokenAllowance(target RouteTarget, catalogMax int) int
+}
+
+// OutputTokenAllowanceResolver is the error-aware form used at the final
+// pre-send boundary. Most adapters have no invalid allowance combinations and
+// only need OutputTokenAllower. An adapter whose wire rules can make otherwise
+// positive parameters contradictory returns a typed local error here instead
+// of collapsing that conflict into the same sentinel as an omitted bound.
+type OutputTokenAllowanceResolver interface {
+	ResolveOutputTokenAllowance(target RouteTarget, catalogMax int) (int, error)
 }
 
 // ErrStreamIncomplete reports that a stream ended without the provider's
@@ -156,9 +208,32 @@ type APIError struct {
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("%s: http %d: %s", e.Provider, e.StatusCode, e.Body)
+	return fmt.Sprintf("%s: http %d: %s", e.Provider, e.StatusCode, SanitizeAPIErrorText(e.Body))
 }
 
 func (e *APIError) Retryable() bool {
 	return e.StatusCode == 408 || e.StatusCode == 409 || e.StatusCode == 429 || e.StatusCode >= 500
+}
+
+const MaxAPIErrorBodyBytes = 8 << 10
+
+// ReadAPIErrorBody keeps a provider's useful bounded diagnostic only when the
+// component is complete. A prefix is unsafe: the byte just past the cap can be
+// the one that makes an issuer-shaped credential recognizable.
+func ReadAPIErrorBody(r io.Reader) []byte {
+	raw, err := io.ReadAll(io.LimitReader(r, MaxAPIErrorBodyBytes+1))
+	if err != nil {
+		return []byte("[provider error body unavailable]")
+	}
+	if len(raw) > MaxAPIErrorBodyBytes {
+		return []byte("[provider error body withheld because it exceeded the 8192-byte limit]")
+	}
+	return raw
+}
+
+// SanitizeAPIErrorText scrubs a complete semantic provider error before it is
+// stored, rendered, or wrapped by a higher-level error.
+func SanitizeAPIErrorText(text string) string {
+	text = strings.ToValidUTF8(text, "�")
+	return credential.Redact(text, credential.ScanPrompt(text))
 }

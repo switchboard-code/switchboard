@@ -12,10 +12,11 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/atotto/clipboard"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
+	"github.com/switchboard-code/switchboard/internal/terminaltext"
 	"github.com/switchboard-code/switchboard/internal/workspace"
 )
 
@@ -118,6 +119,41 @@ func (r *workspaceRuntime) search(ctx context.Context, literal string) ([]worksp
 	return nil, workspace.SearchStatus{}, errors.New("workspace changed while search was running; run the search again")
 }
 
+// completeFiles uses the same revision-aware inventory as /files, including
+// its git-aware exclusions and invalidation epoch. Filtering stays off the UI
+// goroutine too: a 200k-file checkout should not make one typed rune miss a
+// frame. The returned epoch binds the matches to the inventory that produced
+// them so a tool batch cannot publish stale completion after an edit.
+func (r *workspaceRuntime) completeFiles(ctx context.Context, query string, limit int, forceRefresh bool) ([]string, uint64, error) {
+	_, index, err := r.resources(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		epoch := r.epoch.Load()
+		var snapshot workspace.Snapshot
+		if forceRefresh {
+			snapshot, err = index.Refresh(ctx)
+		} else {
+			snapshot, err = index.Ensure(ctx)
+		}
+		if err != nil {
+			return nil, 0, err
+		}
+		matches := snapshot.Filter(query, limit)
+		if epoch == r.epoch.Load() {
+			paths := make([]string, len(matches))
+			for i := range matches {
+				paths[i] = matches[i].File.Path
+			}
+			return paths, epoch, nil
+		}
+		index.Invalidate()
+		forceRefresh = false
+	}
+	return nil, 0, errors.New("workspace changed while file completion was refreshing; type another character to retry")
+}
+
 func (r *workspaceRuntime) read(ctx context.Context, path string) (workspace.Document, error) {
 	root, _, err := r.resources(ctx)
 	if err != nil {
@@ -188,6 +224,7 @@ type workspaceView struct {
 
 	loading   string
 	err       error
+	stale     bool
 	truncated bool
 	skipped   int
 	oversized int
@@ -422,7 +459,7 @@ func currentSessionID(m *tuiModel) string {
 func (m *tuiModel) workspaceViewMatches(view *workspaceView, sessionID string, generation uint64) bool {
 	current, ok := m.full.(*workspaceView)
 	return ok && current == view && current.generation == generation &&
-		current.sessionID == sessionID && currentSessionID(m) == sessionID
+		generation == m.workspaceGeneration && current.sessionID == sessionID && currentSessionID(m) == sessionID
 }
 
 func (m *tuiModel) onWorkspaceOpened(msg workspaceOpenedMsg) tea.Cmd {
@@ -529,16 +566,34 @@ func (m *tuiModel) onWorkspaceEditorDone(msg workspaceEditorDoneMsg) tea.Cmd {
 	if !m.workspaceViewMatches(msg.view, msg.sessionID, msg.generation) {
 		return nil
 	}
+	// An editor can save before exiting non-zero, and preview/index work may
+	// still be in flight from before it launched. Advance the shared boundary
+	// on every return, rebind this panel for a successful refresh, and leave a
+	// failed return visibly stale instead of presenting old source as current.
+	invalidateRestoredWorkspace(m)
+	msg.view.generation = m.workspaceGeneration
+	msg.view.filterRequest++
+	msg.view.previewRequest++
 	if msg.err != nil {
 		return noticeCmd("error", "editor: "+msg.err.Error())
 	}
-	msg.view.runtime.invalidate()
+	msg.view.stale = false
+	msg.view.previewStale = false
 	msg.view.loading = "refreshing after editor…"
 	msg.view.err = nil
 	return msg.view.openCmd()
 }
 
 func (v *workspaceView) key(msg tea.KeyMsg) (bool, tea.Cmd) {
+	if v.stale {
+		switch msg.String() {
+		case "q", "esc":
+			v.close()
+			return true, nil
+		default:
+			return false, noticeCmd("warn", "the workspace changed; close and reopen this panel for current source")
+		}
+	}
 	if v.filterEditing {
 		return false, v.filterKey(msg)
 	}
@@ -672,6 +727,9 @@ func (v *workspaceView) goTo(end bool) tea.Cmd {
 }
 
 func (v *workspaceView) mouse(msg tea.MouseMsg) tea.Cmd {
+	if v.stale {
+		return nil
+	}
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
 		return v.move(-3)
@@ -785,6 +843,8 @@ func (v *workspaceView) header(width int, th *theme) string {
 func (v *workspaceView) footer(width int, th *theme) string {
 	status := ""
 	switch {
+	case v.stale:
+		status = "stale: workspace changed; close and reopen this panel"
 	case v.err != nil:
 		status = "error: " + workspaceSanitize(v.err.Error())
 	case v.loading != "":
@@ -813,7 +873,7 @@ func (v *workspaceView) listView(width, height int, th *theme, withPreview bool)
 		return workspaceFill([]string{th.err.Render(workspaceFit(" "+workspaceSanitize(v.err.Error()), width))}, width, height)
 	}
 	if v.loading != "" && len(v.rows) == 0 {
-		return workspaceFill([]string{th.dim.Render(" " + v.loading)}, width, height)
+		return workspaceFill([]string{th.dim.Render(workspaceFit(" "+v.loading, width))}, width, height)
 	}
 	if len(v.rows) == 0 {
 		empty := " no files match this filter"
@@ -857,7 +917,7 @@ func (v *workspaceView) previewView(width, height int, th *theme) string {
 	}
 	row := v.rows[v.selected]
 	if v.previewPath != row.location.Path || (v.preview.Location.Path == "" && v.previewErr == nil) {
-		return workspaceFill([]string{th.dim.Render(" loading source…")}, width, height)
+		return workspaceFill([]string{th.dim.Render(workspaceFit(" loading source…", width))}, width, height)
 	}
 	if v.previewErr != nil {
 		return workspaceFill([]string{th.warn.Render(workspaceFit(" "+workspaceSanitize(v.previewErr.Error()), width))}, width, height)
@@ -952,14 +1012,10 @@ func workspaceFit(text string, width int) string {
 	if lipgloss.Width(text) <= width {
 		return text
 	}
-	plain := []rune(text)
-	for len(plain) > 0 && lipgloss.Width(string(plain)+"…") > width {
-		plain = plain[:len(plain)-1]
-	}
-	if len(plain) == 0 {
-		return ""
-	}
-	return string(plain) + "…"
+	// Source paths and symbols routinely contain combining sequences and emoji.
+	// Rune slicing can split either even while remaining valid UTF-8; ANSI's
+	// cell-aware truncator preserves the terminal grapheme as one unit.
+	return ansi.Truncate(text, width, "…")
 }
 
 func workspacePad(text string, width int) string {
@@ -971,15 +1027,11 @@ func workspacePad(text string, width int) string {
 }
 
 func workspaceSanitize(text string) string {
-	return strings.Map(func(r rune) rune {
-		if r == '\t' {
-			return ' '
-		}
-		if unicode.IsControl(r) {
-			return '�'
-		}
-		return r
-	}, text)
+	// A tab's terminal width depends on the viewer's tab stops; source uses a
+	// stable single-cell spelling. Everything else follows the shared terminal
+	// boundary, including visible escapes for bidi overrides that could make a
+	// repository path or source line appear in a different order.
+	return terminaltext.Escape(strings.ReplaceAll(text, "\t", " "))
 }
 
 func workspaceClamp(value, low, high int) int {
@@ -992,7 +1044,7 @@ func workspaceClamp(value, low, high int) int {
 	return value
 }
 
-var workspaceClipboardWrite = clipboard.WriteAll
+var workspaceClipboardWrite = writeClipboardAll
 
 var workspaceGetenv = os.Getenv
 

@@ -1,15 +1,20 @@
 # Installation and configuration
 
-Switchboard runs on macOS and Linux. The interactive setup can create and
-update the user configuration, so editing TOML is optional.
+Switchboard runs on macOS, Linux, and Windows. The interactive setup can create
+and update the user configuration, so editing TOML is optional.
 
 ## Install
 
-The release installer verifies checksums and writes `sb` to `~/.local/bin`:
+On macOS and Linux, the release installer verifies checksums and writes `sb` to
+`~/.local/bin`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/switchboard-code/switchboard/main/install.sh | bash
 ```
+
+On Windows, download the `windows_amd64` or `windows_arm64` archive and
+`checksums.txt` from the [latest release](https://github.com/switchboard-code/switchboard/releases/latest),
+verify its SHA-256 digest, and place `sb.exe` on `PATH`.
 
 To build from source, install Go 1.26 and run:
 
@@ -47,14 +52,21 @@ local configuration or extension inventory is broken.
 
 ## Updates
 
-The TUI checks for releases at startup. By default it installs a verified
-update in the background, leaving the current process untouched. The next run
-uses the new binary. Switchboard detects package-manager installations and does
-not replace them.
+The TUI checks for releases at startup and shows a notice when one is
+available. It does not replace the executable by default. Switchboard detects
+package-manager installations and does not replace them.
 
 Use `sb update` for the same operation in a script. `/update channel beta`
-follows prereleases. `/update auto off` keeps the release notice but disables
-automatic installation.
+follows prereleases. `/update auto on` explicitly opts into background
+installation; the running process is untouched and the next run uses the new
+binary. `/update auto off` returns to notice-only behavior.
+
+Downloaded archives are checked against the exact SHA-256 value published in
+the same GitHub release. That detects corruption and mismatched assets, but it
+is not an independent publisher signature: compromise of the release assets
+could replace both the archive and its checksum. Leave automatic installation
+off if that trust model is not appropriate; manual `/update` and `sb update`
+use the same integrity check.
 
 ## First-run setup
 
@@ -65,11 +77,13 @@ it sets that address, which is what a server on another machine needs. A second
 row takes the base url of any OpenAI-compatible server, such as LM Studio,
 vLLM, llama.cpp, or a proxy. Both addresses are written to the config file.
 
-Providers that require a key use a masked prompt and store the value in the OS
-credential service. An empty entry stores nothing and continues, which is the
-answer for a server that issues no keys. If Codex CLI is signed in, setup can
-configure its token helper for OpenAI. Choose the first tier's model to finish
-setup.
+On macOS and Linux, providers that require a key use a masked prompt and store
+the value in the OS credential service. Windows builds currently have no native
+credential-store backend, so configure an environment variable or credential
+helper there before setup. An empty entry stores nothing and continues, which
+is the answer for a server that issues no keys. If Codex CLI is signed in,
+setup can configure its token helper for OpenAI. Choose the first tier's model
+to finish setup.
 
 The model step offers serving surfaces as well as individual models. The
 catalog prices the models it has verified; it cannot enumerate the models a
@@ -84,6 +98,10 @@ the surface is queried again with it. A model id can also be typed, which
 covers a server that does not answer the query, an entitlement that has not
 propagated, and a model published after the catalog revision.
 
+When such a custom or unlisted model has no verified output allowance, binding
+adds one short step for a positive output-token cap. The cap is a request limit,
+not a claim about the model's capacity.
+
 A credential stored anywhere in the TUI takes effect on the next request rather
 than the next launch.
 
@@ -92,7 +110,7 @@ These commands remain available later:
 | Command | Purpose |
 | --- | --- |
 | `/setup` | Reopen the setup checklist |
-| `/models` | Browse models and bind tiers |
+| `/models` | Browse models, bind tiers, and cap an unlisted model's output |
 | `/login` and `/logout` | Manage provider credentials |
 | `/doctor` or `sb doctor` | Probe providers, credentials, sandbox support, conditional tools, and MCP servers |
 | `/doctor extensions` | Inspect retained startup extension diagnostics in discovery order |
@@ -129,17 +147,48 @@ effort = "high"
 [tiers.t3]
 label = "kimi"
 model = "kimi/kimi-for-coding-highspeed"
+max_output = 8192
 fallback = ["ollama/qwen3.8:27b-mlx"]
 
 [tiers.t4]
 label = "codex"
 model = "openai/gpt-5.6-sol"
 surface = "subscription"
+max_output = 8192
 ```
 
 The `model` value identifies a provider and model. A tier may also set a
-reasoning `effort`, serving `surface`, and ordered `fallback` targets. See
-[Routing and the model ladder](routing.md) for selection and fallback rules.
+reasoning `effort`, serving `surface`, positive output-token `max_output`, and
+ordered `fallback` targets. See [Routing and the model ladder](routing.md) for
+selection and fallback rules.
+
+A custom or unlisted model normally has no verified output allowance. Give
+that rung a finite cap when neither its adapter nor the catalog supplies one:
+
+```toml
+[tiers.t5]
+label = "custom local"
+model = "ollama/my-model:latest"
+max_output = 4096
+```
+
+Omit `max_output` to use a verified adapter or catalog allowance. When the key
+is present it must be greater than zero. It is rung policy: the primary and
+every ordered fallback receive the same cap, and changing it changes every
+concrete target recorded for that rung. On Ollama it is the exact
+`options.num_predict`; on an OpenAI-compatible chat-completions endpoint it is
+the exact `max_tokens`; on OpenAI's Responses endpoint it is the exact
+`max_output_tokens`. Anthropic's token-budget dialect also treats an
+explicit value as a hard cap: if it does not exceed `budget_tokens`, the
+request is refused as an incompatible combination rather than silently raised.
+When `max_output` is omitted, that adapter may derive a larger default required
+by the chosen reasoning budget. Context and worst-case budget checks reserve
+the exact value the adapter will put on a successful request.
+
+Switchboard does not turn an unstated server default into a guessed finite
+bound. `/models` asks for a cap before binding a custom or unlisted model when
+no verified allowance exists. Choose a value the server supports and leave
+enough of the context window for the system prompt, tools, and conversation.
 
 `[routing] destinations = ["ollama"]` limits the workspace to the named
 providers. It is a hard requirement checked before cost, so a target it

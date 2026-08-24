@@ -3,15 +3,69 @@ package main
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
 )
 
 func typeSearch(m *tuiModel, text string) {
 	for _, r := range text {
 		m.transcriptSearchKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+}
+
+func TestTranscriptSearchMarkerAtWidthOneIsValidAndBounded(t *testing.T) {
+	m := testModel(t)
+	m.tr = newTranscript(1, m.th, newMarkdown(1, true))
+	m.tr.add(&entry{kind: kindInfo, text: "✗ needle"})
+	m.tr.view(1)
+	m.startTranscriptSearch()
+	typeSearch(m, "needle")
+
+	view := m.tr.view(1)
+	if !utf8.ValidString(view) {
+		t.Fatalf("width-one marker corrupted UTF-8: %q", view)
+	}
+	if cells := ansi.StringWidth(view); cells > 1 {
+		t.Fatalf("width-one marker occupies %d cells: %q", cells, view)
+	}
+}
+
+func TestTranscriptSearchScrollToShowsMatchAtHeightOne(t *testing.T) {
+	m := testModel(t)
+	m.tr.reset()
+	m.tr.add(&entry{kind: kindInfo, text: "zero"})
+	m.tr.add(&entry{kind: kindInfo, text: "unique needle"})
+	m.tr.add(&entry{kind: kindInfo, text: "tail"})
+	m.tr.view(1)
+	m.startTranscriptSearch()
+	typeSearch(m, "unique needle")
+
+	if got := ansi.Strip(m.tr.view(1)); !strings.Contains(got, "unique") {
+		t.Fatalf("one-row search landed above its match: %q", got)
+	}
+}
+
+func TestTranscriptSearchRescansFlatCoordinatesAfterResize(t *testing.T) {
+	m := testModel(t)
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 12})
+	m.tr.reset()
+	m.tr.add(&entry{kind: kindInfo, text: strings.Repeat("long prelude ", 15)})
+	m.tr.add(&entry{kind: kindInfo, text: "UNIQUE-NEEDLE at the target"})
+	m.startTranscriptSearch()
+	typeSearch(m, "unique-needle")
+
+	m.Update(tea.WindowSizeMsg{Width: 20, Height: 12})
+	if len(m.trMatches) == 0 {
+		t.Fatal("resize lost the active transcript search")
+	}
+	for _, line := range m.trMatches {
+		if line < 0 || line >= len(m.tr.searchable) || !strings.Contains(m.tr.searchable[line], "unique-needle") {
+			t.Fatalf("resize left stale match %d in %d rows: matches=%v", line, len(m.tr.searchable), m.trMatches)
+		}
 	}
 }
 

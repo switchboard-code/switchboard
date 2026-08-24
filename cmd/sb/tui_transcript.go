@@ -2,10 +2,12 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/switchboard-code/switchboard/internal/terminaltext"
 	"github.com/switchboard-code/switchboard/internal/tools"
@@ -91,6 +93,14 @@ type transcript struct {
 	offset int // lines scrolled up from the bottom
 	height int // the viewport view last drew, for the scroll clamp
 
+	// A width change rewraps flat rows. While scrolled back, reflowLine keeps
+	// one semantic row at the same screen position until view supplies the new
+	// viewport height; offset alone cannot do that because it counts wrapped
+	// rows from the bottom.
+	reflowLine      int
+	reflowScreenRow int
+	reflowPending   bool
+
 	// marks overlays the one-cell page margin: flat line index to a
 	// pre-rendered single-cell marker. The search owns the map; the
 	// transcript only paints it, on a copy, so the flat buffer never
@@ -105,6 +115,11 @@ type transcript struct {
 	selEnd    int
 	selOn     bool
 	selMoved  bool
+
+	// onChange lets the owning model refresh flat-row interaction state after
+	// asynchronous streaming/tool splices. The transcript remains usable on
+	// its own in tests; nil means no owner-side state is active.
+	onChange func()
 }
 
 func newTranscript(width int, th *theme, md *markdown) *transcript {
@@ -180,6 +195,21 @@ func (t *transcript) invalidate(i int) {
 	if i+1 < len(t.entries) {
 		oldEnd = t.starts[i+1]
 	}
+	// Once somebody scrolls back, new output must not pull the viewport toward
+	// the live tail. Find the first line this splice actually changes rather
+	// than using the entry boundary: a streaming entry can be much taller than
+	// the viewport while only its last wrapped line is changing.
+	changeStart := oldStart
+	oldLines := t.flat[oldStart:oldEnd]
+	for changeStart-oldStart < len(oldLines) && changeStart-oldStart < len(lines) &&
+		oldLines[changeStart-oldStart] == lines[changeStart-oldStart] {
+		changeStart++
+	}
+	viewStart := 0
+	if t.height > 0 {
+		viewEnd := len(t.flat) - t.offset
+		viewStart = max(viewEnd-t.height, 0)
+	}
 	plain := make([]string, len(lines))
 	for j, l := range lines {
 		plain[j] = strings.ToLower(plainLine(l))
@@ -188,7 +218,20 @@ func (t *transcript) invalidate(i int) {
 	if delta == 0 {
 		copy(t.flat[oldStart:], lines)
 		copy(t.searchable[oldStart:], plain)
+		t.changed()
 		return
+	}
+	// A mouse drag is expressed in flat-row coordinates. Tool completions and
+	// expansion can splice rows ahead of an in-progress drag, so carry both
+	// endpoints across the splice before repainting. Otherwise a release that
+	// races an async completion copies whatever inherited the old row numbers,
+	// rather than the lines the user actually selected.
+	if t.selOn {
+		t.selAnchor = remapFlatIndex(t.selAnchor, oldStart, oldEnd, len(lines))
+		t.selEnd = remapFlatIndex(t.selEnd, oldStart, oldEnd, len(lines))
+	}
+	if t.reflowPending {
+		t.reflowLine = remapFlatIndex(t.reflowLine, oldStart, oldEnd, len(lines))
 	}
 	tail := append([]string(nil), t.flat[oldEnd:]...)
 	flat := append(t.flat[:oldStart], lines...)
@@ -199,6 +242,37 @@ func (t *transcript) invalidate(i int) {
 	for j := i + 1; j < len(t.starts); j++ {
 		t.starts[j] += delta
 	}
+	if t.offset > 0 && changeStart >= viewStart {
+		// offset is measured from the bottom, so absorbing the splice delta
+		// keeps the same absolute rows under the viewport. Changes wholly above
+		// the viewport instead shift those rows naturally and need no adjustment.
+		t.offset += delta
+		t.clampOffset()
+	}
+	t.changed()
+}
+
+func (t *transcript) changed() {
+	if t.onChange != nil {
+		t.onChange()
+	}
+}
+
+// remapFlatIndex carries one row coordinate through replacement of
+// [oldStart, oldEnd) by newLen rows. Coordinates in the replaced entry keep
+// their relative row where possible; coordinates after it move by the splice
+// delta.
+func remapFlatIndex(index, oldStart, oldEnd, newLen int) int {
+	if index < oldStart {
+		return index
+	}
+	if index >= oldEnd {
+		return index + newLen - (oldEnd - oldStart)
+	}
+	if newLen <= 0 {
+		return oldStart - 1
+	}
+	return oldStart + min(index-oldStart, newLen-1)
 }
 
 func (t *transcript) render(e *entry) []string {
@@ -223,10 +297,20 @@ func (t *transcript) render(e *entry) []string {
 // after each block. Tool and thinking entries stay tight — the rail groups
 // them — and blanks do not stack.
 func (t *transcript) composed(e *entry) []string {
-	lines := t.renderUncached(e)
+	// Flat rows are the viewport's unit for scrolling, clicking, selection,
+	// and search. Letting the terminal wrap one behind our back makes all four
+	// maps wrong, so every renderer passes through one final cell-aware bound.
+	// Renderers still choose their own semantic wrapping; this guard protects
+	// the invariant from long unbroken tool names/output and future entry kinds.
+	contentWidth := max(t.width-1, 1)
+	lines := boundTranscriptLines(t.renderUncached(e), contentWidth)
+	margin := " "
+	if t.width <= 1 {
+		margin = ""
+	}
 	for i, l := range lines {
 		if l != "" {
-			lines[i] = " " + l
+			lines[i] = margin + l
 		}
 	}
 	if e.padTop {
@@ -256,11 +340,11 @@ func (t *transcript) renderUncached(e *entry) []string {
 	case kindAssistant:
 		text := terminaltext.Display(e.text)
 		if e.live {
-			return wrapPlain(text, w)
+			return wrapPlain(text, max(w-1, 1))
 		}
 		return t.md.render(text)
 	case kindThinking:
-		lines := wrapPlain(terminaltext.Display(e.text), w)
+		lines := wrapPlain(terminaltext.Display(e.text), max(w-1, 1))
 		for i, l := range lines {
 			lines[i] = t.th.thinking.Render(l)
 		}
@@ -274,7 +358,16 @@ func (t *transcript) renderUncached(e *entry) []string {
 	case kindRoute:
 		return t.renderRoute(e, w)
 	case kindRaw:
-		return strings.Split(e.text, "\n")
+		// kindRaw is the pre-styled opening banner. It is built before Bubble
+		// Tea reports the real terminal size, so fitting belongs here where a
+		// resize invalidates and re-renders the width-keyed entry cache. Leave
+		// one cell for composed's page margin.
+		inner := max(w-1, 0)
+		lines := strings.Split(e.text, "\n")
+		for i, line := range lines {
+			lines[i] = fitCells(line, inner)
+		}
+		return lines
 	default: // kindInfo
 		return t.renderInfo(terminaltext.Display(e.text), w)
 	}
@@ -293,14 +386,22 @@ func (t *transcript) renderInfo(text string, w int) []string {
 	// columns, and every column reserved here is one the command's own
 	// alignment loses, so nothing is taken beyond the two cells of rail and
 	// the page margin the transcript adds.
-	inner := w - 3
-	if inner < 20 {
-		inner = 20
-	}
+	inner := max(w-3, 1)
 	rail := t.th.faint.Render("│ ")
 
 	heading, body, _ := strings.Cut(text, "\n")
-	lines := []string{t.th.faint.Render("╭ ") + t.th.bold.Render(heading)}
+	headingLines := wrapPlain(heading, inner)
+	if len(headingLines) == 0 {
+		headingLines = []string{""}
+	}
+	lines := make([]string, 0, len(headingLines)+2)
+	for i, line := range headingLines {
+		lead := rail
+		if i == 0 {
+			lead = t.th.faint.Render("╭ ")
+		}
+		lines = append(lines, lead+t.th.bold.Render(line))
+	}
 	for _, paragraph := range strings.Split(body, "\n") {
 		if strings.TrimSpace(paragraph) == "" {
 			lines = append(lines, rail)
@@ -310,7 +411,8 @@ func (t *transcript) renderInfo(text string, w int) []string {
 		// out columns with it — so it is preserved and the wrap applies to
 		// what is left.
 		indent := paragraph[:len(paragraph)-len(strings.TrimLeft(paragraph, " "))]
-		for _, l := range wrapPlain(strings.TrimLeft(paragraph, " "), inner-lipgloss.Width(indent)) {
+		indent = fitCells(indent, max(inner-1, 0))
+		for _, l := range wrapPlain(strings.TrimLeft(paragraph, " "), max(inner-lipgloss.Width(indent), 1)) {
 			lines = append(lines, rail+t.th.dim.Render(indent+l))
 		}
 	}
@@ -330,10 +432,7 @@ func (t *transcript) renderInfo(text string, w int) []string {
 // what *you* said to land as one object, not as lines that happen to share a
 // prefix. Every segment carries the ground, the way the status bar does.
 func (t *transcript) renderUser(text string, w int) []string {
-	inner := w - 4 // the 1-cell page margin, the two-cell bar, a right pad
-	if inner < 20 {
-		inner = 20
-	}
+	inner := max(w-4, 1) // the 1-cell page margin, the two-cell bar, a right pad
 	on := t.th.onSurface
 	bar := on(t.th.user).Render("▌ ")
 	pad := on(t.th.user).Render("  ")
@@ -343,10 +442,7 @@ func (t *transcript) renderUser(text string, w int) []string {
 		if i == 0 {
 			lead = bar
 		}
-		gap := w - 1 - 2 - lipgloss.Width(l)
-		if gap < 1 {
-			gap = 1
-		}
+		gap := max(w-1-2-lipgloss.Width(l), 0)
 		lines = append(lines, lead+on(t.th.text).Render(l)+on(t.th.text).Render(strings.Repeat(" ", gap)))
 	}
 	return lines
@@ -357,13 +453,13 @@ func (t *transcript) renderTool(tool *toolEntry, expanded bool, rank int, w int)
 	if rank >= 0 {
 		rail = t.th.rung(rank)
 	}
-	head := rail.Render("│ ") + t.th.bold.Render(terminaltext.Escape(tool.name))
+	headBody := t.th.bold.Render(terminaltext.Escape(tool.name))
 	if tool.desc != "" {
-		desc := terminaltext.Display(tool.desc)
-		head += t.th.dim.Render(" " + truncate(desc, max(w-12-len(tool.name), 8)))
+		headBody += t.th.dim.Render(" " + terminaltext.Display(tool.desc))
 	}
+	head := prefixedWrappedLines(rail.Render("│ "), headBody, w-1)
 	if !tool.done {
-		return []string{head}
+		return head
 	}
 	// Completion is a verdict glyph, not a word: ✓ and ✗ read at scroll speed,
 	// where "ok" and "failed" read at reading speed.
@@ -371,7 +467,7 @@ func (t *transcript) renderTool(tool *toolEntry, expanded bool, rank int, w int)
 	if tool.failed {
 		status = t.th.err.Render("✗ " + formatDuration(tool.took))
 	}
-	lines := []string{head, rail.Render("└ ") + status}
+	lines := append(head, rail.Render("└ ")+status)
 
 	detail := strings.TrimRight(terminaltext.Display(tool.detail), "\n")
 	if detail == "" {
@@ -381,10 +477,13 @@ func (t *transcript) renderTool(tool *toolEntry, expanded bool, rank int, w int)
 		// A failure shows its tail in full below; repeating the first line
 		// inline as well would print a one-line error twice.
 		if first := firstLine(detail); first != "" && !tool.failed {
-			lines[1] += t.th.dim.Render(" · " + first)
+			remaining := max(w-1-lipgloss.Width(lines[1])-3, 0)
+			if remaining > 0 {
+				lines[1] += t.th.dim.Render(" · " + fitCells(first, remaining))
+			}
 		}
 		if tool.failed {
-			lines = append(lines, indentLines(t.th.err, tailLines(detail, 24), 4)...)
+			lines = append(lines, indentWrappedLines(t.th.err, tailLines(detail, 24), 4, w-1)...)
 		}
 		return lines
 	}
@@ -392,7 +491,7 @@ func (t *transcript) renderTool(tool *toolEntry, expanded bool, rank int, w int)
 	if tool.failed {
 		style = t.th.err
 	}
-	lines = append(lines, indentLines(style, tailLines(detail, 200), 4)...)
+	lines = append(lines, indentWrappedLines(style, tailLines(detail, 200), 4, w-1)...)
 	return lines
 }
 
@@ -420,17 +519,31 @@ func (t *transcript) renderTodo(items []tools.TodoItem, rank int, w int) []strin
 		if i == len(items)-1 {
 			lead = "└ "
 		}
-		text := truncate(terminaltext.Display(item.Text), max(w-8, 8))
-		var body string
+		textLines := wrapPlain(terminaltext.Display(item.Text), max(w-5, 1))
+		if len(textLines) == 0 {
+			textLines = []string{""}
+		}
+		var mark string
+		style := t.th.dim
 		switch item.Status {
 		case tools.TodoDone:
-			body = t.th.ok.Render("✓ ") + t.th.dim.Render(text)
+			mark = t.th.ok.Render("✓ ")
 		case tools.TodoActive:
-			body = t.th.bold.Render("▸ " + text)
+			mark = t.th.bold.Render("▸ ")
+			style = t.th.bold
 		default:
-			body = t.th.dim.Render("· " + text)
+			mark = t.th.dim.Render("· ")
 		}
-		lines = append(lines, rail.Render(lead)+body)
+		for j, text := range textLines {
+			rowLead, rowMark := lead, mark
+			if j > 0 {
+				rowLead, rowMark = "│ ", "  "
+				if i == len(items)-1 {
+					rowLead = "  "
+				}
+			}
+			lines = append(lines, rail.Render(rowLead)+rowMark+style.Render(text))
+		}
 	}
 	return lines
 }
@@ -468,10 +581,23 @@ func (t *transcript) renderNotice(e *entry, w int) []string {
 		if e.rail {
 			lead = rail.Render("└ ") + t.th.ok.Render("✓ ")
 		}
-		return []string{lead + t.th.dim.Render(terminaltext.Display(e.text))}
+		bodyWidth := max(w-1-lipgloss.Width(lead), 1)
+		wrapped := wrapPlain(terminaltext.Display(e.text), bodyWidth)
+		if len(wrapped) == 0 {
+			wrapped = []string{""}
+		}
+		lines := make([]string, 0, len(wrapped))
+		for i, line := range wrapped {
+			prefix := strings.Repeat(" ", lipgloss.Width(lead))
+			if i == 0 {
+				prefix = lead
+			}
+			lines = append(lines, prefix+t.th.dim.Render(line))
+		}
+		return lines
 	}
 	var lines []string
-	for i, l := range wrapPlain(terminaltext.Display(e.text), max(w-2, 20)) {
+	for i, l := range wrapPlain(terminaltext.Display(e.text), max(w-3, 1)) {
 		if i == 0 {
 			lines = append(lines, style.Render(glyph+" ")+body.Render(l))
 		} else {
@@ -490,14 +616,24 @@ func (t *transcript) renderRoute(e *entry, w int) []string {
 	if e.rank >= 0 {
 		marker = t.th.rung(e.rank)
 	}
-	line := marker.Render("◆ ") + t.th.dim.Render(terminaltext.Display(e.routeSummary))
-	if !e.expanded {
-		return []string{line}
+	summary := wrapPlain(terminaltext.Display(e.routeSummary), max(w-3, 1))
+	if len(summary) == 0 {
+		summary = []string{""}
 	}
-	lines := []string{line}
+	lines := make([]string, 0, len(summary)+len(e.routeLines))
+	for i, text := range summary {
+		lead := "  "
+		if i == 0 {
+			lead = marker.Render("◆ ")
+		}
+		lines = append(lines, lead+t.th.dim.Render(text))
+	}
+	if !e.expanded {
+		return lines
+	}
 	for _, l := range e.routeLines {
 		l = terminaltext.Display(l)
-		for _, wl := range wrapPlain(l, max(w-4, 20)) {
+		for _, wl := range wrapPlain(l, max(w-5, 1)) {
 			lines = append(lines, t.th.dim.Render("    "+wl))
 		}
 	}
@@ -512,6 +648,7 @@ func (t *transcript) view(height int) string {
 		return ""
 	}
 	t.height = height
+	t.applyReflowAnchor(true)
 	t.clampOffset()
 	total := len(t.flat)
 	end := total - t.offset
@@ -530,7 +667,12 @@ func (t *transcript) view(height int) string {
 		for j := range visible {
 			if mark, ok := t.marks[start+j]; ok {
 				if visible[j] == "" {
-					visible[j] = mark
+					visible[j] = fitCells(mark, max(t.width, 0))
+				} else if t.width <= 1 {
+					// There is no dedicated margin cell at width one. Replacing
+					// the row is less informative than a normal view, but it is
+					// valid UTF-8 and cannot split the first wide grapheme.
+					visible[j] = fitCells(mark, max(t.width, 0))
 				} else {
 					// Every non-blank line begins with the one-cell page
 					// margin; the marker takes that cell.
@@ -570,11 +712,16 @@ func (t *transcript) scrollTo(line int) {
 	if t.height <= 0 {
 		return
 	}
-	t.offset = len(t.flat) - line - t.height/2
+	t.reflowPending = false
+	// The visible interval is half-open, so the matched line itself consumes
+	// one row. Accounting for that row avoids landing one line above a match
+	// when the viewport is only one cell tall.
+	t.offset = len(t.flat) - line - (t.height+1)/2
 	t.clampOffset()
 }
 
 func (t *transcript) scrollBy(n int) {
+	t.reflowPending = false
 	t.offset += n
 	t.clampOffset()
 }
@@ -597,7 +744,183 @@ func (t *transcript) clampOffset() {
 	}
 }
 
-func (t *transcript) scrollToBottom() { t.offset = 0 }
+func (t *transcript) scrollToBottom() {
+	t.reflowPending = false
+	t.offset = 0
+}
+
+type transcriptReflowAnchor struct {
+	entry         int
+	screenRow     int
+	semantic      string
+	semanticStart int
+	semanticTotal int
+	relativeRow   int
+	entryRows     int
+}
+
+// captureReflowAnchor records the first meaningful row in a scrolled
+// viewport as an entry plus an offset in that entry's decoration-free text.
+// Removing whitespace and repeated rails makes the stream invariant under
+// ordinary word wrapping, including CJK hard-wraps and styled info cards.
+func (t *transcript) captureReflowAnchor() *transcriptReflowAnchor {
+	if t.offset <= 0 || len(t.flat) == 0 || t.height <= 0 {
+		return nil
+	}
+	end := max(len(t.flat)-t.offset, 0)
+	start := max(end-t.height, 0)
+	for line := start; line < end; line++ {
+		entryIndex := t.entryIndexAt(line)
+		if entryIndex < 0 {
+			continue
+		}
+		entryStart, entryEnd := t.entryBounds(entryIndex)
+		semantic, starts, lengths := reflowSemanticRows(t.flat[entryStart:entryEnd])
+		relative := line - entryStart
+		if relative < 0 || relative >= len(lengths) || lengths[relative] == 0 {
+			continue
+		}
+		return &transcriptReflowAnchor{
+			entry: entryIndex, screenRow: line - start, semantic: semantic,
+			semanticStart: starts[relative], semanticTotal: len([]rune(semantic)),
+			relativeRow: relative, entryRows: entryEnd - entryStart,
+		}
+	}
+
+	// A viewport containing only blank/decorative rows is unusual but still
+	// gets a stable entry-relative fallback instead of reverting to the old
+	// rows-from-bottom interpretation.
+	entryIndex := t.entryIndexAt(start)
+	if entryIndex < 0 {
+		return nil
+	}
+	entryStart, entryEnd := t.entryBounds(entryIndex)
+	return &transcriptReflowAnchor{
+		entry: entryIndex, relativeRow: start - entryStart, entryRows: entryEnd - entryStart,
+	}
+}
+
+func (t *transcript) resolveReflowAnchor(anchor transcriptReflowAnchor) (int, int) {
+	if anchor.entry < 0 || anchor.entry >= len(t.entries) {
+		return -1, 0
+	}
+	entryStart, entryEnd := t.entryBounds(anchor.entry)
+	rows := t.flat[entryStart:entryEnd]
+	if len(rows) == 0 {
+		return entryStart, anchor.screenRow
+	}
+	semantic, starts, lengths := reflowSemanticRows(rows)
+	relative := proportionalRow(anchor.relativeRow, anchor.entryRows, len(rows))
+	if semantic != "" && anchor.semanticTotal > 0 {
+		desired := reflowSemanticOffset(anchor, semantic)
+		lastMeaningful := relative
+		for i, length := range lengths {
+			if length == 0 {
+				continue
+			}
+			lastMeaningful = i
+			if desired < starts[i]+length {
+				relative = i
+				break
+			}
+			relative = lastMeaningful
+		}
+	}
+	return entryStart + min(max(relative, 0), len(rows)-1), anchor.screenRow
+}
+
+func (t *transcript) entryBounds(index int) (int, int) {
+	start := t.starts[index]
+	end := len(t.flat)
+	if index+1 < len(t.starts) {
+		end = t.starts[index+1]
+	}
+	return start, end
+}
+
+func (t *transcript) entryIndexAt(line int) int {
+	if line < 0 || line >= len(t.flat) {
+		return -1
+	}
+	// starts is monotonic and a resumed transcript can hold thousands of
+	// entries. A resize should cost viewport rows times log(entries), not a
+	// backwards walk over the whole session for every candidate anchor row.
+	i := sort.Search(len(t.starts), func(i int) bool {
+		return t.starts[i] > line
+	}) - 1
+	if i >= 0 {
+		return i
+	}
+	return -1
+}
+
+func (t *transcript) applyReflowAnchor(clear bool) {
+	if !t.reflowPending || t.height <= 0 {
+		return
+	}
+	visibleStart := t.reflowLine - t.reflowScreenRow
+	t.offset = len(t.flat) - visibleStart - t.height
+	t.clampOffset()
+	if clear {
+		t.reflowPending = false
+	}
+}
+
+func proportionalRow(row, oldRows, newRows int) int {
+	if newRows <= 1 || oldRows <= 1 {
+		return 0
+	}
+	row = min(max(row, 0), oldRows-1)
+	return (row*(newRows-1) + (oldRows-1)/2) / (oldRows - 1)
+}
+
+func reflowSemanticOffset(anchor transcriptReflowAnchor, semantic string) int {
+	newRunes := []rune(semantic)
+	oldRunes := []rune(anchor.semantic)
+	oldOffset := min(max(anchor.semanticStart, 0), len(oldRunes))
+	if anchor.semantic == semantic {
+		return min(oldOffset, len(newRunes))
+	}
+	// Renderer decorations can vary by width. A window around the old row
+	// recovers the exact semantic position when the underlying prose remains;
+	// proportional progress is the honest fallback when markdown itself changed.
+	windowStart := max(oldOffset-16, 0)
+	windowEnd := min(oldOffset+32, len(oldRunes))
+	if windowEnd > windowStart {
+		needle := string(oldRunes[windowStart:windowEnd])
+		if found := strings.Index(semantic, needle); found >= 0 {
+			prefixRunes := len([]rune(semantic[:found]))
+			return min(prefixRunes+oldOffset-windowStart, len(newRunes))
+		}
+	}
+	if anchor.semanticTotal <= 0 {
+		return 0
+	}
+	return min((oldOffset*len(newRunes)+anchor.semanticTotal/2)/anchor.semanticTotal, len(newRunes))
+}
+
+func reflowSemanticRows(lines []string) (string, []int, []int) {
+	starts := make([]int, len(lines))
+	lengths := make([]int, len(lines))
+	var b strings.Builder
+	runes := 0
+	for i, line := range lines {
+		starts[i] = runes
+		text := reflowSemanticRow(line)
+		lengths[i] = len([]rune(text))
+		runes += lengths[i]
+		b.WriteString(text)
+	}
+	return b.String(), starts, lengths
+}
+
+func reflowSemanticRow(line string) string {
+	runes := []rune(strings.TrimSpace(ansi.Strip(line)))
+	for len(runes) > 0 && strings.ContainsRune("│╭╰└▌", runes[0]) {
+		runes = []rune(strings.TrimSpace(string(runes[1:])))
+	}
+	return strings.Join(strings.Fields(string(runes)), "")
+}
 
 // maxTextWidth caps prose regardless of terminal width. On a wide monitor,
 // uncapped text running edge to edge is the most legible nobody-designed-this
@@ -611,6 +934,10 @@ func (t *transcript) setWidth(width int) {
 	if width == t.width {
 		return
 	}
+	// Settle a prior resize if multiple size messages arrive before the next
+	// paint, then capture the old wrapping while its row map still exists.
+	t.applyReflowAnchor(true)
+	anchor := t.captureReflowAnchor()
 	t.width = width
 	t.md.setWidth(width)
 	// Width-keyed caches make re-render a cache hit where this width was seen
@@ -626,6 +953,17 @@ func (t *transcript) setWidth(width int) {
 			t.searchable = append(t.searchable, strings.ToLower(plainLine(l)))
 		}
 	}
+	if anchor != nil {
+		t.reflowLine, t.reflowScreenRow = t.resolveReflowAnchor(*anchor)
+		t.reflowPending = t.reflowLine >= 0
+		// Keep offset valid for any interaction before Bubble Tea's next paint;
+		// view reapplies the target using the actual post-resize height.
+		t.applyReflowAnchor(false)
+	} else {
+		t.reflowPending = false
+		t.clampOffset()
+	}
+	t.changed()
 }
 
 func (t *transcript) setTheme(th *theme) {
@@ -644,7 +982,9 @@ func (t *transcript) reset() {
 	t.flat = nil
 	t.searchable = nil
 	t.offset = 0
+	t.reflowPending = false
 	t.marks = nil
+	t.changed()
 }
 
 // lastExpandable returns the most recent route or tool entry, which is what
@@ -684,11 +1024,55 @@ func (t *transcript) entryAt(row int) int {
 	return -1
 }
 
-func indentLines(style lipgloss.Style, lines []string, indent int) []string {
+func indentWrappedLines(style lipgloss.Style, lines []string, indent, width int) []string {
+	width = max(width, 1)
+	indent = min(max(indent, 0), max(width-1, 0))
 	pad := strings.Repeat(" ", indent)
-	out := make([]string, len(lines))
-	for i, l := range lines {
-		out[i] = style.Render(pad + l)
+	bodyWidth := max(width-indent, 1)
+	var out []string
+	for _, line := range lines {
+		wrapped := wrapPlain(line, bodyWidth)
+		if len(wrapped) == 0 {
+			wrapped = []string{""}
+		}
+		for _, l := range wrapped {
+			out = append(out, style.Render(pad+l))
+		}
+	}
+	return out
+}
+
+func prefixedWrappedLines(prefix, body string, width int) []string {
+	width = max(width, 1)
+	bodyWidth := max(width-lipgloss.Width(prefix), 1)
+	wrapped := strings.Split(wrapCells(body, bodyWidth), "\n")
+	if len(wrapped) == 0 {
+		wrapped = []string{""}
+	}
+	out := make([]string, 0, len(wrapped))
+	for _, line := range wrapped {
+		out = append(out, prefix+line)
+	}
+	return out
+}
+
+func boundTranscriptLines(lines []string, width int) []string {
+	if width <= 0 {
+		return make([]string, len(lines))
+	}
+	var out []string
+	for _, line := range lines {
+		if line == "" {
+			out = append(out, "")
+			continue
+		}
+		wrapped := strings.Split(wrapCells(line, width), "\n")
+		for _, row := range wrapped {
+			// A grapheme may itself be wider than a one-cell viewport. The
+			// terminal cannot display it there, but it still must not create an
+			// untracked physical row.
+			out = append(out, ansi.Truncate(row, width, ""))
+		}
 	}
 	return out
 }
@@ -702,8 +1086,11 @@ func tailLines(s string, n int) []string {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	boundaries := graphemeBoundaries(s)
+	clusters := len(boundaries) - 1
+	if clusters <= n {
 		return s
 	}
-	return s[:n] + "…"
+	n = min(max(n, 0), clusters)
+	return string([]rune(s)[:boundaries[n]]) + "…"
 }

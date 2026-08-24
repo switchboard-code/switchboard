@@ -24,14 +24,15 @@ func (t *execTool) Description() string {
 		"so an approved command can access the host filesystem outside the workspace and the network. " +
 		"When a verified sandbox is active, writes are limited to the workspace, temp, and build caches; broad system and outside-home paths remain readable, and network requests are gated. " +
 		"Pass either command or script, never both. " +
-		"Combined stdout and stderr are returned; long output has its " +
-		"middle removed and says so."
+		"Combined stdout and stderr are returned; output beyond the bounded " +
+		"capture is withheld because an incomplete stream cannot be checked safely."
 }
 
 func (t *execTool) ParallelSafe() bool { return false }
 
 func (t *execTool) Schema() json.RawMessage {
-	return json.RawMessage(`{
+	scriptDescription := strconv.Quote(scriptSchemaDescription())
+	return json.RawMessage(fmt.Sprintf(`{
   "type": "object",
   "properties": {
     "command": {
@@ -39,12 +40,12 @@ func (t *execTool) Schema() json.RawMessage {
       "items": {"type": "string"},
       "description": "Program and arguments, run directly with no shell: [\"go\",\"test\",\"./...\"]."
     },
-    "script": {"type": "string", "description": "One /bin/sh script, used instead of command when you need a pipe, glob, redirection, or variable: \"grep -r foo . | head -20\"."},
+	"script": {"type": "string", "description": %s},
 	"network": {"type": "boolean", "description": "Request internet access when a sandbox is active. With the default sandbox-off posture, approved commands already have the host's full network reach regardless of this hint."},
     "timeout_seconds": {"type": "integer", "description": "Wall-clock limit. Defaults to 120. Ignored when background is true."},
     "background": {"type": "boolean", "description": "Start the command and return immediately with a handle instead of waiting. For a server, a watch build, or anything meant to keep running while you work. Read its output and stop it with the proc tool."}
   }
-}`)
+}`, scriptDescription))
 }
 
 type execInput struct {
@@ -71,8 +72,9 @@ func (t *execTool) Plan(input json.RawMessage) (Plan, error) {
 			strings.Join(in.Command, " "))
 	}
 	if (len(in.Command) == 0) == (in.Script == "") {
-		return Plan{}, fmt.Errorf(`exec: pass exactly one of command or script, ` +
-			`for example {"command": ["go","test","./..."]} or {"script": "grep -r foo . | head -20"}`)
+		return Plan{}, fmt.Errorf(`exec: pass exactly one of command or script, `+
+			`for example {"command": ["go","test","./..."]} or {"script": %s}`,
+			strconv.Quote(scriptExample()))
 	}
 	argv, shell := in.Command, false
 	if in.Script != "" {
@@ -147,7 +149,10 @@ func (t *execTool) Plan(input json.RawMessage) (Plan, error) {
 // is best placed to decide whether to narrow it, retry, or give up (§10.3).
 func execResult(res execution.Result) Result {
 	var b strings.Builder
-	if res.Output != "" {
+	if res.Truncated {
+		b.WriteString("[command output withheld because it exceeded the bounded capture]")
+		b.WriteByte('\n')
+	} else if res.Output != "" {
 		b.WriteString(res.Output)
 		if !strings.HasSuffix(res.Output, "\n") {
 			b.WriteByte('\n')
@@ -173,7 +178,7 @@ func execResult(res execution.Result) Result {
 // quoting round trip and must never be fed back to a shell.
 func Describe(argv []string, shell bool) string {
 	if shell {
-		return "sh -c " + strconv.Quote(strings.Join(argv, " "))
+		return describeScript(strings.Join(argv, " "))
 	}
 	quoted := make([]string, len(argv))
 	for i, a := range argv {

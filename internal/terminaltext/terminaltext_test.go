@@ -20,13 +20,13 @@ func TestEscapeMakesTerminalAndBidiControlsVisible(t *testing.T) {
 	}
 }
 
-func TestDisplayPreservesLayoutButEscapesTerminalCommands(t *testing.T) {
+func TestDisplayPreservesLinesAndMakesTabsDeterministic(t *testing.T) {
 	input := "first\tcolumn\nsecond\rOVERWRITE\x1b]52;c;Y2xpcGJvYXJk\x07\u202espoof"
 	got := Display(input)
-	if !strings.Contains(got, "first\tcolumn\nsecond") {
+	if !strings.Contains(got, `first\tcolumn`+"\nsecond") {
 		t.Fatalf("display lost ordinary layout: %q", got)
 	}
-	for _, unsafe := range []string{"\r", "\x1b", "\x07", "\u202e"} {
+	for _, unsafe := range []string{"\t", "\r", "\x1b", "\x07", "\u202e"} {
 		if strings.Contains(got, unsafe) {
 			t.Fatalf("display retained unsafe control %q: %q", unsafe, got)
 		}

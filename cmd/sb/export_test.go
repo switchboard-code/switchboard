@@ -97,3 +97,27 @@ func TestExportDisplaysParameterizedRouteTargets(t *testing.T) {
 		t.Fatalf("parameterized export target is opaque: %q", out)
 	}
 }
+
+func TestExportRedactsCredentialsAndEscapesTerminalControls(t *testing.T) {
+	token := "ghp_" + strings.Repeat("a", 36)
+	unsafe := "line\x1b]2;spoof\a\u202eright " + token
+	out := exportMarkdown(session.State{Workspace: unsafe}, []session.Timeline{{
+		Message: func() *provider.Message {
+			message := provider.UserText(unsafe)
+			return &message
+		}(),
+	}})
+	if strings.Contains(out, token) || !strings.Contains(out, "[redacted: a GitHub token]") {
+		t.Fatalf("export exposed a credential: %q", out)
+	}
+	for _, control := range []string{"\x1b", "\a", "\u202e"} {
+		if strings.Contains(out, control) {
+			t.Fatalf("export retained terminal control %q: %q", control, out)
+		}
+	}
+	for _, visible := range []string{`\x1b`, `\x07`, `\u202e`} {
+		if !strings.Contains(out, visible) {
+			t.Fatalf("export did not visibly escape %q: %q", visible, out)
+		}
+	}
+}

@@ -1,4 +1,4 @@
-//go:build unix
+//go:build android || darwin || dragonfly || freebsd || linux || netbsd || openbsd
 
 package extensions
 

@@ -25,6 +25,7 @@ import (
 func (r *Registry) Branch(refuse map[string]string) *Registry {
 	nr := &Registry{
 		root:       r.root,
+		rootInfo:   r.rootInfo,
 		capability: r.capability,
 		execution:  r.execution,
 		versions:   newFileVersions(),

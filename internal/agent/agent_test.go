@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,10 +15,12 @@ import (
 	"time"
 
 	"github.com/switchboard-code/switchboard/internal/catalog"
+	"github.com/switchboard-code/switchboard/internal/checkpoint"
 	"github.com/switchboard-code/switchboard/internal/continuity"
 	"github.com/switchboard-code/switchboard/internal/execution"
 	"github.com/switchboard-code/switchboard/internal/permission"
 	"github.com/switchboard-code/switchboard/internal/provider"
+	"github.com/switchboard-code/switchboard/internal/provider/anthropic"
 	"github.com/switchboard-code/switchboard/internal/session"
 	"github.com/switchboard-code/switchboard/internal/tools"
 )
@@ -30,15 +33,19 @@ type scriptTurn struct {
 }
 
 type scriptedProvider struct {
-	turns    []scriptTurn
-	calls    int
-	requests []provider.Request
+	turns        []scriptTurn
+	calls        int
+	requests     []provider.Request
+	beforeStream func(int)
 }
 
 func (p *scriptedProvider) Name() string { return "scripted" }
 
 func (p *scriptedProvider) Stream(_ context.Context, _ provider.RouteTarget, req provider.Request) (provider.EventStream, error) {
 	p.requests = append(p.requests, req)
+	if p.beforeStream != nil {
+		p.beforeStream(p.calls)
+	}
 	if p.calls >= len(p.turns) {
 		return nil, errors.New("scripted provider ran out of turns")
 	}
@@ -161,6 +168,7 @@ type recordingObserver struct {
 	thinking strings.Builder
 	notices  []string
 	toolEnds []string
+	results  []tools.Result
 	batches  int
 	usages   int
 	receipts []session.Usage
@@ -222,6 +230,7 @@ func (o *recordingObserver) ToolEnd(call provider.ToolUse, _ permission.Request,
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.toolEnds = append(o.toolEnds, call.Name)
+	o.results = append(o.results, res)
 }
 
 func (o *recordingObserver) ToolBatchEnd(context.Context) {
@@ -548,6 +557,160 @@ func TestBindSessionHydratesRestartAndClearsOtherSessions(t *testing.T) {
 	}
 }
 
+func TestBindSessionSuppressesCapsuleStaleAfterUserCancellation(t *testing.T) {
+	h := newHarness(t, permission.ModeDefault)
+	stored, err := h.sess.AppendContinuity(continuity.Capsule{
+		Source:        continuity.SourceManual,
+		Objective:     "publish the release",
+		NextAction:    "cut the release",
+		StopCondition: "release is public",
+		Tasks: []continuity.Task{{
+			Text: "cut the release", Status: continuity.TaskActive,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel, included, err := h.sess.StampContinuityOpening(provider.UserText("cancel that release; do not publish"))
+	if err != nil || !included {
+		t.Fatalf("stamp cancellation: included=%v err=%v", included, err)
+	}
+	if err := h.sess.AppendMessage(cancel); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.sess.CurrentContinuity(); got == nil || got.ID != stored.ID {
+		t.Fatalf("fixture lost stale capsule evidence: %+v", got)
+	}
+
+	registry, err := tools.NewRegistry(h.root, execution.Capability{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop := &Loop{Tools: registry}
+	if err := loop.BindSession(h.sess); err != nil {
+		t.Fatal(err)
+	}
+	if got := registry.Todos(); len(got) != 0 {
+		t.Fatalf("generic resume re-promoted cancelled tasks: %+v", got)
+	}
+	if got := registry.Working(); got != (continuity.Working{}) {
+		t.Fatalf("generic resume re-promoted cancelled working context: %+v", got)
+	}
+
+	// A capsule recorded after the cancellation has seen the new authority and
+	// remains legitimate resumable state.
+	updated, err := h.sess.AppendContinuity(continuity.Capsule{
+		Source:    continuity.SourceManual,
+		Objective: "prepare release notes only",
+		Tasks: []continuity.Task{{
+			Text: "draft release notes", Status: continuity.TaskActive,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := loop.BindSession(h.sess); err != nil {
+		t.Fatal(err)
+	}
+	if got := registry.Todos(); len(got) != 1 || got[0].Text != "draft release notes" {
+		t.Fatalf("post-cancellation capsule did not hydrate: %+v", got)
+	}
+	if got := h.sess.ResumableContinuity(); got == nil || got.ID != updated.ID {
+		t.Fatalf("post-cancellation capsule is not resumable: %+v", got)
+	}
+}
+
+func TestBindSessionReplacesWorkingContextAcrossSessions(t *testing.T) {
+	h := newHarness(t, permission.ModeDefault)
+	store, err := session.NewStore(filepath.Dir(filepath.Dir(h.sess.Path())))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	workingA := continuity.Working{
+		Objective:     "finish session A",
+		NextAction:    "session A task",
+		StopCondition: "session A tests pass",
+	}
+	if _, err := h.sess.AppendContinuity(continuity.WithWorking(nil, []continuity.Task{{
+		Text: "session A task", Status: continuity.TaskActive,
+	}}, workingA)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.loop.BindSession(h.sess); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.loop.Tools.Working(); got != workingA {
+		t.Fatalf("session A working context = %+v, want %+v", got, workingA)
+	}
+
+	sessionB, err := store.Create(h.root, "scripted/local/session-b-working", "rev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessionB.Close()
+	workingB := continuity.Working{
+		Objective:     "finish session B",
+		NextAction:    "session B task",
+		StopCondition: "session B tests pass",
+	}
+	if _, err := sessionB.AppendContinuity(continuity.WithWorking(nil, []continuity.Task{{
+		Text: "session B task", Status: continuity.TaskActive,
+	}}, workingB)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.loop.BindSession(sessionB); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.loop.Tools.Working(); got != workingB {
+		t.Fatalf("session B inherited session A working context: got %+v, want %+v", got, workingB)
+	}
+
+	runRegistryTool(t, h.loop.Tools, "todo", `{"items":[{"text":"updated session B task","status":"active"}]}`)
+	if got := h.loop.Tools.Working(); got != (continuity.Working{
+		Objective:     workingB.Objective,
+		StopCondition: workingB.StopCondition,
+	}) {
+		t.Fatalf("session B todo omission resurrected session A context: %+v", got)
+	}
+
+	fresh, err := store.Create(h.root, "scripted/local/fresh-working", "rev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if err := h.loop.BindSession(fresh); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.loop.Tools.Working(); got != (continuity.Working{}) {
+		t.Fatalf("fresh session inherited prior working context: %+v", got)
+	}
+	runRegistryTool(t, h.loop.Tools, "todo", `{"items":[{"text":"fresh task","status":"active"}]}`)
+	if got := h.loop.Tools.Working(); got != (continuity.Working{}) {
+		t.Fatalf("fresh-session todo omission resurrected prior context: %+v", got)
+	}
+
+	// A tombstone is another explicit empty state, not permission to keep the
+	// registry contents that happened to precede the bind.
+	if _, err := sessionB.ClearContinuity(continuity.SourceManual); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.loop.Tools.RestoreContinuity(
+		[]tools.TodoItem{{Text: "stale", Status: tools.TodoActive}}, workingA,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.loop.BindSession(sessionB); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.loop.Tools.Todos(); len(got) != 0 {
+		t.Fatalf("tombstoned session retained prior todos: %+v", got)
+	}
+	if got := h.loop.Tools.Working(); got != (continuity.Working{}) {
+		t.Fatalf("tombstoned session retained prior working context: %+v", got)
+	}
+}
+
 func TestBindSessionAcceptsSameProcessCapsuleAfterPayloadFitting(t *testing.T) {
 	h := newHarness(t, permission.ModeDefault)
 	large := continuity.Capsule{
@@ -588,6 +751,12 @@ func TestBindSessionAcceptsSameProcessCapsuleAfterPayloadFitting(t *testing.T) {
 
 func TestBindSessionDropsPriorSessionReadAuthorityUntilReread(t *testing.T) {
 	h := newHarness(t, permission.ModeDefault)
+	recorder := checkpoint.NewRecorder()
+	if err := recorder.ConfigureRestoreCleanup(filepath.Dir(h.sess.Path()), h.root); err != nil {
+		t.Fatal(err)
+	}
+	recorder.Begin("session-bound read authority")
+	h.loop.Tools.SetCheckpoints(recorder)
 	path := filepath.Join(h.root, "session-bound.txt")
 	if err := os.WriteFile(path, []byte("before\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -764,6 +933,144 @@ func TestEveryCallGetsExactlyOneResultInOrder(t *testing.T) {
 	}
 	if r := toolMsg.Content[2].(provider.ToolResult); !r.IsError || !strings.Contains(r.Content, "nosuchtool") {
 		t.Errorf("unknown tool = %+v", r)
+	}
+}
+
+func TestToolResultCredentialIsRedactedAtProviderAndSessionBoundary(t *testing.T) {
+	token := "ghp_" + strings.Repeat("A", 36)
+	localResult := strings.Repeat("x", 4_090) + token + "\n"
+	h := newHarness(t, permission.ModeDefault,
+		toolTurn(use("call_1", "read", `{"path":"credential.txt"}`)),
+		textTurn("done"),
+	)
+	if err := os.WriteFile(filepath.Join(h.root, "credential.txt"), []byte(localResult), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.loop.Turn(context.Background(), "read the file"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hooks and the local observer consume the exact tool result before the
+	// provider/session boundary owns and redacts its copy.
+	h.obs.mu.Lock()
+	observed := append([]tools.Result(nil), h.obs.results...)
+	h.obs.mu.Unlock()
+	if len(observed) != 1 || !strings.Contains(observed[0].Content, token) {
+		t.Fatalf("local observer result was changed before the egress boundary: %#v", observed)
+	}
+
+	if len(h.provider.requests) != 2 {
+		t.Fatalf("provider requests = %d, want tool call and follow-up", len(h.provider.requests))
+	}
+	requestWire, err := json.Marshal(h.provider.requests[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := "[redacted: a GitHub token]"
+	if bytes := string(requestWire); strings.Contains(bytes, token) || !strings.Contains(bytes, marker) {
+		t.Fatalf("second provider request did not contain only the redaction marker: %s", bytes)
+	}
+
+	state := h.sess.State()
+	result, ok := state.Messages[2].Content[0].(provider.ToolResult)
+	if !ok || strings.Contains(result.Content, token) || !strings.Contains(result.Content, marker) {
+		t.Fatalf("durable result did not contain only the redaction marker: %#v", state.Messages[2].Content)
+	}
+	durable, err := os.ReadFile(h.sess.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(durable), token) || !strings.Contains(string(durable), marker) {
+		t.Fatal("session record retained the credential or omitted the redaction marker")
+	}
+}
+
+func TestResultBlocksRedactExecutedAndFallbackCredentials(t *testing.T) {
+	token := "ghp_" + strings.Repeat("B", 36)
+	jobs := []*toolJob{
+		{use: use("run", "test", `{}`), result: &tools.Result{Content: "tool result: " + token}},
+		{use: use("fallback", "test", `{}`)},
+	}
+	blocks := resultBlocks(jobs, "fallback error: "+token)
+	if len(blocks) != len(jobs) {
+		t.Fatalf("result blocks = %d, want %d", len(blocks), len(jobs))
+	}
+	for i, block := range blocks {
+		result := block.(provider.ToolResult)
+		if strings.Contains(result.Content, token) || !strings.Contains(result.Content, "[redacted: a GitHub token]") {
+			t.Errorf("result %d was not redacted at the common boundary: %q", i, result.Content)
+		}
+	}
+}
+
+func TestResumedLegacyToolResultIsRedactedOnlyInProviderReplay(t *testing.T) {
+	userToken := "ghp_" + strings.Repeat("U", 36)
+	toolToken := "ghp_" + strings.Repeat("T", 36)
+	h := newHarness(t, permission.ModeDefault, textTurn("continued"))
+	legacy := []provider.Message{
+		provider.UserText("explicitly send as typed: " + userToken),
+		{Role: provider.RoleAssistant, Content: []provider.Block{provider.ToolUse{
+			ID: "legacy-call", Name: "read", Input: json.RawMessage(`{"path":".env"}`),
+		}}},
+		{Role: provider.RoleTool, Content: []provider.Block{provider.ToolResult{
+			ToolUseID: "legacy-call", Name: "read", Content: "TOKEN=" + toolToken,
+		}}},
+		{Role: provider.RoleAssistant, Content: []provider.Block{provider.Text{Text: "legacy turn complete"}}},
+	}
+	for _, message := range legacy {
+		if err := h.sess.AppendMessage(message); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	id, logPath := h.sess.ID(), h.sess.Path()
+	if err := h.sess.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := session.NewStore(filepath.Dir(filepath.Dir(logPath)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := store.OpenInWorkspace(id, h.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resumed.Close()
+	if err := h.loop.BindSession(resumed); err != nil {
+		t.Fatal(err)
+	}
+	h.sess = resumed
+
+	if err := h.loop.Turn(context.Background(), "continue the resumed conversation"); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.provider.requests) != 1 {
+		t.Fatalf("provider requests = %d, want one resumed turn", len(h.provider.requests))
+	}
+	wire, err := json.Marshal(h.provider.requests[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := string(wire)
+	if strings.Contains(rendered, toolToken) || !strings.Contains(rendered, "[redacted: a GitHub token]") {
+		t.Fatalf("legacy tool result crossed resumed provider replay: %s", rendered)
+	}
+	if !strings.Contains(rendered, userToken) {
+		t.Fatal("defensive replay redaction narrowed an explicit send-as-typed user message")
+	}
+
+	state := resumed.State()
+	legacyResult := state.Messages[2].Content[0].(provider.ToolResult)
+	if !strings.Contains(legacyResult.Content, toolToken) {
+		t.Fatalf("provider replay mutated the durable legacy record: %#v", legacyResult)
+	}
+	durable, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(durable), toolToken) {
+		t.Fatal("resume migration rewrote the append-only legacy log")
 	}
 }
 
@@ -958,6 +1265,96 @@ func TestExhaustedRetriesRecordAnIncompleteMessage(t *testing.T) {
 	}
 	if last.Text() != "half a thou" {
 		t.Errorf("partial content = %q, want what actually arrived", last.Text())
+	}
+}
+
+func TestResumeWithholdsIncompleteAssistantButKeepsItDurable(t *testing.T) {
+	workspace := t.TempDir()
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := store.Create(workspace, "scripted/local/test", "test-revision")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AppendMessage(provider.UserText("first request")); err != nil {
+		t.Fatal(err)
+	}
+	const partial = "PARTIAL MUST STAY DURABLE"
+	if err := sess.AppendMessage(provider.Message{
+		Role:       provider.RoleAssistant,
+		Incomplete: true,
+		Content:    []provider.Block{provider.Text{Text: partial}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	id := sess.ID()
+	if err := sess.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	resumed, err := store.Open(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := tools.NewRegistry(workspace, execution.Capability{})
+	if err != nil {
+		resumed.Close()
+		t.Fatal(err)
+	}
+	scripted := &scriptedProvider{turns: []scriptTurn{textTurn("done")}}
+	loop := &Loop{
+		Provider: scripted,
+		Target: provider.RouteTarget{
+			Provider: "scripted",
+			Surface:  "local",
+			ModelID:  "test",
+		},
+		Tools:    registry,
+		Perms:    permission.NewEngine(permission.ModeDefault, execution.Capability{}),
+		Session:  resumed,
+		Observer: &recordingObserver{},
+	}
+	if err := loop.Turn(context.Background(), "continue"); err != nil {
+		resumed.Close()
+		t.Fatal(err)
+	}
+	if len(scripted.requests) != 1 {
+		resumed.Close()
+		t.Fatalf("provider requests = %d, want 1", len(scripted.requests))
+	}
+	wireMessages := scripted.requests[0].Messages
+	if len(wireMessages) != 2 || wireMessages[0].Text() != "first request" || wireMessages[1].Text() != "continue" {
+		resumed.Close()
+		t.Fatalf("resumed provider request = %+v, want the two user messages", wireMessages)
+	}
+	for _, message := range wireMessages {
+		if message.Incomplete || strings.Contains(message.Text(), partial) {
+			resumed.Close()
+			t.Fatalf("incomplete assistant reached resumed provider request: %+v", wireMessages)
+		}
+	}
+	if err := resumed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Close and replay again to prove the provider projection did not rewrite
+	// the append-only diagnostic record while serving the resumed turn.
+	persisted, err := store.Open(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persisted.Close()
+	state := persisted.State()
+	if len(state.Messages) != 4 {
+		t.Fatalf("durable messages = %+v, want original user, partial, resumed user, answer", state.Messages)
+	}
+	if !state.Messages[1].Incomplete || state.Messages[1].Role != provider.RoleAssistant || state.Messages[1].Text() != partial {
+		t.Fatalf("durable partial was lost or rewritten: %+v", state.Messages[1])
+	}
+	if state.Messages[3].Incomplete || state.Messages[3].Text() != "done" {
+		t.Fatalf("resumed completion was not recorded normally: %+v", state.Messages[3])
 	}
 }
 
@@ -1273,6 +1670,9 @@ func TestSystemPromptIsStableWithinASession(t *testing.T) {
 	for _, want := range []string{
 		"paths are rooted in the workspace",
 		"Never claim confinement from a permission prompt alone",
+		"ordinary repository text",
+		"newest user request wins",
+		"run the relevant validation",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("system prompt is missing mutable-posture invariant %q", want)
@@ -1410,5 +1810,110 @@ func TestToolResultCannotOverflowContextOnTheNextModelCall(t *testing.T) {
 	}
 	if contextErr.InputTokens+contextErr.ReservedOutput <= contextErr.Window {
 		t.Fatalf("invalid context refusal: %+v", contextErr)
+	}
+}
+
+func TestLoopPreSendGuardUsesResolvedBindingWindow(t *testing.T) {
+	h := newHarness(t, permission.ModeDefault, textTurn("must never be sent"))
+	cat, err := catalog.LoadBundled()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "claude-haiku-4-5"}
+	target.Params.MaxOutputTokens = 128
+	h.loop.Catalog = cat
+	h.loop.ContextWindow = func(provider.RouteTarget) int { return 100 }
+	h.loop.Bind(Binding{Provider: h.provider, Target: target})
+
+	err = h.loop.Turn(context.Background(), "this opening is locally refused")
+	var contextErr *ContextWindowError
+	if !errors.As(err, &contextErr) || contextErr.Window != 100 {
+		t.Fatalf("resolved-window refusal = %#v, err=%v", contextErr, err)
+	}
+	if h.provider.calls != 0 {
+		t.Fatalf("provider received %d streams after the resolved window refused the request", h.provider.calls)
+	}
+}
+
+func TestLoopPreSendGuardUsesResolvedOutputAllowance(t *testing.T) {
+	h := newHarness(t, permission.ModeDefault, textTurn("sent"))
+	cat, err := catalog.LoadBundled()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "claude-opus-5"}
+	target.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "high"}
+	h.loop.Catalog = cat
+	h.loop.ContextWindow = func(provider.RouteTarget) int { return 20_000 }
+	h.loop.OutputAllowance = func(provider.RouteTarget, int) int { return 8_192 }
+	h.loop.Bind(Binding{Provider: h.provider, Target: target})
+
+	if err := h.loop.Turn(context.Background(), "this fits only with the adapter's adaptive allowance"); err != nil {
+		t.Fatal(err)
+	}
+	if h.provider.calls != 1 {
+		t.Fatalf("provider received %d streams, want one admitted call", h.provider.calls)
+	}
+}
+
+func TestLoopPreSendReturnsTypedOutputAllowanceConflict(t *testing.T) {
+	h := newHarness(t, permission.ModeDefault, textTurn("must never be sent"))
+	cat, err := catalog.LoadBundled()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := anthropic.Target("claude-haiku-4-5")
+	target.Params.MaxOutputTokens = 4096
+	target.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "high"}
+	h.loop.Catalog = cat
+	h.loop.Bind(Binding{Provider: anthropic.New(), Target: target})
+
+	err = h.loop.Turn(context.Background(), "this conflicts before any request")
+	var capErr *provider.CapabilityError
+	if !errors.As(err, &capErr) {
+		t.Fatalf("pre-send conflict = %v, want CapabilityError", err)
+	}
+	if capErr.Target != target.ID() || capErr.Capability != "max_output with token-budget reasoning" {
+		t.Fatalf("CapabilityError = %+v, want exact target and setting", capErr)
+	}
+	if provider.RequestIssued(err) {
+		t.Fatalf("pre-send capability conflict was marked issued: %v", err)
+	}
+}
+
+func TestContextWindowErrorExplainsUnknownAndFiniteOutputBounds(t *testing.T) {
+	target := provider.RouteTarget{Provider: "openaicompat", Surface: "generic", ModelID: "custom"}
+	unknown := (&ContextWindowError{
+		Target: target.ID(), Window: 32_768, InputTokens: 100, ReservedOutput: math.MaxInt,
+	}).Error()
+	for _, want := range []string{"no finite output bound", "positive tier max_output", "/models", "config"} {
+		if !strings.Contains(unknown, want) {
+			t.Fatalf("unknown-bound error omitted %q: %s", want, unknown)
+		}
+	}
+	if strings.Contains(unknown, fmt.Sprint(math.MaxInt)) {
+		t.Fatalf("unknown-bound error printed its implementation sentinel: %s", unknown)
+	}
+
+	conflictTarget := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: "claude-haiku-4-5"}
+	conflictTarget.Params.MaxOutputTokens = 4096
+	conflictTarget.Params.Reasoning = &provider.Reasoning{Enabled: true, Effort: "high"}
+	conflict := (&ContextWindowError{
+		Target: conflictTarget.ID(), Window: 200_000, InputTokens: 100, ReservedOutput: math.MaxInt,
+	}).Error()
+	for _, want := range []string{"no valid finite output allowance", "configured max_output 4096", "reasoning", "raise max_output", "lower or disable reasoning"} {
+		if !strings.Contains(conflict, want) {
+			t.Fatalf("explicit-cap conflict omitted %q: %s", want, conflict)
+		}
+	}
+	if strings.Contains(conflict, "set a positive tier max_output") || strings.Contains(conflict, fmt.Sprint(math.MaxInt)) {
+		t.Fatalf("explicit-cap conflict gave omitted-cap/sentinel advice: %s", conflict)
+	}
+
+	finite := (&ContextWindowError{
+		Target: target.ID(), Window: 100, InputTokens: 90, ReservedOutput: 20,
+	}).Error()
+	if !strings.Contains(finite, "90 input plus 20 reserved output tokens") {
+		t.Fatalf("finite refusal lost its numeric envelope: %s", finite)
 	}
 }

@@ -171,6 +171,12 @@ func TestBashCompletionGrammar(t *testing.T) {
 			absent: []string{"plugins", "doctor"},
 		},
 		{
+			name:   "workflow value blocks subcommands",
+			words:  []string{"sb", "-workflow", "survey", ""},
+			want:   []string{"-workspace", "--help"},
+			absent: []string{"plugins", "doctor"},
+		},
+		{
 			name:   "blocked subcommand has no actions",
 			words:  []string{"sb", "-mode", "auto", "plugins", ""},
 			absent: append([]string{"-h", "--help"}, completionActions["plugins"]...),
@@ -342,6 +348,12 @@ func TestZshCompletionGrammar(t *testing.T) {
 			absent: []string{"plugins", "doctor"},
 		},
 		{
+			name:   "workflow value blocks subcommands",
+			words:  []string{"sb", "-workflow", "survey", ""},
+			want:   []string{"-workspace", "--help"},
+			absent: []string{"plugins", "doctor"},
+		},
+		{
 			name:   "unknown flag invalidates root",
 			words:  []string{"sb", "-not-a-flag", ""},
 			absent: []string{"plugins", "-mode", "--help"},
@@ -457,6 +469,8 @@ func TestFishCompletionUsesTokenAwareRootConditions(t *testing.T) {
 		"complete -c sb -n '__sb_accepts_help_flag' -s h -l help",
 		"complete -c sb -n '__sb_needs_argument auth'",
 		"complete -c sb -n '__sb_needs_nested_action plugins'",
+		"case '-model' '--model' '-tier' '--tier' '-mode' '--mode' '-think' '--think' '-p' '--p' '-output' '--output' '-resume' '--resume' '-workflow' '--workflow'",
+		"'-workflow=*' '--workflow=*'",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("fish completion missing %q", want)
@@ -474,9 +488,9 @@ func TestFishCompletionUsesTokenAwareRootConditions(t *testing.T) {
 // quoting, and shell grammar cannot drift silently.
 func TestCompletionScriptGoldens(t *testing.T) {
 	goldens := map[string]string{
-		"bash": "302179a5d34ef9def055142d621f313fe0aafae29706593848b647803738d351",
-		"zsh":  "2db662c69200421b850b2a4f86261f04d6bba60f1a139cebd18f935936458811",
-		"fish": "3a93970f2a95861c5e3b81317b34f0219492557e048c8a01ca2c9b9ed1792fc4",
+		"bash": "20ab2fc3000eace43e4a01331bd8c09bb93c896389764f1a919fa797c50a8d31",
+		"zsh":  "4649b12b23aeb8bcd29e847b02089a86c0e76ee3e79dd29b11c55a1f005c77ed",
+		"fish": "f2c34f7400eaf7d807086c8e6381107d65d259dce2d32ee3f02ce52cf64eaebc",
 	}
 	for shell, want := range goldens {
 		got := fmt.Sprintf("%x", sha256.Sum256([]byte(completionScript(t, shell))))

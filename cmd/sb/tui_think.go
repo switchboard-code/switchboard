@@ -55,11 +55,11 @@ func cmdThink(m *tuiModel, args string) tea.Cmd {
 	for i := range items {
 		items[i].current = items[i].id == current || (current == "" && items[i].id == "default")
 	}
-	m.dlg = &pickerDialog{
+	m.openDialog(&pickerDialog{
 		title:  "reasoning effort for " + m.app.tier.Target.Display(),
 		items:  items,
 		onPick: func(level string) tea.Cmd { return m.applyThink(level) },
-	}
+	})
 	return nil
 }
 

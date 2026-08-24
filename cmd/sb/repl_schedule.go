@@ -72,7 +72,7 @@ func (r *repl) addSchedule(e schedule.Entry) {
 		r.out.Notice("warn", err.Error())
 		return
 	}
-	r.out.line("  armed " + added.ID + ": " + scheduleLine(added, time.Now()))
+	r.out.line("  armed " + cliText(added.ID) + ": " + cliText(scheduleLine(added, time.Now())))
 }
 
 func (r *repl) scheduleCommand(args string) {
@@ -87,7 +87,7 @@ func (r *repl) scheduleCommand(args string) {
 			return
 		}
 		if r.schedules.Cancel(fields[1]) {
-			r.out.line("  cancelled " + fields[1] + "; the rest of the schedule is untouched")
+			r.out.line("  cancelled " + cliText(fields[1]) + "; the rest of the schedule is untouched")
 		} else {
 			r.out.Notice("warn", "no scheduled entry "+fields[1]+"; /schedule lists them")
 		}
@@ -100,7 +100,7 @@ func (r *repl) scheduleCommand(args string) {
 	}
 	now := time.Now()
 	for _, e := range entries {
-		r.out.line("  " + scheduleLine(e, now))
+		r.out.line("  " + cliText(scheduleLine(e, now)))
 	}
 }
 
@@ -121,11 +121,11 @@ func (r *repl) fireDueSchedules(ctx context.Context) {
 	for _, e := range due {
 		prompt := "[scheduled " + e.ID + "] " + e.Prompt
 		r.out.line(r.out.style(bold, "› ") + workspaceSanitize(prompt))
-		expanded, images, ok := r.prepareInteractivePrompt(prompt)
+		expanded, authored, images, ok := r.prepareInteractivePromptAuthored(prompt)
 		if !ok {
 			continue
 		}
-		err := r.turnPrepared(ctx, expanded, images, false)
+		err := r.turnPreparedAuthored(ctx, expanded, authored, images, false)
 		switch {
 		case errors.Is(err, context.Canceled):
 			r.out.Notice("warn", "turn cancelled; the session is intact and can continue")

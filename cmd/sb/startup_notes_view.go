@@ -163,11 +163,18 @@ func (v *startupNotesView) scroll(delta int) {
 }
 
 func (v *startupNotesView) view(width, height int, th *theme) string {
-	header := startupNotesHeader(width, th)
-	bodyHeight := height - 2
-	if bodyHeight < 1 {
-		bodyHeight = 1
+	if width <= 0 || height <= 0 {
+		return ""
 	}
+	header := startupNotesHeader(width, th)
+	if height == 1 {
+		return header
+	}
+	footerRows := 0
+	if height >= 3 {
+		footerRows = 1
+	}
+	bodyHeight := height - 1 - footerRows
 	visual := v.visualLines(width)
 	if maximum := len(visual) - bodyHeight; v.offset > maximum {
 		v.offset = maximum
@@ -182,12 +189,16 @@ func (v *startupNotesView) view(width, height int, th *theme) string {
 		visible = append(visible, "")
 	}
 
-	footer := ""
-	if len(visual) > bodyHeight {
-		percent := min((v.offset+bodyHeight)*100/len(visual), 100)
-		footer = th.faint.Render(" " + itoa(percent) + "%")
+	rows := append([]string{header}, visible...)
+	if footerRows == 1 {
+		footer := ""
+		if len(visual) > bodyHeight {
+			percent := min((v.offset+bodyHeight)*100/len(visual), 100)
+			footer = th.faint.Render(workspaceFit(" "+itoa(percent)+"%", width))
+		}
+		rows = append(rows, footer)
 	}
-	return header + "\n" + lipgloss.JoinVertical(lipgloss.Left, visible...) + "\n" + footer
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
 
 func startupNotesHeader(width int, th *theme) string {
@@ -200,13 +211,11 @@ func startupNotesHeader(width int, th *theme) string {
 		hint = ""
 		title = fitStartupHighlight(title, max(width, 2))
 	}
-	return th.bold.Render(title) + th.faint.Render(hint)
+	return fitCells(th.bold.Render(title)+th.faint.Render(hint), width)
 }
 
 func (v *startupNotesView) visualLines(width int) []string {
-	if width < 20 {
-		width = 20
-	}
+	width = max(width, 1)
 	if v.visualWidth == width && v.visual != nil {
 		return v.visual
 	}
@@ -216,7 +225,7 @@ func (v *startupNotesView) visualLines(width int) []string {
 			visual = append(visual, "")
 			continue
 		}
-		visual = append(visual, wrapStartupDetailLine(line, max(width-1, 20))...)
+		visual = append(visual, wrapStartupDetailLine(line, width)...)
 	}
 	v.visualWidth = width
 	v.visual = visual
@@ -234,21 +243,12 @@ func wrapStartupDetailLine(line string, width int) []string {
 	if width < 1 {
 		width = 1
 	}
-	var lines []string
-	var current strings.Builder
-	currentWidth := 0
-	for _, r := range line {
-		runeWidth := lipgloss.Width(string(r))
-		if current.Len() > 0 && currentWidth+runeWidth > width {
-			lines = append(lines, current.String())
-			current.Reset()
-			currentWidth = 0
-		}
-		current.WriteRune(r)
-		currentWidth += runeWidth
-	}
-	if current.Len() > 0 {
-		lines = append(lines, current.String())
+	lines := strings.Split(wrapCells(line, width), "\n")
+	for i := range lines {
+		// A single CJK/emoji grapheme may be wider than a one-cell terminal.
+		// It cannot be split, so render a bounded marker instead of allowing an
+		// untracked physical wrap.
+		lines[i] = fitCells(lines[i], width)
 	}
 	return lines
 }

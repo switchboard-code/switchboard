@@ -1,11 +1,18 @@
 package eval
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+
+	"github.com/switchboard-code/switchboard/internal/execution"
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
+	"github.com/switchboard-code/switchboard/internal/safeexec"
 )
 
 // The tier-1 corpus.
@@ -44,6 +51,45 @@ type spec struct {
 	// mustContain re-checks a property the test suite alone would not catch, so
 	// a task cannot be solved by deleting the test.
 	mustContain map[string]string
+}
+
+// maxVerifierOutputBytes is the complete output budget for one corpus
+// verifier. The tail is retained because go test normally reports the useful
+// failure last, while Write continues accepting bytes so a noisy test cannot
+// deadlock on a full pipe.
+const maxVerifierOutputBytes = 1 << 20
+
+const maxVerifierSourceBytes = 4 << 20
+
+type verifierOutput struct {
+	mu        sync.Mutex
+	tail      []byte
+	truncated bool
+}
+
+func (o *verifierOutput) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	n := len(p)
+	if len(p) >= maxVerifierOutputBytes {
+		previous := len(o.tail)
+		o.tail = append(o.tail[:0], p[len(p)-maxVerifierOutputBytes:]...)
+		o.truncated = o.truncated || previous > 0 || len(p) > maxVerifierOutputBytes
+		return n, nil
+	}
+	if overflow := len(o.tail) + len(p) - maxVerifierOutputBytes; overflow > 0 {
+		copy(o.tail, o.tail[overflow:])
+		o.tail = o.tail[:len(o.tail)-overflow]
+		o.truncated = true
+	}
+	o.tail = append(o.tail, p...)
+	return n, nil
+}
+
+func (o *verifierOutput) String() (string, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return string(o.tail), o.truncated
 }
 
 // specs are the corpus. Each is a real invariant this codebase depends on, and
@@ -102,7 +148,7 @@ var specs = []spec{
 		prompt: "The keychain write is putting the credential somewhere it can be read by other processes. Fix it so the tests pass.",
 		pkg:    "./internal/credential/",
 		goos:   "darwin",
-		breaks: []breakage{{"internal/credential/keychain_darwin.go", `cmd := exec.CommandContext(ctx, s.tool(), "-i")`, `cmd := exec.CommandContext(ctx, s.tool(), "add-generic-password", "-s", service(ref), "-a", account(ref), "-U", "-w", value)`}},
+		breaks: []breakage{{"internal/credential/keychain_darwin.go", `cmd := s.command(ctx, "-i")`, `cmd := s.command(ctx, "add-generic-password", "-s", service(ref), "-a", account(ref), "-U", "-w", value)`}},
 	},
 	{
 		id:     "control-character-injection",
@@ -280,9 +326,12 @@ func taskFor(repoRoot string, s spec) Task {
 			return nil
 		},
 
-		Verify: func(dir string) (bool, string, error) {
+		Verify: func(ctx context.Context, dir string) (bool, string, error) {
 			for path, want := range s.mustContain {
-				body, err := os.ReadFile(filepath.Join(dir, path))
+				if err := ctx.Err(); err != nil {
+					return false, "", err
+				}
+				body, err := rootedfs.ReadFile(dir, path, maxVerifierSourceBytes)
 				if err != nil {
 					return false, "", err
 				}
@@ -292,21 +341,124 @@ func taskFor(repoRoot string, s spec) Task {
 					return false, fmt.Sprintf("%s no longer contains %q, so the fix removed the behaviour rather than restoring it", path, want), nil
 				}
 			}
+			if err := ctx.Err(); err != nil {
+				return false, "", err
+			}
 
-			cmd := exec.Command("go", "test", s.pkg)
+			// The copied checkout is adversarial verifier input. Resolve a compatible
+			// local Go toolchain only after removing source/copy authority from PATH,
+			// then retain its exact identity. A distributed sb binary cannot use its
+			// build host's compiled-in GOROOT: that directory does not exist here.
+			// The copied module's go directive checks compatibility; exact equality
+			// with runtime.Version is neither required nor relocatable, and the
+			// pinned GOTOOLCHAIN=local policy below forbids a substitute download.
+			goEnv, err := verifierGoEnv(repoRoot, dir)
+			if err != nil {
+				return false, "", err
+			}
+			goExecutable, err := verifierGoExecutable(goEnv, repoRoot, dir)
+			if err != nil {
+				return false, "", err
+			}
+			cmd, err := goExecutable.Command("test", s.pkg)
+			if err != nil {
+				return false, "", fmt.Errorf("binding the verifier Go executable: %w", err)
+			}
 			cmd.Dir = dir
 			// The verifier runs the repository's offline suite and nothing else.
 			// Inheriting SB_LIVE would have it run the live tests, which need
 			// network and credentials the sandbox correctly denies, so a task
 			// would fail for a reason that has nothing to do with the fix.
-			cmd.Env = append(cleanEnv(), "GOFLAGS=-count=1")
-			out, err := cmd.CombinedOutput()
+			cmd.Env = goEnv
+			out := &verifierOutput{}
+			cmd.Stdout = out
+			cmd.Stderr = out
+			err = execution.RunProcess(ctx, cmd)
 			if err != nil {
-				return false, strings.TrimSpace(lastLines(string(out), 12)), nil
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return false, "", err
+				}
+				text, truncated := out.String()
+				detail := strings.TrimSpace(lastLines(text, 12))
+				if truncated {
+					detail = fmt.Sprintf("verifier output exceeded %d bytes; showing the final lines\n%s", maxVerifierOutputBytes, detail)
+				}
+				return false, detail, nil
 			}
 			return true, "", nil
 		},
 	}
+}
+
+func verifierGoExecutable(environ []string, untrustedRoots ...string) (safeexec.Executable, error) {
+	authorityRoots, err := safeexec.WorkspaceAndCurrentAuthorityRoots(untrustedRoots...)
+	if err != nil {
+		return safeexec.Executable{}, fmt.Errorf("resolving verifier workspace authority: %w", err)
+	}
+	name := "go"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	var pathValue string
+	for _, entry := range environ {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok && strings.EqualFold(strings.TrimSpace(key), "PATH") {
+			pathValue = value
+		}
+	}
+	for _, directory := range filepath.SplitList(pathValue) {
+		candidate := filepath.Join(directory, name)
+		if _, err := os.Lstat(candidate); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return safeexec.Executable{}, fmt.Errorf("inspecting the verifier Go executable: %w", err)
+		}
+		executable, err := safeexec.ResolvePathOutside(candidate, authorityRoots...)
+		if err != nil {
+			return safeexec.Executable{}, fmt.Errorf("binding the verifier Go executable outside verifier input: %w", err)
+		}
+		return executable, nil
+	}
+	return safeexec.Executable{}, errors.New("no trusted Go executable remains on PATH outside verifier input")
+}
+
+func verifierGoEnv(untrustedRoots ...string) ([]string, error) {
+	authorityRoots, err := safeexec.WorkspaceAndCurrentAuthorityRoots(untrustedRoots...)
+	if err != nil {
+		return nil, fmt.Errorf("resolving verifier workspace authority: %w", err)
+	}
+	base := cleanEnv()
+	out := make([]string, 0, len(base)+8)
+	for _, entry := range base {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		upper := strings.ToUpper(strings.TrimSpace(name))
+		// GOENV, GOFLAGS, GOTOOLCHAIN, GOWORK, and the module/VCS controls can
+		// all redirect execution before the requested package tests run. Start
+		// from no ambient Go policy and add the verifier's exact offline policy
+		// below. CGO tool selectors are removed even though CGO is disabled.
+		if strings.HasPrefix(upper, "GO") || upper == "CC" || upper == "CXX" ||
+			upper == "AR" || upper == "FC" || upper == "PKG_CONFIG" {
+			continue
+		}
+		out = append(out, entry)
+	}
+	filtered, err := safeexec.FilterEnvironmentPath(out, authorityRoots...)
+	if err != nil {
+		return nil, fmt.Errorf("preparing the verifier interpreter path: %w", err)
+	}
+	return append(filtered,
+		"GOENV=off",
+		"GOFLAGS=-count=1",
+		"GOTOOLCHAIN=local",
+		"GOWORK=off",
+		"GOPROXY=off",
+		"GOSUMDB=off",
+		"GOVCS=*:off",
+		"CGO_ENABLED=0",
+	), nil
 }
 
 // cleanEnv strips what a verifier must not see: the switch that turns on live
@@ -314,7 +466,7 @@ func taskFor(repoRoot string, s spec) Task {
 // that can be solved by asking one.
 func cleanEnv() []string {
 	var out []string
-	for _, kv := range os.Environ() {
+	for _, kv := range execution.ScrubbedChildEnv() {
 		name, _, _ := strings.Cut(kv, "=")
 		switch {
 		case name == "SB_LIVE",

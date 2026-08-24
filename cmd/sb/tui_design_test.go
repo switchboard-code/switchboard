@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -12,8 +14,10 @@ import (
 
 	"github.com/switchboard-code/switchboard/internal/catalog"
 	"github.com/switchboard-code/switchboard/internal/checkpoint"
+	"github.com/switchboard-code/switchboard/internal/config"
 	"github.com/switchboard-code/switchboard/internal/provider"
 	"github.com/switchboard-code/switchboard/internal/session"
+	"github.com/switchboard-code/switchboard/internal/trust"
 )
 
 // The redesign's invariants, asserted at the SGR level for the same reason
@@ -239,6 +243,67 @@ func TestTitleNamesWorkspaceAndTierAndMarksWork(t *testing.T) {
 	}
 }
 
+func TestTitleEscapesTerminalControlsAndStaysBounded(t *testing.T) {
+	m := testModel(t)
+	m.app.workspace = filepath.Join(t.TempDir(), "project\x1b]2;forged\a\nname")
+	m.app.tier.ID = "t1\x1b]0;spoof\a"
+	title := m.titleText()
+	for _, unsafe := range []string{"\x1b", "\a", "\n", "\r"} {
+		if strings.Contains(title, unsafe) {
+			t.Fatalf("title retained terminal control %q: %q", unsafe, title)
+		}
+	}
+	if lipgloss.Width(title) > 120 {
+		t.Fatalf("title is %d cells, want at most 120", lipgloss.Width(title))
+	}
+}
+
+func TestBannerAndSuggestionsEscapeTerminalControls(t *testing.T) {
+	m := testModel(t)
+	m.app.workspace = filepath.Join(t.TempDir(), "repo\x1b]2;forged\a")
+	m.app.config.Tiers[0].ID = "t1\x1b[2J"
+	m.app.config.Tiers[0].Target.ModelID = "model\a\u202e"
+	m.app.tier = m.app.config.Tiers[0]
+	m.tr.reset()
+	m.addBanner(m.app.loop.Session, false)
+	plain := stripANSI(strings.Join(m.tr.flat, "\n"))
+	for _, unsafe := range []string{"\x1b", "\a", "\u202e"} {
+		if strings.Contains(plain, unsafe) {
+			t.Fatalf("banner retained terminal control %q: %q", unsafe, plain)
+		}
+	}
+
+	m.custom = []customCommand{{name: "inspect\x1b]0;spoof\a", desc: "custom\u202e command"}}
+	m.ta.SetValue("/inspect")
+	plain = stripANSI(m.suggestionsView())
+	for _, unsafe := range []string{"\x1b", "\a", "\u202e"} {
+		if strings.Contains(plain, unsafe) {
+			t.Fatalf("suggestions retained terminal control %q: %q", unsafe, plain)
+		}
+	}
+}
+
+func TestPlanningAndOperationsStartTheirWorkingClock(t *testing.T) {
+	m := testModel(t)
+
+	before := time.Now()
+	_, _ = m.startPlanning()
+	if m.started.Before(before) || m.started.IsZero() {
+		t.Fatalf("planning clock = %v, want a fresh timestamp", m.started)
+	}
+	m.finishPlanning()
+
+	before = time.Now()
+	_, generation, _, err := m.startOperation("resume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.started.Before(before) || m.started.IsZero() {
+		t.Fatalf("operation clock = %v, want a fresh timestamp", m.started)
+	}
+	m.finishOperation(generation, false)
+}
+
 // A click lands where the view says it does: entryAt mirrors the viewport
 // math, so clicking a tool rail toggles that rail and a click below the
 // content toggles nothing.
@@ -275,6 +340,26 @@ func TestQueueShowsAndClears(t *testing.T) {
 	cmdQueue(m, "clear")
 	if len(m.queue) != 0 {
 		t.Fatal("/queue clear left prompts queued")
+	}
+}
+
+func TestTruncatedLocalListingsRedactCredentialsBeforeTheirCaps(t *testing.T) {
+	m := testModel(t)
+	m.queue = []string{strings.Repeat("x", 68) + testGitHubToken}
+	cmdQueue(m, "")
+	joined := strings.Join(m.tr.flat, "\n")
+	if strings.Contains(joined, "ghp_") || strings.Contains(joined, testGitHubToken) {
+		t.Fatalf("queued prompt listing exposed a credential fragment: %q", joined)
+	}
+
+	for _, message := range []provider.Message{
+		provider.UserText(strings.Repeat("x", 158) + testGitHubToken),
+		provider.UserText(compactSeedHead + "\n\n" + strings.Repeat("x", 158) + testGitHubToken),
+	} {
+		notice := syntheticReplayNotice(message)
+		if strings.Contains(notice, "ghp_") || strings.Contains(notice, testGitHubToken) {
+			t.Fatalf("synthetic replay notice exposed a credential fragment: %q", notice)
+		}
 	}
 }
 
@@ -441,10 +526,49 @@ func TestTrustNamesWhatAGrantCovers(t *testing.T) {
 
 	decls := trustDeclarations(m)
 	joined := strings.Join(decls, "\n")
-	for _, want := range []string{"docs", "npx some-docs-server", "exec", "guard.sh"} {
+	for _, want := range []string{"/diff", "Git status", "filters and hooks", "docs", "npx some-docs-server", "exec", "guard.sh"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("declarations missing %q:\n%s", want, joined)
 		}
+	}
+}
+
+func TestTrustGrantAlwaysDisclosesGitExecution(t *testing.T) {
+	m := testModel(t)
+	m.app.workspace = t.TempDir()
+	store, err := trust.OpenFile(filepath.Join(t.TempDir(), "trust.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.app.trust = store
+	if cmd := cmdTrust(m, "grant"); cmd != nil {
+		m.Update(cmd())
+	}
+	rendered := strings.Join(m.tr.flat, "\n")
+	for _, want := range []string{"/diff", "Git filters/hooks", "repository filters and hooks may execute"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("grant confirmation omitted %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "enables nothing") {
+		t.Fatalf("grant falsely claimed it enables nothing:\n%s", rendered)
+	}
+}
+
+func TestTrustDeclarationTruncationNeverExposesCredentialFragments(t *testing.T) {
+	m := testModel(t)
+	m.app.workspace = t.TempDir()
+	dir := m.app.workspace + "/.switchboard"
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "[mcp.docs]\ncommand = \"" + strings.Repeat("x", 48) + testGitHubToken + "\"\n"
+	if err := os.WriteFile(dir+"/mcp.toml", []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(trustDeclarations(m), "\n")
+	if strings.Contains(joined, "ghp_") || strings.Contains(joined, testGitHubToken) {
+		t.Fatalf("trust declaration exposed a credential fragment: %q", joined)
 	}
 }
 
@@ -469,6 +593,37 @@ func TestHelpGroupsCoverEveryCommandOnce(t *testing.T) {
 	}
 }
 
+func TestSandboxStatusIsAdvertisedOnBothInteractiveHelpSurfaces(t *testing.T) {
+	var tuiUsage string
+	for _, command := range commands() {
+		if command.name == "sandbox" {
+			tuiUsage = command.usage
+			break
+		}
+	}
+	if tuiUsage != "[off|on|auto|status]" {
+		t.Fatalf("TUI sandbox usage = %q", tuiUsage)
+	}
+
+	output, err := os.CreateTemp(t.TempDir(), "repl-help")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = output.Close() })
+	r := &repl{out: newRenderer(output), config: &config.Config{}}
+	if exit := r.command(context.Background(), "/help"); exit {
+		t.Fatal("REPL help exited the session")
+	}
+	r.out.flush()
+	text, err := os.ReadFile(output.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(text), "/sandbox [off|on|auto|status]") {
+		t.Fatalf("REPL help omitted /sandbox status:\n%s", text)
+	}
+}
+
 // A governed session's spend readout warms as the ceiling nears, the same
 // thresholds the context gauge uses: the warning comes before the refusal.
 func TestBudgetReadoutWarmsBeforeTheCeiling(t *testing.T) {
@@ -486,7 +641,7 @@ func TestBudgetReadoutWarmsBeforeTheCeiling(t *testing.T) {
 	if m.costPct != 70 {
 		t.Fatalf("costPct = %d, want 70", m.costPct)
 	}
-	if line := m.statusLine(); !strings.Contains(line, "38;5;214") {
+	if line, want := m.statusLine(), m.th.onBar(m.th.warn).Render(m.costLine); !strings.Contains(line, want) {
 		t.Fatalf("a 70%% spent ceiling did not warm the readout:\n%q", line)
 	}
 	state.RetryReserveMicroUSD = 100_000
@@ -497,7 +652,7 @@ func TestBudgetReadoutWarmsBeforeTheCeiling(t *testing.T) {
 
 	state.CostMicroUSD = 900_000
 	m.refreshCost(state)
-	if line := m.statusLine(); !strings.Contains(line, "38;5;196") {
+	if line, want := m.statusLine(), m.th.onBar(m.th.err).Render(m.costLine); !strings.Contains(line, want) {
 		t.Fatalf("a 90%% spent ceiling did not turn the readout red:\n%q", line)
 	}
 

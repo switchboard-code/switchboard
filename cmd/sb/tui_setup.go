@@ -10,10 +10,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -32,12 +29,6 @@ const (
 	setupLocalID  = "\x00ollama"
 	setupCompatID = "\x00compat"
 )
-
-// codexHelper reads the access token Codex CLI keeps refreshed. Wiring it is
-// the user's choice made explicitly here, never something detection does on
-// its own: whose token it is stays visible.
-var codexHelper = []string{"sh", "-c",
-	`python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.codex/auth.json')))['tokens']['access_token'])"`}
 
 // locallyMetered reports whether a reference names a surface the catalog says
 // consumes nothing scarce, which is also the set of surfaces that issue no
@@ -112,15 +103,22 @@ func setupItems(ctx context.Context, reg *providers, cat *catalog.Catalog, cfg *
 }
 
 func setupChecklist(m *tuiModel) tea.Cmd {
+	return setupChecklistBound(m, m.bindAsyncResult())
+}
+
+func setupChecklistBound(m *tuiModel, binding asyncResultBinding) tea.Cmd {
 	app := m.app
+	readCfg := app.config.Snapshot()
+	readReg := app.providers.discoverySnapshot(readCfg)
 	return func() tea.Msg {
+		defer readReg.releaseSnapshot()
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 
-		items := append(setupItems(ctx, app.providers, app.catalog, app.config),
+		items := append(setupItems(ctx, readReg, app.catalog, readCfg),
 			pickerItem{id: setupDoneID, label: "done", desc: "bind rungs with /models"})
 
-		return pickerMsg{
+		return binding.bindPicker(pickerMsg{
 			title: "connect providers",
 			items: items,
 			action: func(id string) tea.Cmd {
@@ -128,78 +126,91 @@ func setupChecklist(m *tuiModel) tea.Cmd {
 				case setupDoneID:
 					return noticeCmd("", "setup closed; /models binds what you connected, /setup returns here")
 				case setupLocalID:
-					return askAddressCmd(app.providers, app.config, ollama.Name, ollama.SurfaceLocal,
-						func() tea.Cmd { return setupChecklist(m) })
+					return askAddressCmd(binding, app.providers, app.config, ollama.Name, ollama.SurfaceLocal,
+						func() tea.Cmd { return setupChecklistBound(m, binding) })
 				case setupCompatID:
-					return askAddressCmd(app.providers, app.config, openaicompat.Name, genericCompat,
-						func() tea.Cmd { return setupChecklist(m) })
+					return askAddressCmd(binding, app.providers, app.config, openaicompat.Name, genericCompat,
+						func() tea.Cmd { return setupChecklistBound(m, binding) })
 				case setupCodexID:
-					return tea.Sequence(wireCodexHelper(m), setupChecklist(m))
+					wired := wireCodexHelper(m)
+					return tea.Sequence(wired, setupChecklist(m))
 				}
 				ref, err := parseRef(id)
 				if err != nil {
 					return noticeCmd("error", err.Error())
 				}
-				return setupSecretCmd(m, ref)
+				return setupSecretCmdBound(m, ref, binding)
 			},
-		}
+		})
 	}
 }
 
 // setupSecretCmd is openSecretCmd with a return ticket: after the store, the
 // checklist reopens with the row's standing refreshed.
 func setupSecretCmd(m *tuiModel, ref credential.Ref) tea.Cmd {
+	return setupSecretCmdBound(m, ref, m.bindAsyncResult())
+}
+
+func setupSecretCmdBound(m *tuiModel, ref credential.Ref, binding asyncResultBinding) tea.Cmd {
 	store := credential.NewOSStore()
 	writer, ok := any(store).(credential.Writer)
 	if !ok {
 		return noticeCmd("error", store.Name()+" cannot store credentials on this platform; "+
 			"set "+credential.EnvNames(ref)[0]+" in the environment instead")
 	}
+	next := setupChecklistBound(m, binding)
 	return func() tea.Msg {
-		return secretPromptMsg{ref: ref, writer: writer, storeName: store.Name(), then: setupChecklist(m)}
+		return binding.bindSecret(secretPromptMsg{
+			ref: ref, writer: writer, storeName: store.Name(),
+			then: next,
+		})
 	}
 }
 
 func codexLoginAvailable(cfg *config.Config) bool {
-	home, err := os.UserHomeDir()
-	if err != nil {
+	if len(cfg.AuthFor("openai").Helper) != 0 {
 		return false
 	}
-	data, err := os.ReadFile(filepath.Join(home, ".codex", "auth.json"))
-	if err != nil {
-		return false
-	}
-	var auth struct {
-		Tokens struct {
-			AccessToken string `json:"access_token"`
-		} `json:"tokens"`
-	}
-	if json.Unmarshal(data, &auth) != nil || auth.Tokens.AccessToken == "" {
-		return false
-	}
-	// Already wired is not an offer worth repeating.
-	return len(cfg.AuthFor("openai").Helper) == 0
+	_, err := readCodexAccessToken()
+	return err == nil
 }
 
 // wireCodex writes the helper into the config. Both entrances — /setup and
 // the first-run wizard — go through here, so the wiring is one behavior.
-func wireCodex(cfg *config.Config) error {
-	settings := cfg.AuthFor("openai")
-	settings.Helper = codexHelper
-	if cfg.Auth == nil {
-		cfg.Auth = map[string]credential.Settings{}
+func wireCodex(cfg *config.Config, workspace string) error {
+	helper, err := codexCredentialHelperArgv(workspace)
+	if err != nil {
+		return err
 	}
-	cfg.Auth["openai"] = settings
-	return cfg.Save()
+	return persistCodexHelper(cfg, helper)
+}
+
+// wireCodexForExecutable exercises the same validation and persistence
+// boundary with an explicit path. Production obtains that path from
+// os.Executable; tests use this form to prove a rejected workspace binary
+// cannot mutate either the live Config or its durable file.
+func wireCodexForExecutable(cfg *config.Config, workspace, executable string) error {
+	helper, err := codexCredentialHelperArgvForPath(workspace, executable)
+	if err != nil {
+		return err
+	}
+	return persistCodexHelper(cfg, helper)
+}
+
+func persistCodexHelper(cfg *config.Config, helper []string) error {
+	settings := cfg.AuthFor("openai")
+	settings.Helper = helper
+	return cfg.SetAuthAndSave("openai", settings)
 }
 
 func wireCodexHelper(m *tuiModel) tea.Cmd {
 	cfg := m.app.config
-	return func() tea.Msg {
-		if err := wireCodex(cfg); err != nil {
-			return noticeMsg{level: "error", text: "wiring the codex login failed: " + err.Error()}
-		}
-		m.app.providers.reset()
-		return noticeMsg{text: "openai now authenticates with your Codex CLI login; when its token expires, running codex once refreshes it"}
+	// This helper is selected from a dialog on the event-loop goroutine. Apply
+	// the small config transaction here so no Tea worker retains a writable
+	// Config pointer; the returned command only delivers its immutable notice.
+	if err := wireCodex(cfg, m.app.workspace); err != nil {
+		return noticeCmd("error", "wiring the codex login failed: "+err.Error())
 	}
+	m.app.providers.reset()
+	return noticeCmd("", "openai now authenticates with your Codex CLI login; when its token expires, running codex once refreshes it")
 }

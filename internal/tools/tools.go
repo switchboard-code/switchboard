@@ -75,6 +75,7 @@ type ParallelBatchTool interface {
 // Registry holds the tool suite for one workspace.
 type Registry struct {
 	root       string
+	rootInfo   os.FileInfo
 	capability execution.Capability
 	execution  *execution.Controller
 	versions   *fileVersions
@@ -82,8 +83,9 @@ type Registry struct {
 	tools      map[string]Tool
 	order      []string
 
-	// checkpoints, when non-nil, captures a file's prior state before write
-	// and edit mutate it. Set at assembly; nil means no undo.
+	// checkpoints captures and durably publishes every write and edit. Product
+	// assembly must set a recorder with an active turn scope; mutating tools fail
+	// closed when it is absent or lacks the exact-state publication contract.
 	checkpoints Checkpointer
 
 	// images queues what an external tool returned as a picture, for delivery
@@ -110,7 +112,9 @@ type Checkpointer interface {
 	Record(abs string)
 }
 
-// SetCheckpoints wires the recorder in at assembly time.
+// SetCheckpoints wires the durable recorder in at assembly time. Write and edit
+// refuse to mutate until it supports their exact-state publication contract and
+// has an active turn scope.
 func (r *Registry) SetCheckpoints(c Checkpointer) { r.checkpoints = c }
 
 // ForgetVersions drops the recorded read state for paths whose contents
@@ -180,9 +184,14 @@ func NewRegistryWithExecution(workspace string, controller *execution.Controller
 	if err != nil {
 		return nil, fmt.Errorf("resolving workspace %s: %w", workspace, err)
 	}
+	rootInfo, err := bindWorkspaceRootIdentity(root)
+	if err != nil {
+		return nil, fmt.Errorf("binding workspace %s: %w", workspace, err)
+	}
 
 	r := &Registry{
 		root:       root,
+		rootInfo:   rootInfo,
 		capability: controller.Capability(),
 		execution:  controller,
 		versions:   newFileVersions(),
@@ -348,12 +357,12 @@ func newFileVersions() *fileVersions {
 	}
 }
 
-func (v *fileVersions) record(path, hash string) {
+func (v *fileVersions) record(path, hash string, info os.FileInfo) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.seen[path] = hash
 	delete(v.reported, path)
-	if info, err := os.Stat(path); err == nil && !info.IsDir() {
+	if info != nil && !info.IsDir() {
 		v.stamps[path] = readStamp{size: info.Size(), modTime: info.ModTime()}
 	} else {
 		delete(v.stamps, path)
@@ -458,7 +467,7 @@ func resolveExistingPrefix(p string) (string, error) {
 // display renders a path relative to the workspace for prompts and messages.
 func (r *Registry) display(abs string) string {
 	if rel, err := filepath.Rel(r.root, abs); err == nil {
-		return rel
+		return filepath.ToSlash(rel)
 	}
-	return abs
+	return filepath.ToSlash(abs)
 }

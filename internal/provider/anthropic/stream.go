@@ -16,6 +16,19 @@ import (
 // never sends a newline from consuming memory without limit.
 const maxLineBytes = 8 << 20
 
+// maxAccumulatedBlocks matches the agent's durable draft bound. Wire events
+// which have not produced a canonical event yet still need their own ceiling:
+// otherwise a server can grow the adapter's block map indefinitely while the
+// outer stream limiter has nothing to observe.
+const maxAccumulatedBlocks = 4096
+
+const (
+	// Transport syntax gets a separate generous budget: it is not model output,
+	// but an endless stream of ignored envelopes still needs a finite bound.
+	maxAccumulatedWireBytes = 8 * provider.ProviderStreamHardBytes
+	maxAccumulatedWireLines = 4 * provider.ProviderStreamMaxEvents
+)
+
 // stream decodes server-sent events into canonical events.
 //
 // This format is kinder than the compatible one in two ways that matter. Blocks
@@ -27,9 +40,13 @@ const maxLineBytes = 8 << 20
 // input and cache counts with a placeholder output count, and message_delta
 // carries the final figures. Taking either alone reports a turn wrong.
 type stream struct {
-	ctx     context.Context
-	body    io.ReadCloser
-	scanner *bufio.Scanner
+	ctx       context.Context
+	body      io.ReadCloser
+	scanner   *bufio.Scanner
+	events    *provider.StreamLimiter
+	accum     *provider.StreamLimiter
+	wireBytes int
+	wireLines int
 
 	pending []provider.Event
 
@@ -53,13 +70,15 @@ type blockAccum struct {
 	input strings.Builder
 }
 
-func newStream(ctx context.Context, body io.ReadCloser) *stream {
+func newStream(ctx context.Context, body io.ReadCloser, outputTokenAllowance int) *stream {
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, 64<<10), maxLineBytes)
 	return &stream{
 		ctx:     ctx,
 		body:    body,
 		scanner: sc,
+		events:  provider.NewStreamLimiter(0),
+		accum:   provider.NewStreamLimiter(outputTokenAllowance),
 		blocks:  map[int]*blockAccum{},
 	}
 }
@@ -105,7 +124,11 @@ func (s *stream) readLine() error {
 		return provider.ErrStreamIncomplete
 	}
 
-	line := strings.TrimSpace(s.scanner.Text())
+	rawLine := s.scanner.Text()
+	if err := s.admitWireLine(rawLine); err != nil {
+		return err
+	}
+	line := strings.TrimSpace(rawLine)
 	if line == "" || strings.HasPrefix(line, ":") {
 		return nil
 	}
@@ -116,6 +139,12 @@ func (s *stream) readLine() error {
 		return nil
 	}
 	payload = strings.TrimSpace(payload)
+	// Count the wire event before decoding it. Bytes are charged separately,
+	// immediately before a decoded value is retained; charging JSON syntax here
+	// would reject valid highly-fragmented output on envelope overhead alone.
+	if err := s.events.AdmitPayloadBytes(); err != nil {
+		return s.limitError("event count")
+	}
 
 	var ev streamEvent
 	if err := json.Unmarshal([]byte(payload), &ev); err != nil {
@@ -131,7 +160,7 @@ func (s *stream) handle(ev streamEvent) error {
 		if ev.Error != nil {
 			msg = ev.Error.Message
 		}
-		return &provider.APIError{Provider: Name, StatusCode: 0, Body: msg}
+		return &provider.APIError{Provider: Name, StatusCode: 0, Body: provider.SanitizeAPIErrorText(msg)}
 
 	case "message_start":
 		if ev.Message != nil {
@@ -141,6 +170,21 @@ func (s *stream) handle(ev streamEvent) error {
 	case "content_block_start":
 		if ev.ContentBlock == nil {
 			return nil
+		}
+		previous, exists := s.blocks[ev.Index]
+		if !exists && len(s.blocks) >= maxAccumulatedBlocks {
+			return s.limitError("distinct block count")
+		}
+		parts := []string{ev.ContentBlock.Type, ev.ContentBlock.ID, ev.ContentBlock.Name}
+		if previous != nil {
+			parts = []string{
+				growthBeyond(len(previous.kind), ev.ContentBlock.Type),
+				growthBeyond(len(previous.id), ev.ContentBlock.ID),
+				growthBeyond(len(previous.name), ev.ContentBlock.Name),
+			}
+		}
+		if err := s.admitAccumulated(parts...); err != nil {
+			return err
 		}
 		acc := &blockAccum{
 			kind: ev.ContentBlock.Type,
@@ -172,6 +216,9 @@ func (s *stream) handle(ev streamEvent) error {
 			s.emitText(ev.Index, provider.EventThinkingDelta, "", ev.Delta.Signature)
 		case "input_json_delta":
 			if acc, ok := s.blocks[ev.Index]; ok {
+				if err := s.admitAccumulated(ev.Delta.PartialJSON); err != nil {
+					return err
+				}
 				acc.input.WriteString(ev.Delta.PartialJSON)
 			}
 		}
@@ -207,6 +254,49 @@ func (s *stream) handle(ev streamEvent) error {
 		s.finish()
 	}
 	return nil
+}
+
+func (s *stream) limitError(kind string) error {
+	return &provider.ProtocolError{
+		Provider: Name,
+		Detail:   fmt.Sprintf("event stream exceeded its %s limit", kind),
+		Err:      provider.ErrStreamLimit,
+	}
+}
+
+func (s *stream) admitAccumulated(parts ...string) error {
+	sizes := make([]int, len(parts))
+	hasPayload := false
+	for i, part := range parts {
+		sizes[i] = len(part)
+		hasPayload = hasPayload || len(part) > 0
+	}
+	if hasPayload {
+		if err := s.accum.AdmitPayloadBytes(sizes...); err != nil {
+			return s.limitError("accumulated bytes or fragment count")
+		}
+	}
+	return nil
+}
+
+func (s *stream) admitWireLine(line string) error {
+	size := len(line) + 1 // Include the scanner-stripped line ending.
+	if s.wireLines >= maxAccumulatedWireLines {
+		return s.limitError("wire line count")
+	}
+	if s.wireBytes > maxAccumulatedWireBytes || size > maxAccumulatedWireBytes-s.wireBytes {
+		return s.limitError("wire bytes")
+	}
+	s.wireLines++
+	s.wireBytes += size
+	return nil
+}
+
+func growthBeyond(retained int, replacement string) string {
+	if len(replacement) <= retained {
+		return ""
+	}
+	return replacement[retained:]
 }
 
 func (s *stream) emitText(index int, kind provider.EventType, text, signature string) {

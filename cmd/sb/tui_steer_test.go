@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -19,6 +21,9 @@ func TestSteerRoundDrainsMarkedAndOnce(t *testing.T) {
 	for i, msg := range out {
 		if !msg.Injected {
 			t.Errorf("message %d is not marked injected", i)
+		}
+		if !msg.UserSteer {
+			t.Errorf("message %d is not marked as a user-authored steer", i)
 		}
 	}
 	if got := out[0].AuthoredText(); got != "[steer] fix the test first" {
@@ -106,5 +111,52 @@ func TestSteerCommandMatchesTheKey(t *testing.T) {
 
 	if cmd := cmdSteer(m, ""); cmd == nil {
 		t.Fatal("bare /steer said nothing")
+	}
+}
+
+func TestSteerCommandQueuesDuringSessionOperation(t *testing.T) {
+	m := testModel(t)
+	_, generation, _, err := m.startOperation("compact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.finishOperation(generation, false)
+
+	if cmd := cmdSteer(m, "preserve this correction"); cmd != nil {
+		t.Fatalf("operation-time /steer returned a command: %v", cmd)
+	}
+	if pending := m.app.takeSteers(); len(pending) != 0 {
+		t.Fatalf("operation with no round boundary accepted steers: %v", pending)
+	}
+	if len(m.queue) != 1 || m.queue[0] != "preserve this correction" {
+		t.Fatalf("operation-time /steer queue = %v", m.queue)
+	}
+	if flat := strings.Join(m.tr.flat, "\n"); !strings.Contains(flat, "current operation finishes") {
+		t.Fatalf("operation-time /steer did not explain its disposition:\n%s", flat)
+	}
+}
+
+func TestSteerKeepsExactAuthoredTextBesideMentionExpansion(t *testing.T) {
+	m := testModel(t)
+	path := filepath.Join(m.app.workspace, "notes.txt")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("machine evidence, not a user scope change"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if cmd := m.steer("inspect @notes.txt"); cmd != nil {
+		t.Fatalf("plain steer returned a command: %v", cmd)
+	}
+	messages := m.app.steerRound()
+	if len(messages) != 1 {
+		t.Fatalf("steer messages = %d", len(messages))
+	}
+	message := messages[0]
+	if got := message.AuthoredText(); got != "[steer] inspect @notes.txt" {
+		t.Fatalf("authored steer = %q", got)
+	}
+	if got := message.Text(); !strings.Contains(got, "machine evidence, not a user scope change") {
+		t.Fatalf("provider steer lost mention expansion: %q", got)
 	}
 }

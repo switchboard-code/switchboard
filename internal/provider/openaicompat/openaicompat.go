@@ -188,13 +188,14 @@ func (c *Client) Stream(ctx context.Context, target provider.RouteTarget, req pr
 	if err != nil {
 		return nil, err
 	}
-	return newStream(ctx, resp.Body, c.profile), nil
+	return newStream(ctx, resp.Body, c.profile, target.Params.MaxOutputTokens), nil
 }
 
 // CountTokens has no exact answer on a generic compatible endpoint: there is no
 // tokenizer endpoint in the format, and the true count depends on the server's
 // chat template. The estimate is deliberately crude and flagged inexact.
 func (c *Client) CountTokens(_ context.Context, _ provider.RouteTarget, req provider.Request) (provider.TokenEstimate, error) {
+	req = provider.ReplayRequest(req)
 	chars := 0
 	for _, b := range req.System {
 		chars += blockChars(b)
@@ -245,8 +246,11 @@ func (c *Client) Models(ctx context.Context) ([]string, error) {
 	defer resp.Body.Close()
 
 	var list modelList
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil, &provider.ProtocolError{Provider: c.Name(), Detail: "decoding /models", Err: err}
+	if err := provider.DecodeBoundedModelList(resp.Body, c.Name(), "decoding /models", "data", &list); err != nil {
+		return nil, err
+	}
+	if err := validateModelList(c.Name(), list); err != nil {
+		return nil, err
 	}
 	out := make([]string, 0, len(list.Data))
 	for _, m := range list.Data {
@@ -279,8 +283,11 @@ func (c *Client) Probe(ctx context.Context, target provider.RouteTarget) (provid
 	defer resp.Body.Close()
 
 	var list modelList
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return res, &provider.ProtocolError{Provider: c.Name(), Detail: "decoding /models", Err: err}
+	if err := provider.DecodeBoundedModelList(resp.Body, c.Name(), "decoding /models", "data", &list); err != nil {
+		return res, err
+	}
+	if err := validateModelList(c.Name(), list); err != nil {
+		return res, err
 	}
 	res.Reachable = true
 	for _, m := range list.Data {
@@ -315,6 +322,15 @@ func (c *Client) Probe(ctx context.Context, target provider.RouteTarget) (provid
 	}
 	res.Detail = fmt.Sprintf("profile %q; the format reports no per-model capabilities, so this is the profile's word", c.profileName)
 	return res, nil
+}
+
+func validateModelList(providerName string, list modelList) error {
+	for _, model := range list.Data {
+		if err := provider.ValidateModelID(model.ID); err != nil {
+			return &provider.ProtocolError{Provider: providerName, Detail: "validating /models", Err: err}
+		}
+	}
+	return nil
 }
 
 // slotContextWindow asks llama.cpp what it allocated, for the servers whose
@@ -352,7 +368,7 @@ func (c *Client) slotContextWindow(ctx context.Context) int {
 		return 0
 	}
 	var props serverProps
-	if err := json.NewDecoder(resp.Body).Decode(&props); err != nil {
+	if err := provider.DecodeBoundedJSON(resp.Body, c.Name(), "decoding /props", &props); err != nil {
 		return 0
 	}
 	if n := props.DefaultGenerationSettings.NCtx; n > 0 {
@@ -398,8 +414,8 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) (*htt
 	}
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
-		return nil, &provider.APIError{Provider: c.Name(), StatusCode: resp.StatusCode, Body: errorMessage(raw)}
+		raw := provider.ReadAPIErrorBody(resp.Body)
+		return nil, &provider.APIError{Provider: c.Name(), StatusCode: resp.StatusCode, Body: provider.SanitizeAPIErrorText(errorMessage(raw))}
 	}
 	return resp, nil
 }
@@ -430,6 +446,7 @@ func (c *Client) buildRequest(target provider.RouteTarget, req provider.Request)
 			Detail:     "the chat-completions format has no way to place them",
 		}
 	}
+	req = provider.ReplayRequest(req)
 
 	out := chatRequest{Model: target.ModelID, Stream: true}
 	if c.profile.StreamUsage {
@@ -500,7 +517,7 @@ func describeLevels(levels []string) string {
 // tool arguments are re-encoded as a string, which is the format's shape and
 // the main place a round trip through both adapters can go wrong.
 func (c *Client) toWireMessages(target provider.RouteTarget, m provider.Message) ([]wireMessage, error) {
-	if m.Incomplete {
+	if m.Role == provider.RoleAssistant && m.Incomplete {
 		return nil, nil
 	}
 

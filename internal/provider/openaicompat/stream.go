@@ -17,6 +17,15 @@ import (
 // server that never sends a newline from consuming memory without limit.
 const maxLineBytes = 8 << 20
 
+const maxAccumulatedBlocks = 4096
+
+const (
+	// Wire envelopes are not output bytes, so they get independent headroom
+	// while remaining finite even when a server sends only ignored fields.
+	maxAccumulatedWireBytes = 8 * provider.ProviderStreamHardBytes
+	maxAccumulatedWireLines = 4 * provider.ProviderStreamMaxEvents
+)
+
 // stream decodes server-sent events into canonical events.
 //
 // Tool calls are the hard part. The format streams them as fragments tagged
@@ -24,10 +33,14 @@ const maxLineBytes = 8 << 20
 // several more, so nothing can be emitted until the choice finishes and the
 // accumulated argument text parses as JSON.
 type stream struct {
-	ctx     context.Context
-	body    io.ReadCloser
-	scanner *bufio.Scanner
-	profile Profile
+	ctx       context.Context
+	body      io.ReadCloser
+	scanner   *bufio.Scanner
+	profile   Profile
+	events    *provider.StreamLimiter
+	accum     *provider.StreamLimiter
+	wireBytes int
+	wireLines int
 
 	// name is the provider a failure is attributed to. A profile that names its
 	// vendor reports under that name, so an error from OpenAI does not arrive
@@ -39,6 +52,7 @@ type stream struct {
 	blockIndex int
 	blockKind  provider.EventType
 	blockOpen  bool
+	blocks     int
 
 	tools        map[int]*toolAccum
 	sawToolCalls bool
@@ -61,7 +75,7 @@ type toolAccum struct {
 	args strings.Builder
 }
 
-func newStream(ctx context.Context, body io.ReadCloser, profile Profile) *stream {
+func newStream(ctx context.Context, body io.ReadCloser, profile Profile, outputTokenAllowance int) *stream {
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, 64<<10), maxLineBytes)
 	return &stream{
@@ -69,6 +83,8 @@ func newStream(ctx context.Context, body io.ReadCloser, profile Profile) *stream
 		body:    body,
 		scanner: sc,
 		profile: profile,
+		events:  provider.NewStreamLimiter(0),
+		accum:   provider.NewStreamLimiter(outputTokenAllowance),
 		name:    providerName(profile),
 		tools:   map[int]*toolAccum{},
 	}
@@ -117,7 +133,11 @@ func (s *stream) readLine() error {
 		return provider.ErrStreamIncomplete
 	}
 
-	line := strings.TrimSpace(s.scanner.Text())
+	rawLine := s.scanner.Text()
+	if err := s.admitWireLine(rawLine); err != nil {
+		return err
+	}
+	line := strings.TrimSpace(rawLine)
 	if line == "" || strings.HasPrefix(line, ":") {
 		return nil // keep-alive or blank separator
 	}
@@ -128,6 +148,9 @@ func (s *stream) readLine() error {
 		return nil
 	}
 	payload = strings.TrimSpace(payload)
+	if err := s.events.AdmitPayloadBytes(); err != nil {
+		return s.limitError("event count")
+	}
 
 	if payload == "[DONE]" {
 		s.finish()
@@ -139,7 +162,7 @@ func (s *stream) readLine() error {
 		return &provider.ProtocolError{Provider: s.name, Detail: "decoding a stream chunk", Err: err}
 	}
 	if chunk.Error != nil {
-		return &provider.APIError{Provider: s.name, StatusCode: 0, Body: chunk.Error.Message}
+		return &provider.APIError{Provider: s.name, StatusCode: 0, Body: provider.SanitizeAPIErrorText(chunk.Error.Message)}
 	}
 
 	if chunk.Usage != nil {
@@ -155,21 +178,34 @@ func (s *stream) readLine() error {
 
 	for _, choice := range chunk.Choices {
 		if reasoning := firstNonEmpty(choice.Delta.Reasoning, choice.Delta.ReasoningContent); reasoning != "" {
+			index, err := s.indexFor(provider.EventThinkingDelta)
+			if err != nil {
+				s.err = err
+				return nil
+			}
 			s.pending = append(s.pending, provider.Event{
 				Type:  provider.EventThinkingDelta,
-				Index: s.indexFor(provider.EventThinkingDelta),
+				Index: index,
 				Text:  reasoning,
 			})
 		}
 		if choice.Delta.Content != "" {
+			index, err := s.indexFor(provider.EventTextDelta)
+			if err != nil {
+				s.err = err
+				return nil
+			}
 			s.pending = append(s.pending, provider.Event{
 				Type:  provider.EventTextDelta,
-				Index: s.indexFor(provider.EventTextDelta),
+				Index: index,
 				Text:  choice.Delta.Content,
 			})
 		}
 		for _, call := range choice.Delta.ToolCalls {
-			s.accumulate(call)
+			if err := s.accumulate(call); err != nil {
+				s.err = err
+				return nil
+			}
 		}
 		if choice.FinishReason != "" {
 			s.finishReason = choice.FinishReason
@@ -187,10 +223,22 @@ func (s *stream) readLine() error {
 // accumulate folds a tool-call fragment into the call at its index. Ollama
 // sends a complete call in one chunk; OpenAI and others split the arguments,
 // so both shapes fold the same way.
-func (s *stream) accumulate(call wireToolCall) {
+func (s *stream) accumulate(call wireToolCall) error {
 	acc, ok := s.tools[call.Index]
 	if !ok {
+		if len(s.tools) >= maxAccumulatedBlocks {
+			return s.limitError("distinct tool count")
+		}
 		acc = &toolAccum{}
+	}
+	if err := s.admitAccumulated(
+		growthBeyond(len(acc.id), call.ID),
+		growthBeyond(len(acc.name), call.Function.Name),
+		call.Function.Arguments,
+	); err != nil {
+		return err
+	}
+	if !ok {
 		s.tools[call.Index] = acc
 	}
 	if call.ID != "" {
@@ -201,6 +249,7 @@ func (s *stream) accumulate(call wireToolCall) {
 	}
 	acc.args.WriteString(call.Function.Arguments)
 	s.sawToolCalls = true
+	return nil
 }
 
 // emitToolCalls turns the accumulated fragments into canonical calls. It runs
@@ -227,9 +276,14 @@ func (s *stream) emitToolCalls() {
 			s.err = err
 			return
 		}
+		index, err := s.newBlock()
+		if err != nil {
+			s.err = err
+			return
+		}
 		s.pending = append(s.pending, provider.Event{
 			Type:    provider.EventToolUse,
-			Index:   s.newBlock(),
+			Index:   index,
 			ToolUse: use,
 		})
 	}
@@ -299,28 +353,79 @@ func (s *stream) stopReason() provider.StopReason {
 	}
 }
 
-func (s *stream) indexFor(kind provider.EventType) int {
+func (s *stream) indexFor(kind provider.EventType) (int, error) {
 	if s.blockOpen && s.blockKind == kind {
-		return s.blockIndex
+		return s.blockIndex, nil
+	}
+	if s.blocks >= maxAccumulatedBlocks {
+		return 0, s.limitError("distinct block count")
 	}
 	if s.blockOpen {
 		s.blockIndex++
 	}
 	s.blockOpen = true
 	s.blockKind = kind
-	return s.blockIndex
+	s.blocks++
+	return s.blockIndex, nil
 }
 
 // newBlock allocates an index for a block that arrives complete, leaving no
 // block open so the next delta of any kind starts one of its own.
-func (s *stream) newBlock() int {
+func (s *stream) newBlock() (int, error) {
+	if s.blocks >= maxAccumulatedBlocks {
+		return 0, s.limitError("distinct block count")
+	}
 	if s.blockOpen {
 		s.blockIndex++
 	}
 	idx := s.blockIndex
 	s.blockIndex++
 	s.blockOpen = false
-	return idx
+	s.blocks++
+	return idx, nil
+}
+
+func (s *stream) limitError(kind string) error {
+	return &provider.ProtocolError{
+		Provider: s.name,
+		Detail:   fmt.Sprintf("event stream exceeded its %s limit", kind),
+		Err:      provider.ErrStreamLimit,
+	}
+}
+
+func (s *stream) admitAccumulated(parts ...string) error {
+	sizes := make([]int, len(parts))
+	hasPayload := false
+	for i, part := range parts {
+		sizes[i] = len(part)
+		hasPayload = hasPayload || len(part) > 0
+	}
+	if hasPayload {
+		if err := s.accum.AdmitPayloadBytes(sizes...); err != nil {
+			return s.limitError("accumulated bytes or fragment count")
+		}
+	}
+	return nil
+}
+
+func (s *stream) admitWireLine(line string) error {
+	size := len(line) + 1
+	if s.wireLines >= maxAccumulatedWireLines {
+		return s.limitError("wire line count")
+	}
+	if s.wireBytes > maxAccumulatedWireBytes || size > maxAccumulatedWireBytes-s.wireBytes {
+		return s.limitError("wire bytes")
+	}
+	s.wireLines++
+	s.wireBytes += size
+	return nil
+}
+
+func growthBeyond(retained int, replacement string) string {
+	if len(replacement) <= retained {
+		return ""
+	}
+	return replacement[retained:]
 }
 
 func firstNonEmpty(values ...string) string {

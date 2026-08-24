@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,6 +57,110 @@ func TestLookupKnownTarget(t *testing.T) {
 	}
 	if info.Free() {
 		t.Error("a paid model reported itself free")
+	}
+}
+
+func TestLookupDatedSnapshotCarriesAliasEvidenceWithoutCollapsingIdentity(t *testing.T) {
+	c := load(t)
+	for _, tc := range []struct {
+		alias    string
+		snapshot string
+	}{
+		{alias: "claude-opus-5", snapshot: "claude-opus-5-20260824"},
+		{alias: "claude-sonnet-5", snapshot: "claude-sonnet-5-20261231"},
+		{alias: "claude-haiku-4-5", snapshot: "claude-haiku-4-5-20251001"},
+	} {
+		t.Run(tc.snapshot, func(t *testing.T) {
+			aliasTarget := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: tc.alias}
+			snapshotTarget := provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: tc.snapshot}
+			aliasInfo, _, ok := c.Lookup(aliasTarget)
+			if !ok {
+				t.Fatalf("alias %q is absent", tc.alias)
+			}
+			info, confidence, ok := c.Lookup(snapshotTarget)
+			if !ok || confidence != Verified {
+				t.Fatalf("snapshot lookup = present %v confidence %q, want verified alias evidence", ok, confidence)
+			}
+			if info.ProviderModelID != tc.snapshot || info.ID() != string(snapshotTarget.ID()) {
+				t.Fatalf("snapshot identity collapsed to alias: model=%q id=%q want %q", info.ProviderModelID, info.ID(), snapshotTarget.ID())
+			}
+			if info.Snapshot != tc.snapshot {
+				t.Fatalf("resolved snapshot marker = %q, want %q", info.Snapshot, tc.snapshot)
+			}
+			if info.MaxOutput != aliasInfo.MaxOutput || info.Reasoning != aliasInfo.Reasoning ||
+				strings.Join(info.EffortLevels, ",") != strings.Join(aliasInfo.EffortLevels, ",") {
+				t.Fatalf("snapshot lost alias evidence:\n snapshot=%+v\n alias=%+v", info, aliasInfo)
+			}
+		})
+	}
+}
+
+func TestSnapshotLookupRejectsNearPrefixesAndMalformedDates(t *testing.T) {
+	c := load(t)
+	for _, model := range []string{
+		"claude-opus-20260824",
+		"claude-opus-5x-20260824",
+		"claude-opus-5-2026082",
+		"claude-opus-5-20260230",
+		"claude-opus-5-20260824-preview",
+		// Haiku is a verified budget-dialect alias, not one of the four aliases
+		// whose arbitrary canonical snapshots were live-verified. Only its exact
+		// Snapshot field value above may inherit catalog evidence.
+		"claude-haiku-4-5-20260824",
+	} {
+		t.Run(model, func(t *testing.T) {
+			_, _, ok := c.Lookup(provider.RouteTarget{Provider: "anthropic", Surface: "first-party", ModelID: model})
+			if ok {
+				t.Fatalf("malformed or unrelated snapshot %q inherited verified alias evidence", model)
+			}
+		})
+	}
+}
+
+func TestDatedSnapshotInferenceIsNotGenericCatalogPrefixMatching(t *testing.T) {
+	entry := ModelInfo{Provider: "acme", Surface: "cloud", ProviderModelID: "model-pro"}
+	c := &Catalog{entries: map[string]ModelInfo{entry.ID(): entry}}
+	for _, model := range []string{"model-pro-20260824", "model-pro-preview-20260824"} {
+		if _, _, ok := c.Lookup(provider.RouteTarget{Provider: "acme", Surface: "cloud", ModelID: model}); ok {
+			t.Fatalf("unrelated provider snapshot %q inherited an alias by spelling convention alone", model)
+		}
+	}
+}
+
+func TestSurfacesAreOnlyExplicitDefaultsAndDeterministic(t *testing.T) {
+	defaults := []ModelInfo{
+		{Provider: "zeta", Surface: "two", DisplayName: "zeta default"},
+		{Provider: "alpha", Surface: "one", DisplayName: "alpha default"},
+		{Provider: "middle", Surface: "three", DisplayName: "middle default"},
+	}
+	entries := []ModelInfo{
+		{Provider: "anthropic", Surface: "first-party", ProviderModelID: "claude-opus-5", EffortLevels: []string{"xhigh"}, MaxOutput: 128000},
+		{Provider: "entry-only", Surface: "cloud", ProviderModelID: "model", EffortLevels: []string{"wrong-floor"}, MaxOutput: 99},
+	}
+	want := "alpha/one/,middle/three/,zeta/two/"
+
+	random := rand.New(rand.NewSource(42))
+	for run := 0; run < 100; run++ {
+		c := &Catalog{defaults: map[string]ModelInfo{}, entries: map[string]ModelInfo{}}
+		for _, index := range random.Perm(len(defaults)) {
+			info := defaults[index]
+			c.defaults[info.Provider+"/"+info.Surface] = info
+		}
+		for _, index := range random.Perm(len(entries)) {
+			info := entries[index]
+			c.entries[info.ID()] = info
+		}
+		got := c.Surfaces()
+		ids := make([]string, len(got))
+		for i, info := range got {
+			ids[i] = info.ID()
+			if info.Provider == "anthropic" || info.Provider == "entry-only" {
+				t.Fatalf("run %d promoted concrete model evidence to a surface default: %+v", run, info)
+			}
+		}
+		if joined := strings.Join(ids, ","); joined != want {
+			t.Fatalf("run %d surfaces = %q, want stable %q", run, joined, want)
+		}
 	}
 }
 

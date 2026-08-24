@@ -24,12 +24,14 @@ import (
 type adviceMsg struct{ text string }
 
 type advisorReadyMsg struct {
-	adv       *advisor.Advisor
-	tier      config.Tier
-	action    string
-	err       error
-	operation uint64
-	sourceID  string
+	adv             *advisor.Advisor
+	tier            config.Tier
+	client          provider.Provider
+	providerRetries int
+	action          string
+	err             error
+	operation       uint64
+	sourceID        string
 }
 
 const advisorUsage = "usage: /advisor [on|off|status]"
@@ -56,7 +58,7 @@ func cmdAdvisor(m *tuiModel, args string) tea.Cmd {
 		if err != nil {
 			return noticeCmd("warn", err.Error())
 		}
-		return startAdvisor(ctx, m.app, generation, sourceID)
+		return m.ownOperationCmd(generation, startAdvisor(ctx, m.app, generation, sourceID))
 	case "off":
 		if m.operationActive && m.operationName == "advisor on" {
 			if !m.operationCancelling && m.turnCancel != nil {
@@ -74,7 +76,7 @@ func cmdAdvisor(m *tuiModel, args string) tea.Cmd {
 		if err != nil {
 			return noticeCmd("warn", err.Error())
 		}
-		return func() tea.Msg {
+		return m.ownOperationCmd(generation, func() tea.Msg {
 			// Detaching without draining would make a later fork unable to see
 			// this advisor even though its old-session provider call was still
 			// running. Keep it discoverable until its WAL is settled.
@@ -84,7 +86,7 @@ func cmdAdvisor(m *tuiModel, args string) tea.Cmd {
 				result.err = err
 			}
 			return result
-		}
+		})
 	default:
 		return noticeCmd("error", advisorUsage)
 	}
@@ -137,6 +139,10 @@ func describeAdvisorChoice(app *tuiApp) string {
 }
 
 func startAdvisor(ctx context.Context, app *tuiApp, operation uint64, sourceID string) tea.Cmd {
+	return startAdvisorAttempt(ctx, app, operation, sourceID, 0)
+}
+
+func startAdvisorAttempt(ctx context.Context, app *tuiApp, operation uint64, sourceID string, retries int) tea.Cmd {
 	tier, err := advisorTier(app)
 	if err != nil {
 		return func() tea.Msg {
@@ -152,7 +158,8 @@ func startAdvisor(ctx context.Context, app *tuiApp, operation uint64, sourceID s
 		adv := advisor.New(app.watcher, client, probed.Target, func(text string) {
 			app.p.Send(adviceMsg{text: text})
 		}, advisor.WithMeter(advisorMeterFor(app, sess, probed.Target)))
-		return advisorReadyMsg{adv: adv, tier: probed, action: "on", operation: operation, sourceID: sourceID}
+		return advisorReadyMsg{adv: adv, tier: probed, client: client, providerRetries: retries,
+			action: "on", operation: operation, sourceID: sourceID}
 	}
 }
 
@@ -214,6 +221,15 @@ func (m *tuiModel) onAdvisorReady(msg advisorReadyMsg) tea.Cmd {
 		m.finishOperation(msg.operation, false)
 		m.addNotice("", "advisor is off")
 		return m.nextQueuedTurn()
+	}
+	if m.app.providers != nil && !m.app.providers.preparedClientCurrent(msg.client) {
+		if msg.providerRetries >= maxProviderReplans {
+			m.finishOperation(msg.operation, false)
+			m.addNotice("error", "provider settings kept changing while starting the advisor; advisor remains off")
+			return m.nextQueuedTurn()
+		}
+		return m.ownOperationCmd(msg.operation,
+			startAdvisorAttempt(m.turnCtx, m.app, msg.operation, msg.sourceID, msg.providerRetries+1))
 	}
 	// The probe may have completed after a session/tier bind rebuilt the
 	// watcher. Always wrap the graph current at installation time, not the one

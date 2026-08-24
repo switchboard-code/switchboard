@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/switchboard-code/switchboard/internal/credential"
 	"github.com/switchboard-code/switchboard/internal/provider/ollama"
 	"github.com/switchboard-code/switchboard/internal/provider/openaicompat"
+	"github.com/switchboard-code/switchboard/internal/terminaltext"
 )
 
 // errSetupCancelled distinguishes "the user backed out" from a setup that
@@ -29,8 +31,8 @@ var errSetupCancelled = errors.New(
 
 // runOnboarding runs the wizard as its own inline Bubble Tea program, so the
 // few lines it prints stay in the scrollback as a record of what was set up.
-func runOnboarding(reg *providers, cat *catalog.Catalog, cfg *config.Config) error {
-	m := &onboardModel{reg: reg, cat: cat, cfg: cfg, th: themeFor(detectDark())}
+func runOnboarding(reg *providers, cat *catalog.Catalog, cfg *config.Config, workspace string) error {
+	m := &onboardModel{reg: reg, cat: cat, cfg: cfg, workspace: workspace, th: themeFor(detectDark())}
 	if _, err := tea.NewProgram(m).Run(); err != nil {
 		return err
 	}
@@ -45,7 +47,10 @@ type onboardChoicesMsg struct {
 	choices map[string]modelChoice
 }
 type onboardPickedMsg struct{ id string }
-type onboardKeyStoredMsg struct{ note string }
+type onboardKeyStoredMsg struct {
+	note             string
+	refreshProviders bool
+}
 type onboardWiredMsg struct {
 	note string
 	err  error
@@ -73,15 +78,18 @@ const (
 const onboardAddID = "\x00add-rung"
 
 type onboardModel struct {
-	reg *providers
-	cat *catalog.Catalog
-	cfg *config.Config
-	th  *theme
+	reg       *providers
+	cat       *catalog.Catalog
+	cfg       *config.Config
+	workspace string
+	th        *theme
 
 	step   onboardStep
 	dlg    dialog
 	lines  []string
 	choice modelChoice
+	width  int
+	height int
 
 	cancelled bool
 	quitting  bool
@@ -108,15 +116,15 @@ func (m *onboardModel) connectStep() tea.Cmd {
 					m.step = stepModel
 					return m.modelStep()
 				case setupLocalID:
-					return askAddressCmd(reg, cfg, ollama.Name, ollama.SurfaceLocal, m.connectStep)
+					return askAddressCmd(asyncResultBinding{}, reg, cfg, ollama.Name, ollama.SurfaceLocal, m.connectStep)
 				case setupCompatID:
-					return askAddressCmd(reg, cfg, openaicompat.Name, genericCompat, m.connectStep)
+					return askAddressCmd(asyncResultBinding{}, reg, cfg, openaicompat.Name, genericCompat, m.connectStep)
 				case setupCodexID:
+					if err := wireCodex(cfg, m.workspace); err != nil {
+						return func() tea.Msg { return onboardWiredMsg{err: err} }
+					}
+					reg.reset()
 					return func() tea.Msg {
-						if err := wireCodex(cfg); err != nil {
-							return onboardWiredMsg{err: err}
-						}
-						reg.reset()
 						return onboardWiredMsg{note: "openai wired to your Codex CLI login"}
 					}
 				}
@@ -156,6 +164,10 @@ func (m *onboardModel) modelStep() tea.Cmd {
 
 func (m *onboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		return m, nil
+
 	case onboardChoicesMsg:
 		m.step = stepModel // the message is the model step, however it arrived
 		if len(msg.items) == 0 {
@@ -170,13 +182,13 @@ func (m *onboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		choices := msg.choices
 		m.dlg = &pickerDialog{
 			title: "switchboard setup — pick the model t1 starts on",
-			items: msg.items,
+			items: msg.items, sel: -1, requireSelection: true,
 			onPick: func(id string) tea.Cmd {
 				choice := choices[id]
 				if choice.browse {
 					// A surface, not a model yet: its server is asked what it
 					// serves, and the pick comes back through here.
-					return browseSurfaceCmd(m.reg, m.cfg, choice, m.pick)
+					return browseSurfaceCmdWithCatalog(m.reg, m.cat, m.cfg, choice, m.pick)
 				}
 				return m.pick(choice)
 			},
@@ -196,8 +208,14 @@ func (m *onboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// closes its dialog and advances nothing leaves the user at a screen with
 	// no keys that do anything.
 	case noticeMsg:
+		if msg.refreshProviders && m.reg != nil {
+			m.reg.reset()
+		}
 		if msg.text != "" {
 			m.lines = append(m.lines, msg.text)
+		}
+		if msg.after != nil {
+			return m, msg.after
 		}
 		if msg.resumed {
 			// Something else is already queued to continue this flow; taking
@@ -212,7 +230,7 @@ func (m *onboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case m.choice.ref == "":
 			return m, m.modelStep()
 		}
-		return m, m.effortOrBind()
+		return m, m.outputCapOrEffort()
 
 	case secretPromptMsg:
 		m.dlg = newSecretDialog(msg.ref, msg.storeName, func(value string) tea.Cmd {
@@ -222,25 +240,24 @@ func (m *onboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if err := msg.writer.Set(ctx, msg.ref, value); err != nil {
 					return onboardKeyStoredMsg{note: "storing the key failed: " + err.Error()}
 				}
-				// The adapters built before the key existed cached its
-				// absence; the next request has to be built with it.
-				m.reg.reset()
 				note := "stored " + msg.ref.String() + " in the " + msg.storeName
 				if msg.then != nil {
-					return noticeMsg{text: note, resumed: true}
+					return noticeMsg{
+						text: note, resumed: true, refreshProviders: true, after: msg.then,
+					}
 				}
-				return onboardKeyStoredMsg{note: note}
+				return onboardKeyStoredMsg{note: note, refreshProviders: true}
 			}
-			if msg.then != nil {
-				// The flow that asked for the key resumes with it in place,
-				// rather than the wizard deciding what comes next.
-				return tea.Sequence(store, msg.then)
-			}
+			// A continuation rides the store result instead of tea.Sequence:
+			// Update must reset cached providers before the next probe runs.
 			return store
 		})
 		return m, nil
 
 	case onboardKeyStoredMsg:
+		if msg.refreshProviders && m.reg != nil {
+			m.reg.reset()
+		}
 		m.lines = append(m.lines, msg.note)
 		// The same message ends a key entry in both steps; what follows it
 		// depends on which step asked: the checklist reopens refreshed, the
@@ -248,7 +265,7 @@ func (m *onboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.step == stepConnect {
 			return m, m.connectStep()
 		}
-		return m, m.effortOrBind()
+		return m, m.outputCapOrEffort()
 
 	case onboardWiredMsg:
 		if msg.err != nil {
@@ -259,7 +276,9 @@ func (m *onboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.connectStep()
 
 	case pickerMsg:
-		m.dlg = &pickerDialog{title: msg.title, items: msg.items, onPick: msg.action}
+		m.dlg = &pickerDialog{
+			title: msg.title, items: msg.items, sel: -1, requireSelection: true, onPick: msg.action,
+		}
 		return m, nil
 
 	case onboardBoundMsg:
@@ -268,7 +287,13 @@ func (m *onboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		}
-		m.lines = append(m.lines, msg.tier+" now runs "+m.choice.ref)
+		if tier, ok := m.cfg.Tier(msg.tier); ok {
+			m.lines = append(m.lines, tierBindingSummary(tier))
+		} else {
+			m.err = fmt.Errorf("saved %s is absent from the live ladder", msg.tier)
+			m.quitting = true
+			return m, tea.Quit
+		}
 		// The chosen target has been written; anything that arrives next is
 		// about the ladder rather than about this rung.
 		m.choice = modelChoice{}
@@ -321,7 +346,7 @@ func (m *onboardModel) pick(choice modelChoice) tea.Cmd {
 func (m *onboardModel) afterPick() tea.Cmd {
 	choice, cfg := m.choice, m.cfg
 	if needsNoCredential(choice) {
-		return m.effortOrBind()
+		return m.outputCapOrEffort()
 	}
 	providerName := choiceProvider(choice)
 	ref := credential.Ref{Provider: providerName, Account: choice.surface}
@@ -341,6 +366,21 @@ func (m *onboardModel) afterPick() tea.Cmd {
 	}
 }
 
+// outputCapOrEffort keeps an unlisted model from reaching the ladder with an
+// omitted, unbounded wire default. Known catalog maxima and characterized
+// adapter-owned finite defaults pass without acquiring a redundant target
+// parameter; an unrecognized Messages model still asks because the adapter's
+// required default is not evidence about that model's maximum.
+func (m *onboardModel) outputCapOrEffort() tea.Cmd {
+	if !modelChoiceNeedsExplicitOutputCap(m.reg, m.choice) {
+		return m.effortOrBind()
+	}
+	return modelOutputCapPromptCmd(m.choice, "", "", nil, func(chosen modelChoice) tea.Cmd {
+		m.choice = chosen
+		return m.effortOrBind()
+	})
+}
+
 func (m *onboardModel) effortOrBind() tea.Cmd {
 	choice := m.choice
 	if len(choice.effortLevels) == 0 {
@@ -352,7 +392,7 @@ func (m *onboardModel) effortOrBind() tea.Cmd {
 			items = append(items, pickerItem{id: level, label: level})
 		}
 		return pickerMsg{
-			title:  "reasoning effort for " + choice.ref,
+			title:  "reasoning effort for " + modelChoiceLabel(choice),
 			items:  items,
 			action: func(effort string) tea.Cmd { return m.bind(effort) },
 		}
@@ -367,10 +407,10 @@ func (m *onboardModel) bind(effort string) tea.Cmd {
 	choice, cfg := m.choice, m.cfg
 	return func() tea.Msg {
 		id := "t" + strconv.Itoa(highestRung(cfg)+1)
-		if err := cfg.BindTier(id, "", choice.ref, choice.surface, effort); err != nil {
+		if err := cfg.BindTierAndSave(id, "", choice.ref, choice.surface, effort, choice.maxOutput); err != nil {
 			return onboardBoundMsg{err: err}
 		}
-		return onboardBoundMsg{tier: id, err: cfg.Save()}
+		return onboardBoundMsg{tier: id}
 	}
 }
 
@@ -411,7 +451,7 @@ func (m *onboardModel) moreRungsStep() tea.Cmd {
 func ladderSummary(cfg *config.Config) string {
 	parts := make([]string, 0, len(cfg.Tiers))
 	for _, t := range cfg.Tiers {
-		parts = append(parts, t.ID+" "+t.Target.Provider+"/"+t.Target.ModelID)
+		parts = append(parts, t.ID+" "+t.Target.Display())
 	}
 	if len(parts) == 0 {
 		return "nothing bound yet"
@@ -429,23 +469,67 @@ func (m *onboardModel) finish() (tea.Model, tea.Cmd) {
 }
 
 func (m *onboardModel) View() string {
+	width := m.width
+	if width <= 0 {
+		width = 76
+	}
+	height := m.height
+	if height <= 0 {
+		height = dialogUnlimitedHeight
+	}
+	if width <= 0 || height <= 0 {
+		return ""
+	}
 	if m.quitting {
-		var b strings.Builder
+		var rows []string
 		for _, l := range m.lines {
-			b.WriteString(l + "\n")
+			for _, row := range strings.Split(wrapCells(terminaltext.Display(l), width), "\n") {
+				rows = append(rows, fitCells(row, width))
+			}
 		}
-		return b.String()
+		if len(rows) > height {
+			rows = rows[len(rows)-height:]
+		}
+		return strings.Join(rows, "\n")
+	}
+	// A first-run choice is the only path into a usable application. On a
+	// one- or two-row terminal it therefore preempts the explanatory title,
+	// just as a blocking session modal preempts passive status chrome.
+	if m.dlg != nil && height <= 2 {
+		return renderDialogWithin(m.dlg, width, height, m.th)
 	}
 
-	var b strings.Builder
-	b.WriteString(m.th.bold.Render("switchboard") + m.th.dim.Render("  first run — nothing is configured yet") + "\n\n")
+	title := fitCells(m.th.bold.Render("switchboard")+m.th.dim.Render("  first run — nothing is configured yet"), width)
+	top := []string{title}
+	if height >= 8 {
+		top = append(top, "")
+	}
+	var history []string
 	for _, l := range m.lines {
-		b.WriteString(m.th.dim.Render("  "+l) + "\n")
+		display := terminaltext.Display(l)
+		for _, row := range strings.Split(wrapCells(m.th.dim.Render("  "+display), width), "\n") {
+			history = append(history, fitCells(row, width))
+		}
 	}
+	// Five rows keep a compact chooser's title, search, selected option, and
+	// cancel hint together. Older progress notes yield first on a short first
+	// run; the most recent notes remain directly above the current decision.
+	reserveDialog := min(5, max(height-len(top), 0))
+	historyBudget := max(height-len(top)-reserveDialog, 0)
+	if len(history) > historyBudget {
+		history = history[len(history)-historyBudget:]
+	}
+	rows := append(top, history...)
+	remaining := max(height-len(rows), 0)
 	if m.dlg != nil {
-		b.WriteString(m.dlg.view(76, m.th))
+		if dialogView := renderDialogWithin(m.dlg, width, remaining, m.th); dialogView != "" {
+			rows = append(rows, strings.Split(dialogView, "\n")...)
+		}
 	} else {
-		b.WriteString(m.th.dim.Render("  looking for models…"))
+		rows = append(rows, fitCells(m.th.dim.Render("  looking for models…"), width))
 	}
-	return b.String()
+	if len(rows) > height {
+		rows = rows[:height]
+	}
+	return strings.Join(rows, "\n")
 }

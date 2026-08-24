@@ -13,13 +13,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
+	"github.com/switchboard-code/switchboard/internal/execution"
 	"github.com/switchboard-code/switchboard/internal/mcpnative"
+	"github.com/switchboard-code/switchboard/internal/safeexec"
 )
 
 const (
@@ -55,7 +54,14 @@ func readCodexAppServerSnapshot(parent context.Context, workspace string) (codex
 
 	ctx, cancel := context.WithTimeout(parent, codexSnapshotTimeout)
 	defer cancel()
-	command := exec.CommandContext(ctx, executable, "app-server", "--stdio")
+	command, err := executable.CommandContext(ctx, "app-server", "--stdio")
+	if err != nil {
+		return codexAppServerSnapshot{}, errors.New("Codex executable changed before app-server startup")
+	}
+	command.Env, err = codexAppServerEnvironment(workspace)
+	if err != nil {
+		return codexAppServerSnapshot{}, err
+	}
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		return codexAppServerSnapshot{}, errors.New("Codex app-server input is unavailable")
@@ -160,34 +166,37 @@ func codexRequirementsAbsent(raw []byte) (bool, error) {
 	return string(requirements) == "null", nil
 }
 
-func trustedCodexExecutable(workspace string) (string, error) {
+func trustedCodexExecutable(workspace string) (safeexec.Executable, error) {
 	workspace, err := filepath.Abs(workspace)
 	if err != nil {
-		return "", errors.New("Codex workspace path cannot be resolved")
+		return safeexec.Executable{}, errors.New("Codex workspace path cannot be resolved")
 	}
 	workspace, err = filepath.EvalSymlinks(workspace)
 	if err != nil {
-		return "", errors.New("Codex workspace path cannot be canonicalized")
+		return safeexec.Executable{}, errors.New("Codex workspace path cannot be canonicalized")
 	}
-	path, err := exec.LookPath("codex")
+	roots, err := safeexec.WorkspaceAndCurrentAuthorityRoots(workspace)
 	if err != nil {
-		return "", errors.New("Codex executable is unavailable")
+		return safeexec.Executable{}, errors.New("Codex workspace authority cannot be established")
 	}
-	path, err = filepath.Abs(path)
+	executable, err := safeexec.ResolveOutside("codex", roots...)
 	if err != nil {
-		return "", errors.New("Codex executable path cannot be resolved")
+		if errors.Is(err, safeexec.ErrUntrustedPath) {
+			return safeexec.Executable{}, errors.New("refusing to execute a workspace-local Codex binary for native MCP discovery")
+		}
+		return safeexec.Executable{}, errors.New("Codex executable is unavailable at a stable path outside workspace authority")
 	}
-	path, err = filepath.EvalSymlinks(path)
+	return executable, nil
+}
+
+func codexAppServerEnvironment(workspace string) ([]string, error) {
+	roots, err := safeexec.WorkspaceAndCurrentAuthorityRoots(workspace)
 	if err != nil {
-		return "", errors.New("Codex executable path cannot be canonicalized")
+		return nil, errors.New("Codex workspace authority cannot be established")
 	}
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() {
-		return "", errors.New("Codex executable is not a regular file")
+	environ, err := safeexec.FilterEnvironmentPath(execution.ScrubbedChildEnv(), roots...)
+	if err != nil {
+		return nil, errors.New("Codex app-server has no trusted interpreter search path outside workspace authority")
 	}
-	relative, err := filepath.Rel(workspace, path)
-	if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative) {
-		return "", errors.New("refusing to execute a workspace-local Codex binary for native MCP discovery")
-	}
-	return path, nil
+	return environ, nil
 }

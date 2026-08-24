@@ -1,6 +1,7 @@
 package session
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/switchboard-code/switchboard/internal/provider"
@@ -41,6 +42,36 @@ func TestReadOpeningStopsAtTheFirstUserWords(t *testing.T) {
 	}
 	if opening != "fix the flaky auth test" {
 		t.Fatalf("opening = %q, want the first user words", opening)
+	}
+}
+
+func TestReadOpeningWithholdsLegacyProviderExpandedContent(t *testing.T) {
+	store, workspace := newStore(t)
+	sess, err := store.Create(workspace, "test/local/model", "rev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	const expanded = "inspect @private.env\nAPI_TOKEN_FROM_EXPANDED_FILE"
+	if err := sess.AppendMessage(provider.Message{Role: provider.RoleUser, Content: []provider.Block{
+		provider.Text{Text: expanded},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	opening, err := ReadOpening(sess.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opening != "" || strings.Contains(opening, "API_TOKEN") {
+		t.Fatalf("legacy provider expansion escaped as authored opening: %q", opening)
+	}
+	summary, err := ReadOpeningSummary(sess.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.Found || summary.AuthoredKnown || summary.Text != "" {
+		t.Fatalf("legacy opening provenance = %+v", summary)
 	}
 }
 

@@ -16,17 +16,19 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
 
+	"github.com/switchboard-code/switchboard/internal/checkpoint"
+	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 	"github.com/switchboard-code/switchboard/internal/mcpnative"
 )
 
 const (
-	nativeMCPStateFileName = "native-mcp.json"
-	maxNativeMCPStateBytes = 1 << 20
+	nativeMCPStateFileName        = "native-mcp.json"
+	nativeMCPStateRecoveryDirName = ".native-mcp-state-recovery"
+	maxNativeMCPStateBytes        = 1 << 20
 )
 
 // nativeMCPActivationState is Switchboard's independent decision about exact
@@ -46,6 +48,20 @@ type nativeMCPActivationStatus struct {
 	Enabled bool
 	Changed bool
 }
+
+type nativeMCPStateImage struct {
+	existed bool
+	mode    os.FileMode
+	content []byte
+}
+
+// Test seams sit on the two sides of checkpoint publication. Production
+// leaves both nil. The pre-publication seam is followed by checkpoint's exact
+// descriptor and namespace revalidation.
+var (
+	nativeMCPStateBeforePublication func()
+	nativeMCPStateAfterPublication  func(bool, error) error
+)
 
 // nativeMCPActivationRecord extends the original on-disk identity with the
 // required-startup bit that was in force when the definition was approved.
@@ -97,44 +113,95 @@ func openNativeMCPActivationState() (*nativeMCPActivationState, error) {
 }
 
 func openNativeMCPActivationStateFile(path string) (*nativeMCPActivationState, error) {
-	state := &nativeMCPActivationState{path: path, records: make(map[string]nativeMCPActivationRecord)}
-	pathInfo, err := os.Lstat(path)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolving native MCP state %s: %w", path, err)
 	}
-	if os.IsNotExist(err) {
-		return state, nil
+	path = filepath.Clean(abs)
+	lock, err := acquireNativeMCPStateFileLock(context.Background(), path)
+	if err != nil {
+		return nil, err
+	}
+	if err := recoverNativeMCPStatePublication(context.Background(), lock); err != nil {
+		return nil, errors.Join(err, lock.Close())
+	}
+	state, _, readErr := readNativeMCPActivationStateLocked(lock, path)
+	closeErr := lock.Close()
+	if readErr != nil || closeErr != nil {
+		return nil, errors.Join(readErr, closeErr)
+	}
+	return state, nil
+}
+
+func readNativeMCPActivationStateLocked(lock *nativeMCPStateFileLock, path string) (*nativeMCPActivationState, nativeMCPStateImage, error) {
+	state := &nativeMCPActivationState{path: path, records: make(map[string]nativeMCPActivationRecord)}
+	if lock == nil || lock.root == nil || filepath.Clean(path) != filepath.Join(lock.directoryPath, lock.stateLeaf) {
+		return nil, nativeMCPStateImage{}, errors.New("native MCP state read has no matching directory capability")
+	}
+	if err := lock.verifyAuthority(); err != nil {
+		return nil, nativeMCPStateImage{}, err
+	}
+	pathInfo, err := lock.root.Lstat(lock.stateLeaf)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := lock.verifyAuthority(); err != nil {
+			return nil, nativeMCPStateImage{}, err
+		}
+		return state, nativeMCPStateImage{}, nil
+	}
+	if err != nil {
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: %w", path, err)
 	}
 	if pathInfo.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("reading %s: native MCP state must not be a symbolic link", path)
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: native MCP state must not be a symbolic link", path)
 	}
-	f, err := openNativeMCPStateDataFile(path)
+	if !pathInfo.Mode().IsRegular() {
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: native MCP state is not a regular file", path)
+	}
+	f, err := fileprivacy.OpenInRoot(lock.root, lock.stateLeaf)
 	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: %w", path, err)
 	}
 	defer f.Close()
 	openedInfo, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: %w", path, err)
 	}
 	if !os.SameFile(pathInfo, openedInfo) {
-		return nil, fmt.Errorf("reading %s: native MCP state changed while it was opened", path)
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: native MCP state changed while it was opened", path)
 	}
-	if !openedInfo.Mode().IsRegular() {
-		return nil, fmt.Errorf("reading %s: native MCP state is not a regular file", path)
+	ownerOnly, err := fileprivacy.IsOwnerOnly(f)
+	if err != nil {
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s permissions: %w", path, err)
 	}
-	if runtime.GOOS != "windows" && openedInfo.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("reading %s: native MCP state permissions are %04o, want 0600", path, openedInfo.Mode().Perm())
+	if !ownerOnly {
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: native MCP state permissions are not owner-only", path)
+	}
+	if openedInfo.Size() > maxNativeMCPStateBytes {
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: native MCP state exceeds %d bytes", path, maxNativeMCPStateBytes)
 	}
 	raw, err := io.ReadAll(io.LimitReader(f, maxNativeMCPStateBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: %w", path, err)
 	}
 	if len(raw) > maxNativeMCPStateBytes {
-		return nil, fmt.Errorf("reading %s: native MCP state exceeds %d bytes", path, maxNativeMCPStateBytes)
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: native MCP state exceeds %d bytes", path, maxNativeMCPStateBytes)
+	}
+	finished, err := f.Stat()
+	if err != nil {
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: %w", path, err)
+	}
+	linked, linkErr := lock.root.Lstat(lock.stateLeaf)
+	if linkErr != nil || !linked.Mode().IsRegular() || !os.SameFile(openedInfo, finished) ||
+		!os.SameFile(finished, linked) || openedInfo.Size() != finished.Size() ||
+		finished.Size() != int64(len(raw)) || !openedInfo.ModTime().Equal(finished.ModTime()) {
+		return nil, nativeMCPStateImage{}, errors.Join(linkErr,
+			fmt.Errorf("reading %s: native MCP state changed while it was read", path))
+	}
+	if err := lock.verifyAuthority(); err != nil {
+		return nil, nativeMCPStateImage{}, err
 	}
 	if err := rejectNativeMCPDuplicateJSONKeys(raw); err != nil {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: %w", path, err)
 	}
 	var file struct {
 		Version     int                         `json:"version"`
@@ -144,31 +211,57 @@ func openNativeMCPActivationStateFile(path string) (*nativeMCPActivationState, e
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&file); err != nil {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: %w", path, err)
 	}
 	if err := requireNativeMCPJSONEOF(decoder); err != nil {
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: %w", path, err)
 	}
 	if file.Version != 1 {
-		return nil, fmt.Errorf("reading %s: unsupported native MCP state version %d", path, file.Version)
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: unsupported native MCP state version %d", path, file.Version)
 	}
 	key, err := base64.RawStdEncoding.DecodeString(file.Key)
 	if err != nil || len(key) != 32 {
-		return nil, fmt.Errorf("reading %s: native MCP activation key is invalid", path)
+		return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: native MCP activation key is invalid", path)
 	}
 	state.key = append([]byte(nil), key...)
 	for _, activation := range file.Activations {
 		identity := activation.identity()
 		if err := validateNativeMCPActivation(identity); err != nil {
-			return nil, fmt.Errorf("reading %s: %w", path, err)
+			return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: %w", path, err)
 		}
 		recordKey := nativeMCPActivationKey(identity)
 		if _, duplicate := state.records[recordKey]; duplicate {
-			return nil, fmt.Errorf("reading %s: duplicate native MCP activation for %s", path, activation.ID)
+			return nil, nativeMCPStateImage{}, fmt.Errorf("reading %s: duplicate native MCP activation for %s", path, activation.ID)
 		}
 		state.records[recordKey] = activation
 	}
-	return state, nil
+	return state, nativeMCPStateImage{
+		existed: true, mode: finished.Mode(), content: append([]byte(nil), raw...),
+	}, nil
+}
+
+func recoverNativeMCPStatePublication(ctx context.Context, lock *nativeMCPStateFileLock) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if lock == nil {
+		return errors.New("native MCP state publication recovery has no lock authority")
+	}
+	if err := lock.verifyAuthority(); err != nil {
+		return err
+	}
+	if err := checkpoint.RecoverFilePublicationCleanupBound(
+		lock.recoveryPath, lock.directoryPath, lock.recoveryRoot, lock.root,
+	); err != nil {
+		return fmt.Errorf("recovering native MCP state publication: %w", err)
+	}
+	if err := lock.verifyAuthority(); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 func (s *nativeMCPActivationState) NativeMCPActivated(request mcpnative.ActivationRequest) bool {
@@ -454,7 +547,10 @@ func (s *nativeMCPActivationState) mutate(ctx context.Context, apply func(*nativ
 		return s.poisonLocked(err)
 	}
 
-	latest, err := openNativeMCPActivationStateFile(s.path)
+	if err := recoverNativeMCPStatePublication(ctx, lock); err != nil {
+		return s.poisonLocked(err)
+	}
+	latest, before, err := readNativeMCPActivationStateLocked(lock, s.path)
 	if err != nil {
 		return s.poisonLocked(fmt.Errorf("reloading native MCP activation state: %w", err))
 	}
@@ -473,11 +569,19 @@ func (s *nativeMCPActivationState) mutate(ctx context.Context, apply func(*nativ
 		return err
 	}
 	if changed {
-		if err := latest.saveLockedContext(ctx); err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		desired, err := latest.encoded()
+		if err != nil {
+			return err
+		}
+		published, err := publishNativeMCPActivationState(ctx, lock, s.path, before, desired)
+		if err != nil {
+			if !published && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 				return err
 			}
 			return s.poisonLocked(fmt.Errorf("saving native MCP activation state: %w", err))
+		}
+		if !published {
+			return s.poisonLocked(errors.New("saving native MCP activation state returned without publishing"))
 		}
 	}
 	s.adoptLocked(latest)
@@ -537,22 +641,12 @@ func validateNativeMCPActivation(identity mcpnative.ActivationIdentity) error {
 	return nil
 }
 
-func (s *nativeMCPActivationState) saveLocked() error {
-	return s.saveLockedContext(context.Background())
-}
-
-func (s *nativeMCPActivationState) saveLockedContext(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return err
+func (s *nativeMCPActivationState) encoded() ([]byte, error) {
+	if s == nil {
+		return nil, errors.New("native MCP activation state is unavailable")
 	}
 	if len(s.key) != 32 {
-		return errors.New("native MCP activation key is unavailable")
-	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return fmt.Errorf("creating %s: %w", filepath.Dir(s.path), err)
+		return nil, errors.New("native MCP activation key is unavailable")
 	}
 	file := struct {
 		Version     int                         `json:"version"`
@@ -572,32 +666,80 @@ func (s *nativeMCPActivationState) saveLockedContext(ctx context.Context) error 
 		}
 		return left.RealPath < right.RealPath
 	})
-	tmp, err := os.CreateTemp(filepath.Dir(s.path), nativeMCPStateFileName+".*")
+	raw, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
+	if len(raw) >= maxNativeMCPStateBytes {
+		return nil, fmt.Errorf("native MCP activation state exceeds its %d-byte write bound", maxNativeMCPStateBytes)
 	}
-	encoder := json.NewEncoder(tmp)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(file); err != nil {
-		tmp.Close()
-		return err
+	raw = append(raw, '\n')
+	if len(raw) > maxNativeMCPStateBytes {
+		return nil, fmt.Errorf("native MCP activation state exceeds its %d-byte write bound", maxNativeMCPStateBytes)
 	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
+	return raw, nil
+}
+
+func publishNativeMCPActivationState(
+	ctx context.Context,
+	lock *nativeMCPStateFileLock,
+	path string,
+	before nativeMCPStateImage,
+	desired []byte,
+) (published bool, resultErr error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
-	return replaceNativeMCPStateFile(tmp.Name(), s.path)
+	if len(desired) > maxNativeMCPStateBytes {
+		return false, fmt.Errorf("native MCP activation state exceeds its %d-byte write bound", maxNativeMCPStateBytes)
+	}
+	if lock == nil || lock.root == nil || filepath.Clean(path) != filepath.Join(lock.directoryPath, lock.stateLeaf) {
+		return false, errors.New("native MCP state publication has no matching directory capability")
+	}
+	if err := lock.verifyAuthority(); err != nil {
+		return false, err
+	}
+	published, resultErr = checkpoint.PublishStandaloneFileCASBound(
+		ctx,
+		lock.recoveryPath,
+		lock.directoryPath,
+		lock.recoveryRoot,
+		lock.root,
+		path,
+		lock.root,
+		lock.stateLeaf,
+		before.existed,
+		before.mode,
+		before.content,
+		0o600,
+		desired,
+		maxNativeMCPStateBytes,
+		fileprivacy.Secure,
+		nativeMCPStateBeforePublication,
+	)
+	if nativeMCPStateAfterPublication != nil {
+		resultErr = errors.Join(resultErr, nativeMCPStateAfterPublication(published, resultErr))
+	}
+	if resultErr != nil {
+		return published, resultErr
+	}
+	if !published {
+		return false, errors.New("atomic native MCP state publication returned without committing")
+	}
+	if err := lock.verifyAuthority(); err != nil {
+		return true, err
+	}
+	_, after, err := readNativeMCPActivationStateLocked(lock, path)
+	if err != nil {
+		return true, fmt.Errorf("verifying published native MCP activation state: %w", err)
+	}
+	if !after.existed || !bytes.Equal(after.content, desired) {
+		return true, errors.New("published native MCP activation state does not match the selected image")
+	}
+	return true, nil
 }
 
 func requireNativeMCPJSONEOF(decoder *json.Decoder) error {

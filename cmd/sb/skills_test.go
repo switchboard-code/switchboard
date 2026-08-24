@@ -14,7 +14,7 @@ import (
 // build without the feature: the definitions sit in the frozen zone, and a
 // tool that appears for everyone would move every user's cached prefix.
 func TestNoSkillsLeavesTheSchemasByteIdentical(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	isolateTestHome(t, t.TempDir())
 	ws := t.TempDir()
 
 	bare, err := tools.NewRegistry(ws, execution.Capability{})
@@ -44,7 +44,7 @@ func TestNoSkillsLeavesTheSchemasByteIdentical(t *testing.T) {
 }
 
 func TestSkillsJoinTheSuiteWhenDefined(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	isolateTestHome(t, t.TempDir())
 	ws := t.TempDir()
 	dir := filepath.Join(ws, ".switchboard", "skills")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -69,7 +69,7 @@ func TestSkillsJoinTheSuiteWhenDefined(t *testing.T) {
 }
 
 func TestManualOnlySkillsStayInInventoryWithoutChangingSchemas(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	isolateTestHome(t, t.TempDir())
 	ws := t.TempDir()
 	dir := filepath.Join(ws, ".agents", "skills", "deploy")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

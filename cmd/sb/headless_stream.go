@@ -75,6 +75,19 @@ func newStreamObserver(w io.Writer, inner agent.Observer) *streamObserver {
 	return &streamObserver{inner: inner, w: w, enc: enc}
 }
 
+// selectPlainObserver is the one output-mode switch for a headless/REPL
+// surface. The routing watcher must wrap what this returns: wrapping the raw
+// renderer instead would overwrite stream-json after its init line and drop
+// every typed live event.
+func selectPlainObserver(output string, w io.Writer, inner agent.Observer, sessionID, tier, target, mode string) agent.Observer {
+	if output != "stream-json" {
+		return inner
+	}
+	stream := newStreamObserver(w, inner)
+	stream.writeStreamInit(sessionID, tier, target, mode)
+	return stream
+}
+
 // emit is the only writer. Tool callbacks may be concurrent when a batch is
 // parallel-safe, and two events interleaved mid-line would produce output no
 // consumer can parse.

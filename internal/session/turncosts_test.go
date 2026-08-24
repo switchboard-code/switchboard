@@ -99,3 +99,48 @@ func TestTurnCostReaderRejectsTokenOverflow(t *testing.T) {
 		t.Fatalf("turn token overflow was accepted: %v", err)
 	}
 }
+
+func TestTurnCostsWithholdLegacyExpansionAndIgnoreMachineUserRoles(t *testing.T) {
+	store, workspace := newStore(t)
+	sess, err := store.Create(workspace, "test/local/model", "rev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	const expanded = "inspect @private.env\nEXPANDED_FILE_BYTES"
+	legacy := provider.Message{Role: provider.RoleUser, Content: []provider.Block{provider.Text{Text: expanded}}}
+	injected := provider.Message{Role: provider.RoleUser, Injected: true, Content: []provider.Block{
+		provider.Text{Text: "[watch] INJECTED_TOOL_OUTPUT"},
+	}}
+	toolCarrier := provider.Message{Role: provider.RoleUser, Content: []provider.Block{
+		provider.ToolResult{ToolUseID: "read-1", Name: "read", Content: "TOOL_RESULT_BYTES"},
+	}}
+	for _, message := range []provider.Message{legacy, injected, toolCarrier} {
+		if err := sess.AppendMessage(message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := sess.AppendUsage(Usage{Purpose: UsagePurposeTurn, CostMicroUSD: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AppendMessage(provider.UserText("modern authored ask")); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AppendUsage(Usage{Purpose: UsagePurposeTurn, CostMicroUSD: 50}); err != nil {
+		t.Fatal(err)
+	}
+
+	turns, err := ReadTurnCosts(sess.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 2 {
+		t.Fatalf("machine-role messages opened turns: %+v", turns)
+	}
+	if turns[0].Prompt != "" || turns[0].PromptAuthoredKnown || turns[0].PromptSynthetic {
+		t.Fatalf("legacy expanded prompt escaped provenance boundary: %+v", turns[0])
+	}
+	if turns[1].Prompt != "modern authored ask" || !turns[1].PromptAuthoredKnown || turns[1].PromptSynthetic {
+		t.Fatalf("modern authored prompt lost provenance: %+v", turns[1])
+	}
+}

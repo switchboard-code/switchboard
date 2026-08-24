@@ -48,6 +48,39 @@ func drain(t *testing.T, s provider.EventStream) ([]provider.Event, error) {
 	}
 }
 
+func TestBuildRequestEmitsOnlyAnExplicitMaxTokens(t *testing.T) {
+	c, err := New("generic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decode := func(target provider.RouteTarget) *int {
+		t.Helper()
+		raw, err := c.buildRequest(target, provider.Request{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wire struct {
+			MaxTokens *int `json:"max_tokens"`
+		}
+		if err := json.Unmarshal(raw, &wire); err != nil {
+			t.Fatal(err)
+		}
+		return wire.MaxTokens
+	}
+
+	target, err := Target("generic", "custom")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decode(target); got != nil {
+		t.Fatalf("omitted max output emitted max_tokens=%d", *got)
+	}
+	target.Params.MaxOutputTokens = 4_096
+	if got := decode(target); got == nil || *got != 4_096 {
+		t.Fatalf("explicit max output emitted max_tokens=%v, want 4096", got)
+	}
+}
+
 func target(t *testing.T, model string) provider.RouteTarget {
 	t.Helper()
 	tgt, err := Target("ollama", model)
@@ -299,6 +332,29 @@ func TestNestedErrorShapeIsUnwrapped(t *testing.T) {
 	}
 }
 
+func TestHTTPErrorCredentialBodyIsRedactedBeforeItsCap(t *testing.T) {
+	token := "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for name, body := range map[string]string{
+		"complete":       `{"error":{"message":"rejected ` + token + `"}}`,
+		"cross-boundary": strings.Repeat("x", provider.MaxAPIErrorBodyBytes-len(token)+1) + token,
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := serve(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, body)
+			})
+			_, err := c.Stream(context.Background(), target(t, "m"), provider.Request{})
+			var apiErr *provider.APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("err = %v, want APIError", err)
+			}
+			if strings.Contains(apiErr.Body, token) || strings.Contains(apiErr.Body, "ghp_") {
+				t.Fatalf("API error body exposed a credential fragment: %q", apiErr.Body)
+			}
+		})
+	}
+}
+
 func TestBuildRequestShape(t *testing.T) {
 	c, err := New("ollama")
 	if err != nil {
@@ -360,6 +416,46 @@ func TestBuildRequestShape(t *testing.T) {
 	}
 	if got.StreamOptions == nil || !got.StreamOptions.IncludeUsage {
 		t.Error("the ollama profile reports stream usage, so it must be requested")
+	}
+}
+
+func TestReplayExcludesIncompleteAssistantFromCompatibleWireAndEstimate(t *testing.T) {
+	const partial = "PARTIAL MUST NOT REPLAY"
+	base := provider.Request{Messages: []provider.Message{
+		provider.UserText("before"),
+		provider.UserText("after"),
+	}}
+	withPartial := base
+	withPartial.Messages = []provider.Message{
+		base.Messages[0],
+		{Role: provider.RoleAssistant, Incomplete: true, Content: []provider.Block{provider.Text{Text: partial}}},
+		base.Messages[1],
+	}
+	client, err := New("ollama")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := target(t, "m")
+	body, err := client.buildRequest(target, withPartial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), partial) {
+		t.Fatalf("incomplete assistant reached compatible wire:\n%s", body)
+	}
+	if !strings.Contains(string(body), "before") || !strings.Contains(string(body), "after") {
+		t.Fatalf("projection removed surrounding durable messages:\n%s", body)
+	}
+	got, err := client.CountTokens(context.Background(), target, withPartial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := client.CountTokens(context.Background(), target, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("estimate with partial = %+v, want %+v", got, want)
 	}
 }
 
@@ -487,6 +583,35 @@ func TestModelsListsWhatTheServerServes(t *testing.T) {
 	if len(names) != 2 || names[0] != "qwen3:8b" || names[1] != "llama3.2" {
 		t.Fatalf("Models() = %v, want the server's two ids in order", names)
 	}
+}
+
+func TestModelsBoundsBodyAndRejectsUnsafeIDs(t *testing.T) {
+	clientFor := func(t *testing.T, body string) *Client {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, body)
+		}))
+		t.Cleanup(srv.Close)
+		c, err := New("generic", WithBaseURL(srv.URL))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+
+	t.Run("oversize body", func(t *testing.T) {
+		c := clientFor(t, strings.Repeat(" ", provider.MaxProviderJSONBodyBytes+1))
+		if _, err := c.Models(context.Background()); err == nil || !strings.Contains(err.Error(), "response limit") {
+			t.Fatalf("err = %v, want response-limit refusal", err)
+		}
+	})
+
+	t.Run("terminal control id", func(t *testing.T) {
+		c := clientFor(t, `{"data":[{"id":"model\nspoof"}]}`)
+		if _, err := c.Models(context.Background()); err == nil || !strings.Contains(err.Error(), "control") {
+			t.Fatalf("err = %v, want unsafe model-ID refusal", err)
+		}
+	})
 }
 
 // A profile with no address has not been configured, and the message has to

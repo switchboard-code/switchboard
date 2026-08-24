@@ -57,6 +57,7 @@ func (c *Cache) plan(system []provider.Block, tools []provider.ToolDefinition, m
 	if c == nil || c.Manager == nil {
 		return nil
 	}
+	messages = provider.ReplayRequest(provider.Request{Messages: messages}).Messages
 
 	layout := cacheLayout(system, tools, messages)
 
@@ -98,6 +99,7 @@ func (c *Cache) Predict(system []provider.Block, tools []provider.ToolDefinition
 	if c == nil || c.Tracker == nil || c.Manager == nil {
 		return cachestate.Expectation{}, false
 	}
+	messages = provider.ReplayRequest(provider.Request{Messages: messages}).Messages
 	hash := cacheLayout(system, tools, messages).PrefixHash()
 	if hash == "" {
 		return cachestate.Expectation{}, false

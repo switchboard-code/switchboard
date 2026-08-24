@@ -8,31 +8,104 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: test / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - run: go build ./... && go vet ./... && go test ./...
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  race:
+    name: race / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
 
   release:
-    needs: test
+    needs: [test, race]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - name: Build and package
+        id: package
         run: |
-          set -eu
+          set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ${#tag} -gt 128 || ! "$tag" =~ $semver ]]; then
+            echo "release tag is not a canonical semantic version: $tag" >&2
+            exit 1
+          fi
+          tag_without_build="${tag%%+*}"
+          core="${tag_without_build%%-*}"
+          IFS=. read -r major minor patch <<< "${core#v}"
+          for component in "$major" "$minor" "$patch"; do
+            if [[ ${#component} -gt 20 || ( ${#component} -eq 20 && "x$component" > x18446744073709551615 ) ]]; then
+              echo "release version component exceeds the supported uint64 range: $tag" >&2
+              exit 1
+            fi
+          done
+          prerelease=false
+          if [[ "$tag_without_build" == *-* ]]; then
+            prerelease=true
+            prerelease_value="${tag_without_build#*-}"
+            IFS=. read -r -a identifiers <<< "$prerelease_value"
+            for identifier in "${identifiers[@]}"; do
+              if [[ "$identifier" =~ ^[0-9]+$ && ${#identifier} -gt 1 && "$identifier" == 0* ]]; then
+                echo "numeric prerelease identifiers must not have a leading zero: $tag" >&2
+                exit 1
+              fi
+            done
+          fi
           ver="${tag#v}"
+          notes="docs/release-${ver}.md"
+          if [[ "$ver" =~ ^[0-9]+\.[0-9]+\.0$ && ! -f "$notes" ]]; then
+            notes="docs/release-${ver%.*}.md"
+          fi
+          if [[ ! -f "$notes" ]]; then
+            echo "missing release notes for $tag (expected docs/release-${ver}.md)" >&2
+            exit 1
+          fi
+          echo "notes_path=$notes" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           mkdir -p dist
           for target in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64 windows_amd64 windows_arm64; do
             os="${target%_*}"
@@ -42,10 +115,36 @@ jobs:
             echo "building $os/$arch"
             CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
               -ldflags "-s -w -X main.version=$tag" -o "dist/$bin" ./cmd/sb
-            (cd dist && tar -czf "sb_${ver}_${os}_${arch}.tar.gz" "$bin" && rm "$bin")
+            binary_size=$(wc -c < "dist/$bin")
+            if [[ $binary_size -le 0 || $binary_size -gt 268435456 ]]; then
+              echo "$os/$arch binary size $binary_size is outside the updater's 1..268435456-byte bound" >&2
+              exit 1
+            fi
+            archive="sb_${ver}_${os}_${arch}.tar.gz"
+            (cd dist && tar --sort=name --mtime='UTC 1970-01-01' \
+              --owner=0 --group=0 --numeric-owner -cf - "$bin" | gzip -n > "$archive" && rm "$bin")
+            archive_size=$(wc -c < "dist/$archive")
+            if [[ $archive_size -le 0 || $archive_size -gt 134217728 ]]; then
+              echo "$archive size $archive_size is outside the updater's 1..134217728-byte bound" >&2
+              exit 1
+            fi
+            members=$(tar -tzf "dist/$archive")
+            if [[ "$members" != "$bin" ]]; then
+              echo "$archive does not contain exactly one member named $bin" >&2
+              exit 1
+            fi
           done
-          (cd dist && sha256sum -- *.tar.gz > checksums.txt)
-      - uses: softprops/action-gh-release@v3
+          (cd dist && sha256sum -- *.tar.gz > checksums.txt && sha256sum --check checksums.txt)
+          asset_count=$(find dist -maxdepth 1 -type f | wc -l)
+          if [[ $asset_count -ne 7 ]]; then
+            echo "release packaging produced $asset_count files; expected six archives and checksums.txt" >&2
+            exit 1
+          fi
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: dist/*
+          body_path: ${{ steps.package.outputs.notes_path }}
           generate_release_notes: true
+          prerelease: ${{ steps.package.outputs.prerelease }}
+          fail_on_unmatched_files: true
+          overwrite_files: false

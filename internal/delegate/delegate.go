@@ -33,12 +33,14 @@ import (
 // subagent stuck in a retry cycle has no user watching to interrupt it.
 const MaxRounds = 25
 
-// Preamble is appended to the subagent's system blocks. It states the one
-// fact a fresh context cannot know: that only the final message survives.
+// Preamble is appended to the subagent's system blocks during assembly. The
+// Runner adds RuntimeContract after every assembled block; keeping the short
+// role description separate lets the final contract remain last even when a
+// named agent contributes standing instructions.
 const Preamble = "You are a delegated subagent. Complete the task you are given and reply " +
-	"with your findings. Your final message is returned verbatim to the agent that " +
-	"delegated the task, and nothing else you produce survives, so put everything " +
-	"that matters in it."
+	"with your findings. Your final message becomes the evidence report returned to " +
+	"the agent that delegated the task after credential redaction and trust-boundary " +
+	"framing. Only that report normally returns, so put everything that matters in it."
 
 // Config wires a delegate tool to the session's machinery. Every closure is
 // supplied by the surface (cmd/sb), because building a provider client, a
@@ -106,12 +108,77 @@ func New(c Config) (tools.Tool, error) {
 	if c.Probe == nil || c.NewSession == nil || c.NewLoop == nil {
 		return nil, fmt.Errorf("delegate is missing assembly wiring")
 	}
+	agents, err := prepareConfiguredAgents(c.Agents)
+	if err != nil {
+		return nil, err
+	}
+	c.Agents = agents
 	manager := c.Tasks
 	if manager == nil {
 		manager = NewTaskManager(DefaultMaxParallel)
 	}
 	c.Tasks = manager
 	return &delegateTool{c: c, tasks: manager, runner: NewRunner(c)}, nil
+}
+
+func prepareConfiguredAgents(input []Agent) ([]Agent, error) {
+	agents := append([]Agent(nil), input...)
+	seen := make(map[string]bool, len(agents))
+	for i := range agents {
+		agent := &agents[i]
+		if agent.Name == "" {
+			return nil, fmt.Errorf("delegate agent has an empty name")
+		}
+		if len(agent.Name) > maxAgentNameBytes {
+			return nil, fmt.Errorf("delegate agent name exceeds the %d-byte limit", maxAgentNameBytes)
+		}
+		if err := validateAgentMetadata("name", agent.Name); err != nil {
+			return nil, err
+		}
+		if redactCrossAgent(agent.Name) != agent.Name {
+			return nil, fmt.Errorf("delegate agent name contains credential-like text")
+		}
+		if seen[agent.Name] {
+			return nil, fmt.Errorf("delegate agent name %q is ambiguous", agent.Name)
+		}
+		seen[agent.Name] = true
+		if redactCrossAgent(agent.Tier) != agent.Tier {
+			return nil, fmt.Errorf("delegate agent tier contains credential-like text")
+		}
+		if len(agent.Tier) > maxAgentTierBytes {
+			return nil, fmt.Errorf("delegate agent tier exceeds the %d-byte limit", maxAgentTierBytes)
+		}
+		if err := validateAgentMetadata("tier", agent.Tier); err != nil {
+			return nil, err
+		}
+		if len(agent.Tools) > maxAgentTools {
+			return nil, fmt.Errorf("delegate agent tool grant exceeds the %d-tool limit", maxAgentTools)
+		}
+		agent.Tools = append([]string(nil), agent.Tools...)
+		for _, name := range agent.Tools {
+			if redactCrossAgent(name) != name {
+				return nil, fmt.Errorf("delegate agent tool grant contains credential-like text")
+			}
+			if err := validateAgentMetadata("tool grant", name); err != nil {
+				return nil, err
+			}
+		}
+		agent.Description = redactCrossAgent(agent.Description)
+		if len(agent.Description) > maxAgentDescriptionBytes {
+			return nil, fmt.Errorf("delegate agent description exceeds the %d-byte limit", maxAgentDescriptionBytes)
+		}
+		if err := validateAgentMetadata("description", agent.Description); err != nil {
+			return nil, err
+		}
+		if int64(len(agent.Prompt)) > maxAgentDefinitionBytes {
+			return nil, fmt.Errorf("delegate agent prompt exceeds the %d-byte limit", maxAgentDefinitionBytes)
+		}
+		if err := validateAgentDocument(agent.Prompt); err != nil {
+			return nil, err
+		}
+		agent.Prompt = redactCrossAgent(agent.Prompt)
+	}
+	return agents, nil
 }
 
 type delegateTool struct {
@@ -142,12 +209,12 @@ func (t *delegateTool) Description() string {
 	b.WriteString(" Named agents carry standing instructions and their own default rung and " +
 		"tool grant; pass one as agent when its charter fits the subtask:")
 	for _, ag := range t.c.Agents {
-		fmt.Fprintf(&b, "\n- %s", ag.Name)
+		fmt.Fprintf(&b, "\n- %s", redactCrossAgent(ag.Name))
 		if ag.Description != "" {
-			fmt.Fprintf(&b, ": %s", ag.Description)
+			fmt.Fprintf(&b, ": %s", redactCrossAgent(ag.Description))
 		}
 		if ag.Tier != "" {
-			fmt.Fprintf(&b, " (runs on %s)", ag.Tier)
+			fmt.Fprintf(&b, " (runs on %s)", redactCrossAgent(ag.Tier))
 		}
 	}
 	return b.String()
@@ -210,7 +277,10 @@ func (t *delegateTool) Plan(input json.RawMessage) (tools.Plan, error) {
 	// Spawning is free and touches nothing; every call the subagent then
 	// makes goes through the shared permission engine on its own merits, so
 	// the spawn itself carries the read effect.
-	summary := in.Task
+	// The permission detail and /tasks row are parent-facing renderings of a
+	// child handoff. Keep a key-shaped value out of both even though the full
+	// tool call remains in the primary session record.
+	summary := redactCrossAgent(in.Task)
 	if runes := []rune(summary); len(runes) > 80 {
 		summary = string(runes[:80]) + "…"
 	}
@@ -230,8 +300,9 @@ func (t *delegateTool) Plan(input json.RawMessage) (tools.Plan, error) {
 	}, nil
 }
 
-// finalText is the last complete assistant message's text, which the
-// preamble told the subagent is the part that survives.
+// finalText is the last complete assistant message's text, which the preamble
+// told the subagent becomes its report. The full text stays in this state;
+// redaction and framing happen only on the copy handed back to the parent.
 func finalText(state session.State) string {
 	for i := len(state.Messages) - 1; i >= 0; i-- {
 		m := state.Messages[i]

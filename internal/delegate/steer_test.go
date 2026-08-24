@@ -83,6 +83,25 @@ func TestSteerReachesARunningTaskAtItsNextRound(t *testing.T) {
 	}
 }
 
+func TestSteerRedactsBeforeItCrossesIntoTheChildSession(t *testing.T) {
+	m := NewTaskManager(1)
+	handle, finish := running(t, m, "scout")
+	defer finish()
+	if err := m.Steer(handle.id, "inspect with "+boundaryTestToken); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs := handle.injectSteering()
+	if len(msgs) != 1 {
+		t.Fatalf("drained %d steers, want one", len(msgs))
+	}
+	got := messageText(msgs[0])
+	if strings.Contains(got, boundaryTestToken) ||
+		!strings.Contains(got, "[redacted: a GitHub token]") {
+		t.Fatalf("steer crossed the child boundary unsafely: %q", got)
+	}
+}
+
 // Accepting a message nothing will read is worse than refusing it.
 func TestSteerRefusesAFinishedTask(t *testing.T) {
 	m := NewTaskManager(1)
@@ -98,6 +117,38 @@ func TestSteerRefusesAFinishedTask(t *testing.T) {
 
 	if err := m.Steer(id, "too late"); err == nil {
 		t.Fatal("steering a finished task was accepted")
+	}
+}
+
+func TestSteerRefusesTaskAfterCancelLinearizes(t *testing.T) {
+	m := NewTaskManager(1)
+	handle, finish := running(t, m, "scout")
+	finished := false
+	defer func() {
+		if !finished {
+			finish()
+		}
+	}()
+
+	if err := m.Cancel(handle.id); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Steer(handle.id, "too late"); err == nil || !strings.Contains(err.Error(), string(TaskCanceling)) {
+		t.Fatalf("steer after cancel error = %v", err)
+	}
+	snap := snapshotFor(t, m, handle.id)
+	if snap.Status != TaskCanceling || snap.SteersSent != 0 || snap.SteersApplied != 0 {
+		t.Fatalf("canceling task accepted steer state: %+v", snap)
+	}
+	if pending := handle.injectSteering(); len(pending) != 0 {
+		t.Fatalf("canceling task retained steer messages: %+v", pending)
+	}
+
+	finish()
+	finished = true
+	snap = snapshotFor(t, m, handle.id)
+	if snap.Status != TaskCanceled || snap.Error != context.Canceled.Error() || snap.SteersSent != 0 {
+		t.Fatalf("canceled task terminal state = %+v", snap)
 	}
 }
 

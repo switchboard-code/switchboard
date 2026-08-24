@@ -27,12 +27,11 @@ func cmdRouting(m *tuiModel, args string) tea.Cmd {
 }
 
 func (m *tuiModel) setRouting(on bool) tea.Cmd {
+	if err := m.app.config.SetRouteAutoAndSave(on); err != nil {
+		return noticeCmd("error", "saving the routing setting failed: "+err.Error())
+	}
 	if m.app.watcher != nil {
 		m.app.watcher.setPaused(!on)
-	}
-	m.app.config.RouteAuto = &on
-	if err := m.app.config.Save(); err != nil {
-		return noticeCmd("error", "saving the routing setting failed: "+err.Error())
 	}
 	if on {
 		return noticeCmd("", "routing on: the policy may move the primary on its own signals, and every move says why")

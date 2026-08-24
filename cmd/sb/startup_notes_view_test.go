@@ -46,6 +46,16 @@ func TestStartupNoteFloodKeepsSmallTUIUsable(t *testing.T) {
 	}
 }
 
+func TestStartupNotesViewHonorsTinyPhysicalViewport(t *testing.T) {
+	v := newStartupNotesView(startupNoteReport{Details: []mcpNote{{text: strings.Repeat("界", 20)}}})
+	for _, width := range []int{1, 2, 10} {
+		for _, height := range []int{1, 2} {
+			view := v.view(width, height, darkTheme())
+			assertTUIViewBounds(t, view, width, height)
+		}
+	}
+}
+
 func TestDoctorExtensionsOpensEveryOrderedSanitizedDetail(t *testing.T) {
 	m := testModel(t)
 	input := []mcpNote{

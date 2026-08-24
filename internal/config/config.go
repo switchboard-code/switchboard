@@ -10,8 +10,10 @@ package config
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,7 +45,8 @@ type Tier struct {
 	// its primary cannot be reached (§5.4). Every entry was written into the
 	// config by the user, which is what makes each an approved destination;
 	// the substitution still renders before content is sent. Entries use the
-	// provider's default serving surface.
+	// provider's default serving surface. A tier's max_output is rung policy,
+	// so every fallback carries the same concrete output cap as the primary.
 	Fallbacks []provider.RouteTarget
 }
 
@@ -76,7 +79,8 @@ type Config struct {
 
 	// UpdateAuto installs a newer release in the background when the startup
 	// check finds one, leaving the running process alone; the new binary runs
-	// on the next start. Default on. Installs owned by a package manager are
+	// on the next start. Default off: release checks only show a notice unless
+	// the user explicitly opts in. Installs owned by a package manager are
 	// detected and never touched regardless of this setting (§18).
 	UpdateAuto bool
 
@@ -166,6 +170,53 @@ type Config struct {
 	mainTiers     []Tier
 
 	Path string
+}
+
+// Snapshot returns a deep, independently readable copy of the effective
+// configuration. TUI discovery runs off the event-loop goroutine; handing it
+// the live maps and tier slices would race a later /setup or /models write even
+// when the stale UI result itself is rejected.
+func (c *Config) Snapshot() *Config {
+	if c == nil {
+		return nil
+	}
+	out := *c
+	out.Tiers = cloneTiers(c.Tiers)
+	out.mainTiers = cloneTiers(c.mainTiers)
+	out.Slots = maps.Clone(c.Slots)
+	out.Providers = maps.Clone(c.Providers)
+	out.Permissions = slices.Clone(c.Permissions)
+	for i := range out.Permissions {
+		out.Permissions[i].ArgvPrefix = slices.Clone(c.Permissions[i].ArgvPrefix)
+		if c.Permissions[i].Shell != nil {
+			value := *c.Permissions[i].Shell
+			out.Permissions[i].Shell = &value
+		}
+	}
+	out.Destinations = slices.Clone(c.Destinations)
+	out.Auth = make(map[string]credential.Settings, len(c.Auth))
+	for name, settings := range c.Auth {
+		settings.Helper = slices.Clone(settings.Helper)
+		settings.OAuth.Scopes = slices.Clone(settings.OAuth.Scopes)
+		settings.OAuth.ExtraAuthParams = maps.Clone(settings.OAuth.ExtraAuthParams)
+		out.Auth[name] = settings
+	}
+	out.Profiles = make(map[string][]Tier, len(c.Profiles))
+	for name, tiers := range c.Profiles {
+		out.Profiles[name] = cloneTiers(tiers)
+	}
+	out.RouteAuto = cloneBool(c.RouteAuto)
+	out.Notify = cloneBool(c.Notify)
+	out.Mouse = cloneBool(c.Mouse)
+	return &out
+}
+
+func cloneBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 // ApplyProfile swaps the active ladder for the named profile's. Launch time
@@ -372,8 +423,8 @@ type uiEntry struct {
 	Mouse  *bool  `toml:"mouse,omitempty"`
 }
 
-// updatesEntry holds the update settings. Booleans are *bool so "absent" and
-// "explicitly off" are different facts: the defaults are on.
+// updatesEntry holds the update settings. Booleans are *bool because the
+// release check defaults on while automatic installation defaults off.
 type updatesEntry struct {
 	Check   *bool  `toml:"check,omitempty"`
 	Auto    *bool  `toml:"auto,omitempty"`
@@ -418,11 +469,12 @@ type oauthEntry struct {
 }
 
 type tierEntry struct {
-	Label    string   `toml:"label,omitempty"`
-	Model    string   `toml:"model"`
-	Surface  string   `toml:"surface,omitempty"`
-	Effort   string   `toml:"effort,omitempty"`
-	Fallback []string `toml:"fallback,omitempty"`
+	Label     string   `toml:"label,omitempty"`
+	Model     string   `toml:"model"`
+	Surface   string   `toml:"surface,omitempty"`
+	Effort    string   `toml:"effort,omitempty"`
+	MaxOutput *int     `toml:"max_output,omitempty"`
+	Fallback  []string `toml:"fallback,omitempty"`
 }
 
 // Load reads the user's configuration. A missing file is not an error: the
@@ -435,7 +487,7 @@ func Load() (*Config, error) {
 			Auth:             map[string]credential.Settings{},
 			Providers:        map[string]ProviderSettings{},
 			UpdateCheck:      true,
-			UpdateAuto:       true,
+			UpdateAuto:       false,
 			CompactAuto:      true,
 			CompactAtPercent: 85,
 			Sandbox:          execution.SandboxOff,
@@ -450,20 +502,22 @@ func LoadFile(path string) (*Config, error) {
 		Auth:             map[string]credential.Settings{},
 		Providers:        map[string]ProviderSettings{},
 		UpdateCheck:      true,
-		UpdateAuto:       true,
+		UpdateAuto:       false,
 		CompactAuto:      true,
 		CompactAtPercent: 85,
 		Sandbox:          execution.SandboxOff,
 		Path:             path,
 	}
 
-	data, err := os.ReadFile(path)
+	read, found, err := readConfigBytes(path)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return c, nil
-		}
-		return nil, fmt.Errorf("reading %s: %w", path, err)
+		return nil, err
 	}
+	if !found {
+		return c, nil
+	}
+	defer read.Close()
+	data := read.data
 
 	var f file
 	meta, err := toml.Decode(string(data), &f)
@@ -579,6 +633,9 @@ func LoadFile(path string) (*Config, error) {
 			c.Profiles[name] = ladder
 		}
 	}
+	if err := read.Verify(); err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 
@@ -619,16 +676,25 @@ func buildTierList(entries map[string]tierEntry, path, where string) ([]Tier, er
 	var tiers []Tier
 	for _, id := range ids {
 		entry := entries[id]
+		maxOutput := 0
+		if entry.MaxOutput != nil {
+			if *entry.MaxOutput <= 0 {
+				return nil, fmt.Errorf("%s: %stier %s max_output %d must be positive", path, where, id, *entry.MaxOutput)
+			}
+			maxOutput = *entry.MaxOutput
+		}
 		target, err := ParseTarget(entry.Model, entry.Surface, entry.Effort)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %stier %s: %w", path, where, id, err)
 		}
+		target.Params.MaxOutputTokens = maxOutput
 		tier := Tier{ID: id, Label: entry.Label, Target: target}
 		for _, ref := range entry.Fallback {
 			fb, err := ParseTarget(ref, "", "")
 			if err != nil {
 				return nil, fmt.Errorf("%s: %stier %s fallback: %w", path, where, id, err)
 			}
+			fb.Params.MaxOutputTokens = maxOutput
 			tier.Fallbacks = append(tier.Fallbacks, fb)
 		}
 		tiers = append(tiers, tier)
@@ -681,8 +747,11 @@ func ParseTarget(ref, surface, effort string) (provider.RouteTarget, error) {
 
 	providerName, model, ok := strings.Cut(ref, "/")
 	if !ok || model == "" {
-		return provider.RouteTarget{}, fmt.Errorf(
-			"model %q must be written as provider/model, for example ollama/qwen3.5:9b-mlx", ref)
+		return provider.RouteTarget{}, errors.New(
+			"model must be written as provider/model, for example ollama/qwen3.5:9b-mlx")
+	}
+	if err := provider.ValidateModelID(model); err != nil {
+		return provider.RouteTarget{}, err
 	}
 
 	if surface == "" {

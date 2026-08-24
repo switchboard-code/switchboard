@@ -10,10 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"os"
 )
 
 type AccountingCharge struct {
@@ -51,7 +48,7 @@ func legacyAccountingID(kind string, rec Record) string {
 // identity exists only for pre-CallID logs and stays stable when a fork copies
 // the record byte-for-byte.
 func ReadAccountingLedger(path string) (AccountingLedger, error) {
-	f, err := os.Open(path)
+	f, err := openPublishedLog(path)
 	if err != nil {
 		return AccountingLedger{}, err
 	}
@@ -63,9 +60,11 @@ func ReadAccountingLedger(path string) (AccountingLedger, error) {
 
 	var out AccountingLedger
 	attempts := make(map[string]accountingAttempt)
+	lastSeq := 0
+	budget := newReplayBudget(defaultReplayLimits, len(magic)+4)
 	for {
-		rec, _, err := decodeRecord(r)
-		if errors.Is(err, io.EOF) || errors.Is(err, ErrCorruptRecord) {
+		rec, _, err := budget.decode(r, &lastSeq)
+		if isRecoverableRecordEnd(err) {
 			break
 		}
 		if err != nil {

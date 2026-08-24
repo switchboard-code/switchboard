@@ -32,6 +32,18 @@ func (a *tuiApp) publishOccupancy(tokens, window int) {
 	a.pressureTokens, a.pressureWindow = tokens, window
 }
 
+// resetPressureSession drops the occupancy and one-shot warning owned by the
+// session being left. Every adopted log has its own request history, including
+// a compacted log: carrying the old token count can warn immediately in a
+// fresh context, while carrying warned can suppress this session's warning.
+func (a *tuiApp) resetPressureSession() {
+	a.pressureMu.Lock()
+	defer a.pressureMu.Unlock()
+	a.pressureTokens = 0
+	a.pressureWindow = 0
+	a.pressureWarned = false
+}
+
 func (a *tuiApp) pressureRound() []provider.Message {
 	a.pressureMu.Lock()
 	tokens, window, warned := a.pressureTokens, a.pressureWindow, a.pressureWarned

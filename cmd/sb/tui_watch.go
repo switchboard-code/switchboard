@@ -19,7 +19,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -27,7 +26,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/switchboard-code/switchboard/internal/credential"
 	"github.com/switchboard-code/switchboard/internal/provider"
 	"github.com/switchboard-code/switchboard/internal/watch"
 )
@@ -42,6 +40,89 @@ type watchReportMsg struct {
 	command string
 	rep     watch.Report
 	turnEnd bool
+	ticket  watchRunTicket
+}
+
+// turnEndWatchDoneMsg is the exclusive-operation completion fence around a
+// final verifier run. report is populated by direct/test programs; the real
+// Bubble Tea program receives the report through Program.Send before this
+// completion, which preserves fold-before-continuation ordering.
+type turnEndWatchDoneMsg struct {
+	operation           uint64
+	sourceID            string
+	suppressAutoCompact bool
+	report              tea.Msg
+}
+
+// watchRunTicket binds one verifier execution to the conversation and exact
+// /watch declaration that launched it. The session epoch is carried only by
+// swaps that explicitly continue the same conversation (compaction and a kept
+// race arm); every other committed adoption invalidates it.
+type watchRunTicket struct {
+	sourceSessionID string
+	sessionEpoch    uint64
+	turnGeneration  int
+	invocation      uint64
+	pending         int
+	watch           *watch.Watch
+	sequence        *watchRunSequence
+}
+
+// watchRunSequence is one link in a declaration-local FIFO. A turn-end run is
+// asynchronous, so the next turn can otherwise finish a newer verifier run
+// first and let the old observation regress Watch's delta baseline. The link
+// is carried by value with the ticket; the once keeps every cancellation and
+// stale-result path safe to finish.
+type watchRunSequence struct {
+	previous    <-chan struct{}
+	invalidated <-chan struct{}
+	done        chan struct{}
+	once        sync.Once
+}
+
+func (s *watchRunSequence) wait(ctx context.Context) bool {
+	if s == nil {
+		return false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	if s.invalidated != nil {
+		select {
+		case <-s.invalidated:
+			return false
+		default:
+		}
+	}
+	if s.previous != nil {
+		select {
+		case <-s.previous:
+		case <-ctx.Done():
+			return false
+		case <-s.invalidated:
+			return false
+		}
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	if s.invalidated != nil {
+		select {
+		case <-s.invalidated:
+			return false
+		default:
+		}
+	}
+	return true
+}
+
+func (s *watchRunSequence) finish() {
+	if s != nil {
+		s.once.Do(func() { close(s.done) })
+	}
 }
 
 // watchState is the mutable half of the feature, guarded because the loop's
@@ -61,6 +142,20 @@ type watchState struct {
 	lastPending int
 	gen         int
 
+	// epoch and sessionSources are the conversation ownership stamp for a run.
+	// invocation distinguishes individual executions, while watch identifies
+	// the exact declaration so /watch off or a re-arm invalidates old work.
+	epoch          uint64
+	nextInvocation uint64
+	lastCommitted  uint64
+	lastDelivered  uint64
+	turnSessionID  string
+	currentSession string
+	sessionSources map[string]struct{}
+	pendingCancels map[uint64]context.CancelFunc
+	runTail        <-chan struct{}
+	runInvalidated chan struct{}
+
 	// fold holds turn-end reports for the next prompt, the seam advice and
 	// ! output already use: one user message per turn.
 	fold []string
@@ -69,6 +164,7 @@ type watchState struct {
 func (ws *watchState) arm(w *watch.Watch) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
+	ws.invalidateRunsLocked()
 	ws.w = w
 	ws.lastPending = 0
 	ws.fold = nil
@@ -78,6 +174,7 @@ func (ws *watchState) disarm() *watch.Watch {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	w := ws.w
+	ws.invalidateRunsLocked()
 	ws.w = nil
 	ws.fold = nil
 	return w
@@ -92,40 +189,250 @@ func (ws *watchState) armed() *watch.Watch {
 // beginTurn resets the per-turn counter alongside the recorder's new scope
 // and remembers the turn's context, so an interrupted turn interrupts a
 // mid-turn verifier run with it.
-func (ws *watchState) beginTurn(ctx context.Context) {
+func (ws *watchState) beginTurn(ctx context.Context, sessionID string) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
+	if ws.epoch == 0 {
+		ws.epoch = 1
+	}
+	if ws.sessionSources == nil {
+		ws.sessionSources = make(map[string]struct{})
+	}
+	// A direct binding change that did not pass the normal adoption seam still
+	// fails closed. Production swaps call sessionBoundary first; this guard
+	// keeps tests and future call sites from silently carrying a verdict.
+	if ws.currentSession != "" && sessionID != ws.currentSession {
+		if _, carried := ws.sessionSources[sessionID]; !carried {
+			ws.invalidateRunsLocked()
+			if ws.w != nil {
+				ws.w.ResetBaseline()
+			}
+			ws.sessionSources = make(map[string]struct{})
+		}
+	}
+	if sessionID != "" {
+		ws.sessionSources[sessionID] = struct{}{}
+	}
+	ws.currentSession = sessionID
+	ws.turnSessionID = sessionID
 	ws.lastPending = 0
 	ws.gen++
 	ws.turnCtx = ctx
 }
 
 // due reports whether the verifier should run now: armed, and the turn has
-// captured files it has not seen. The generation comes back with the
-// verdict so the eventual ran() can be told from a stale one.
-func (ws *watchState) due(pending int) (*watch.Watch, context.Context, int, bool) {
+// captured files it has not seen. Its ticket is immutable ownership evidence
+// for both committing the delta baseline and later rendering the report.
+func (ws *watchState) due(pending int) (watchRunTicket, context.Context, bool) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 	if ws.w == nil || pending <= ws.lastPending {
-		return nil, nil, 0, false
+		return watchRunTicket{}, nil, false
 	}
 	ctx := ws.turnCtx
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return ws.w, ctx, ws.gen, true
+	ws.nextInvocation++
+	if ws.nextInvocation == 0 {
+		ws.nextInvocation++
+	}
+	if ws.runInvalidated == nil {
+		ws.runInvalidated = make(chan struct{})
+	}
+	sequence := &watchRunSequence{
+		previous:    ws.runTail,
+		invalidated: ws.runInvalidated,
+		done:        make(chan struct{}),
+	}
+	ws.runTail = sequence.done
+	return watchRunTicket{
+		sourceSessionID: ws.turnSessionID,
+		sessionEpoch:    ws.epoch,
+		turnGeneration:  ws.gen,
+		invocation:      ws.nextInvocation,
+		pending:         pending,
+		watch:           ws.w,
+		sequence:        sequence,
+	}, ctx, true
 }
 
-// ran records how much of the turn the verifier has seen. A count from a
-// finished generation is dropped: the turn it measured is over, and the
-// current one owes its own runs.
-func (ws *watchState) ran(gen, pending int) {
+// backgroundContext makes a turn-end execution independent of the completed
+// turn's cancellation while still cancellable by an ordinary session swap,
+// /watch off, or re-arming the declaration.
+func (ws *watchState) backgroundContext(ticket watchRunTicket) (context.Context, bool) {
+	return ws.backgroundContextFrom(ticket, context.Background())
+}
+
+// backgroundContextFrom gives the TUI's operation owner a cancellation seam
+// without weakening declaration/session invalidation. The ordinary helper
+// above preserves the detached turn-end contract for focused callers.
+func (ws *watchState) backgroundContextFrom(ticket watchRunTicket, owner context.Context) (context.Context, bool) {
+	ws.mu.Lock()
+	if !ws.ticketCurrentLocked(ticket) {
+		ws.mu.Unlock()
+		ticket.sequence.finish()
+		return nil, false
+	}
+	if owner == nil {
+		owner = context.Background()
+	}
+	ctx, cancel := context.WithCancel(owner)
+	if ws.pendingCancels == nil {
+		ws.pendingCancels = make(map[uint64]context.CancelFunc)
+	}
+	ws.pendingCancels[ticket.invocation] = cancel
+	ws.mu.Unlock()
+	return ctx, true
+}
+
+// execute waits for every earlier invocation from this declaration before it
+// observes the workspace. The state mutex remains free while the command runs,
+// so /watch off, session adoption, and cancellation stay responsive.
+func (ws *watchState) execute(ticket watchRunTicket, ctx context.Context) (watch.Report, bool) {
+	if !ticket.sequence.wait(ctx) {
+		return watch.Report{}, false
+	}
+	ws.mu.Lock()
+	current := ws.ticketCurrentLocked(ticket) && ticket.invocation > ws.lastCommitted
+	ws.mu.Unlock()
+	if !current {
+		return watch.Report{}, false
+	}
+	observation := ticket.watch.Observe(ctx)
+	// The turn owns a round-boundary verifier. If that turn is cancelled while
+	// the command is running, the partial execution is not a verifier verdict and
+	// must not consume the recorder count. onTurnDone can then run the same pending
+	// captures with its detached context. Ordinary launch failures still commit a
+	// harness-error report because their owner context remains live.
+	if ctx.Err() != nil {
+		return watch.Report{}, false
+	}
+	return ws.commitObservation(ticket, observation)
+}
+
+// commit is the testable staged-observation path. Production executions use
+// execute so observations themselves are serialized, not merely the baseline
+// mutation. Direct callers still release their FIFO link on every outcome.
+func (ws *watchState) commit(ticket watchRunTicket, observation watch.Observation) (watch.Report, bool) {
+	defer ws.finish(ticket)
+	return ws.commitObservation(ticket, observation)
+}
+
+// commitObservation is the only TUI path that may advance a Watch baseline.
+// It holds the session ticket lock while committing, so a swap either
+// invalidates first and this observation is discarded, or resets the
+// just-committed baseline before the new conversation can use it.
+func (ws *watchState) commitObservation(ticket watchRunTicket, observation watch.Observation) (watch.Report, bool) {
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
-	if gen != ws.gen {
+	if !ws.ticketCurrentLocked(ticket) || ticket.invocation <= ws.lastCommitted {
+		return watch.Report{}, false
+	}
+	rep := ticket.watch.Commit(observation)
+	ws.lastCommitted = ticket.invocation
+	ws.ranLocked(ticket)
+	return rep, true
+}
+
+// finish releases the next invocation and retires a detached turn-end
+// context. It is deliberately separate from commitObservation: callers keep
+// their FIFO ownership until their report has been handed to Bubble Tea, so
+// reports cannot overtake the baseline order they describe.
+func (ws *watchState) finish(ticket watchRunTicket) {
+	ws.mu.Lock()
+	if cancel := ws.pendingCancels[ticket.invocation]; cancel != nil {
+		delete(ws.pendingCancels, ticket.invocation)
+		cancel()
+	}
+	ws.mu.Unlock()
+	ticket.sequence.finish()
+}
+
+func (ws *watchState) ranLocked(ticket watchRunTicket) {
+	if ticket.turnGeneration == ws.gen {
+		ws.lastPending = ticket.pending
+	}
+}
+
+// reportCurrent revalidates a committed observation when its Bubble Tea
+// message reaches the UI. A swap can commit after commit() and before this
+// message is handled; that report must still not render or fold into the new
+// conversation.
+func (ws *watchState) reportCurrent(ticket watchRunTicket) bool {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if !ws.ticketCurrentLocked(ticket) || ticket.invocation <= ws.lastDelivered {
+		return false
+	}
+	ws.lastDelivered = ticket.invocation
+	return true
+}
+
+func (ws *watchState) ticketCurrentLocked(ticket watchRunTicket) bool {
+	if ticket.invocation == 0 || ticket.sessionEpoch == 0 ||
+		ticket.sessionEpoch != ws.epoch || ticket.watch == nil || ticket.watch != ws.w {
+		return false
+	}
+	_, sourceCurrent := ws.sessionSources[ticket.sourceSessionID]
+	return ticket.sourceSessionID != "" && sourceCurrent
+}
+
+// sessionBoundary invalidates every ordinary session's staged and committed
+// report. carry is the explicit same-conversation exception used by
+// compaction and a kept race arm: their source IDs join the same epoch, and a
+// pending turn-end observation remains eligible to commit and render.
+func (ws *watchState) sessionBoundary(nextSessionID string, carry bool) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if ws.epoch == 0 {
+		ws.epoch = 1
+	}
+	if carry {
+		if ws.sessionSources == nil {
+			ws.sessionSources = make(map[string]struct{})
+		}
+		if ws.currentSession != "" {
+			ws.sessionSources[ws.currentSession] = struct{}{}
+		}
+		if nextSessionID != "" {
+			ws.sessionSources[nextSessionID] = struct{}{}
+		}
+		ws.currentSession = nextSessionID
 		return
 	}
-	ws.lastPending = pending
+
+	ws.invalidateRunsLocked()
+	ws.lastPending = 0
+	ws.turnCtx = nil
+	ws.turnSessionID = ""
+	ws.fold = nil
+	ws.sessionSources = make(map[string]struct{})
+	if nextSessionID != "" {
+		ws.sessionSources[nextSessionID] = struct{}{}
+	}
+	ws.currentSession = nextSessionID
+	if ws.w != nil {
+		ws.w.ResetBaseline()
+	}
+}
+
+func (ws *watchState) invalidateRunsLocked() {
+	ws.epoch++
+	if ws.epoch == 0 {
+		ws.epoch++
+	}
+	for invocation, cancel := range ws.pendingCancels {
+		cancel()
+		delete(ws.pendingCancels, invocation)
+	}
+	// A different declaration or conversation owns an independent FIFO. Old
+	// links finish through their canceled/stale paths, but cannot hold new work.
+	if ws.runInvalidated != nil {
+		close(ws.runInvalidated)
+		ws.runInvalidated = nil
+	}
+	ws.runTail = nil
 }
 
 func (ws *watchState) addFold(text string) {
@@ -173,22 +480,34 @@ func (a *tuiApp) watchRound() []provider.Message {
 	if a.undo == nil {
 		return nil
 	}
-	w, ctx, gen, ok := a.watchSt.due(a.undo.PendingFiles())
+	ticket, ctx, ok := a.watchSt.due(a.undo.PendingFiles())
 	if !ok {
 		return nil
 	}
-	rep := w.Run(ctx)
-	a.watchSt.ran(gen, a.undo.PendingFiles())
+	defer a.watchSt.finish(ticket)
+	rep, current := a.watchSt.execute(ticket, ctx)
+	if !current {
+		return nil
+	}
+	command := redactedWatchCommand(ticket.watch.Command())
 	if a.p != nil {
-		a.p.Send(watchReportMsg{command: w.Command(), rep: rep})
+		a.p.Send(watchReportMsg{command: command, rep: rep, ticket: ticket})
 	}
 	if a.watcher != nil && len(rep.Signatures) > 0 {
 		a.watcher.VerifierFailures(ctx, rep.Signatures)
 	}
-	if text := watchInjectText(w.Command(), rep); text != "" {
+	if text := watchInjectText(command, rep); text != "" {
 		return []provider.Message{provider.UserText(text)}
 	}
 	return nil
+}
+
+// redactedWatchCommand is the only spelling of a verifier command allowed to
+// leave watch.Watch for a non-execution use. The Watch retains the exact user
+// input because the shell must execute it byte-for-byte; every display, note,
+// report, and model-facing copy uses this unattended redaction posture instead.
+func redactedWatchCommand(command string) string {
+	return redactCredentialText(command)
 }
 
 // watchInjectText is what the model reads. Only a change speaks: a repeat
@@ -198,6 +517,7 @@ func watchInjectText(command string, rep watch.Report) string {
 	if !rep.Changed() {
 		return ""
 	}
+	command = redactCredentialText(command)
 	var b strings.Builder
 	if rep.WentGreen {
 		fmt.Fprintf(&b, "[watch] The user's verifier `%s` now passes.", command)
@@ -208,7 +528,7 @@ func watchInjectText(command string, rep watch.Report) string {
 				fmt.Fprintf(&b, "…and %d more new failures\n", len(rep.New)-watchInjectLines)
 				break
 			}
-			b.WriteString(truncate(f.Line, 200) + "\n")
+			b.WriteString(redactCredentialTextBeforeTruncate(f.Line, 200) + "\n")
 		}
 		if rep.Persisting > 0 {
 			fmt.Fprintf(&b, "%d earlier failure(s) persist.\n", rep.Persisting)
@@ -218,58 +538,153 @@ func watchInjectText(command string, rep watch.Report) string {
 	// Verifier output is exactly the surface an env dump leaks a key
 	// through, and a round boundary has no one to ask, so this redacts
 	// unconditionally — the race record's posture.
-	if leaks := credential.ScanPrompt(text); len(leaks) > 0 {
-		text = credential.Redact(text, leaks)
-	}
-	return text
+	return redactCredentialText(text)
 }
 
 // watchTurnEnd covers the edits of a turn's final round, which no later
 // round boundary will see. It runs off the UI goroutine and its report
 // waits for the next prompt: the turn is over, so there is no request to
 // inject into and no escalation left to feed.
-func (m *tuiModel) watchTurnEnd() tea.Cmd {
+func (m *tuiModel) prepareWatchTurnEnd() (watchRunTicket, bool) {
 	if m.app.undo == nil {
-		return nil
+		return watchRunTicket{}, false
 	}
-	w, _, gen, ok := m.app.watchSt.due(m.app.undo.PendingFiles())
+	ticket, _, ok := m.app.watchSt.due(m.app.undo.PendingFiles())
+	if !ok {
+		return watchRunTicket{}, false
+	}
+	return ticket, true
+}
+
+func (m *tuiModel) watchTurnEnd() tea.Cmd {
+	ticket, ok := m.prepareWatchTurnEnd()
 	if !ok {
 		return nil
 	}
-	pending := m.app.undo.PendingFiles()
-	return func() tea.Msg {
-		// Deliberately not the turn's context: the turn is over, and this
-		// run reports on what it left behind — an esc that ended the turn
-		// must not also cancel the report. The watch's own timeout bounds it.
-		rep := w.Run(context.Background())
-		m.app.watchSt.ran(gen, pending)
-		return watchReportMsg{command: w.Command(), rep: rep, turnEnd: true}
+	return m.watchTurnEndTicket(ticket, context.Background())
+}
+
+func (m *tuiModel) watchTurnEndTicket(ticket watchRunTicket, owner context.Context) tea.Cmd {
+	ctx, ok := m.app.watchSt.backgroundContextFrom(ticket, owner)
+	if !ok {
+		return nil
 	}
+	return func() tea.Msg {
+		defer m.app.watchSt.finish(ticket)
+		// Deliberately not the completed turn's context: this run reports what
+		// that turn left behind. The short-lived watch operation now owns it, so
+		// a later esc or TUI exit can still cancel without reviving the old turn.
+		rep, current := m.app.watchSt.execute(ticket, ctx)
+		if !current {
+			return nil
+		}
+		msg := watchReportMsg{command: redactedWatchCommand(ticket.watch.Command()), rep: rep, turnEnd: true, ticket: ticket}
+		// Program.Send hands the report to the event loop before the FIFO link is
+		// released, preserving report order as well as baseline order. Tests that
+		// execute the command without a Program still receive the message directly.
+		if m.app.p != nil {
+			m.app.p.Send(msg)
+			return nil
+		}
+		return msg
+	}
+}
+
+// startTurnEndWatch claims the ordinary exclusive-operation gate before the
+// verifier starts. The event loop stays responsive, while turns, shell work,
+// compaction, and deferred startup remain behind the completed tree snapshot.
+func (m *tuiModel) startTurnEndWatch(suppressAutoCompact bool) tea.Cmd {
+	return m.startTurnEndWatchWithHook(suppressAutoCompact, nil)
+}
+
+// startTurnEndWatchWithHook keeps a deterministic invalidation seam between
+// ticket preparation and background-context binding. Production passes nil;
+// tests use it to prove that session/declaration invalidation cannot strand
+// the completed turn's continuation or the verifier FIFO.
+func (m *tuiModel) startTurnEndWatchWithHook(suppressAutoCompact bool, beforeBind func(watchRunTicket)) tea.Cmd {
+	ticket, ok := m.prepareWatchTurnEnd()
+	if !ok {
+		return nil
+	}
+	owner, operation, sourceID, err := m.startOperation("watch verifier")
+	if err != nil {
+		m.app.watchSt.finish(ticket)
+		m.addNotice("warn", "watch could not claim the completed turn: "+err.Error())
+		return nil
+	}
+	if beforeBind != nil {
+		beforeBind(ticket)
+	}
+	run := m.watchTurnEndTicket(ticket, owner)
+	if run == nil {
+		m.finishOperation(operation, false)
+		if next := m.continueAfterTurnEnd(suppressAutoCompact); next != nil {
+			return next
+		}
+		// onTurnDone treats nil as "no watch was due" and would call the
+		// continuation a second time. A no-op command records that this path
+		// already consumed the completed-turn handoff.
+		return func() tea.Msg { return nil }
+	}
+	return m.ownOperationCmdWithAbandon(operation, func() tea.Msg {
+		return turnEndWatchDoneMsg{
+			operation: operation, sourceID: sourceID,
+			suppressAutoCompact: suppressAutoCompact,
+			report:              run(),
+		}
+	}, func() error {
+		m.app.watchSt.finish(ticket)
+		return nil
+	})
+}
+
+func (m *tuiModel) onTurnEndWatchDone(msg turnEndWatchDoneMsg) tea.Cmd {
+	if !m.operationMatches(msg.operation, msg.sourceID) {
+		return nil
+	}
+	if report, ok := msg.report.(watchReportMsg); ok {
+		m.onWatchReport(report)
+	}
+	cancelled := m.operationCancelling
+	m.finishOperation(msg.operation, false)
+	if cancelled {
+		m.addNotice("", "watch cancelled; continuing from the completed turn")
+	}
+	return m.continueAfterTurnEnd(msg.suppressAutoCompact)
 }
 
 // onWatchReport renders a run's outcome. The transcript speaks only on a
 // change; the status chip always tells the current color.
 func (m *tuiModel) onWatchReport(msg watchReportMsg) {
+	if !m.app.watchSt.reportCurrent(msg.ticket) {
+		return
+	}
 	rep := msg.rep
+	if msg.turnEnd && rep.Changed() {
+		if text := watchInjectText(msg.command, rep); text != "" {
+			m.app.watchSt.addFold(text)
+		}
+	}
 	if rep.Err != nil {
 		m.watchFails = -1
-		m.addNotice("warn", fmt.Sprintf("watch: %s could not run: %v", msg.command, rep.Err))
+		m.addNotice("warn", redactCredentialText(fmt.Sprintf("watch: %s could not run: %v", msg.command, rep.Err)))
 		return
 	}
 	if rep.Passed {
 		m.watchFails = 0
 		if rep.WentGreen || rep.FirstRun {
-			m.addNotice("watch", fmt.Sprintf("watch: %s is green", msg.command))
+			m.addNotice("watch", redactCredentialText(fmt.Sprintf("watch: %s is green", msg.command)))
 		}
 		return
 	}
 	m.watchFails = len(rep.Signatures)
 	if len(rep.New) > 0 {
-		text := fmt.Sprintf("watch: %s — new failure: %s", msg.command, truncate(rep.New[0].Line, 120))
+		text := fmt.Sprintf("watch: %s — new failure: %s",
+			redactCredentialText(msg.command), redactCredentialTextBeforeTruncate(rep.New[0].Line, 120))
 		if extra := len(rep.New) - 1 + rep.Persisting; extra > 0 {
 			text += fmt.Sprintf(" (+%d more)", extra)
 		}
-		m.addNotice("warn", text)
+		m.addNotice("warn", redactCredentialText(text))
 		// The moment a verifier turns red at a turn's end is the moment
 		// "which turn broke it" becomes askable, so /bisect is named here
 		// once — with turns to search, and never again this session,
@@ -277,11 +692,6 @@ func (m *tuiModel) onWatchReport(msg watchReportMsg) {
 		if msg.turnEnd && !m.bisectHinted && m.app.undo != nil && len(m.app.undo.Turns()) > 1 {
 			m.bisectHinted = true
 			m.addNotice("", "/bisect can name the turn that broke it")
-		}
-	}
-	if msg.turnEnd && rep.Changed() {
-		if text := watchInjectText(msg.command, rep); text != "" {
-			m.app.watchSt.addFold(text)
 		}
 	}
 }
@@ -329,8 +739,18 @@ func (m *tuiModel) watchChip() string {
 // manifests because it is the project's own declaration rather than an
 // implication.
 func suggestVerifier(workspace string) string {
+	return suggestVerifierWithHook(workspace, nil)
+}
+
+func suggestVerifierWithHook(workspace string, beforeOpen func(string)) string {
+	const maxSuggestionManifestBytes = int64(1 << 20)
 	read := func(name string) string {
-		data, err := os.ReadFile(filepath.Join(workspace, name))
+		path := filepath.Join(workspace, name)
+		var hook func()
+		if beforeOpen != nil {
+			hook = func() { beforeOpen(name) }
+		}
+		data, err := readWorkspaceFileBounded(workspace, path, maxSuggestionManifestBytes, hook)
 		if err != nil {
 			return ""
 		}
@@ -384,14 +804,15 @@ func cmdWatch(m *tuiModel, args string) tea.Cmd {
 		} else if m.watchFails < 0 {
 			state = "could not run"
 		}
-		m.addInfo(fmt.Sprintf("  watching: %s  (%s; /watch off stops)", w.Command(), state))
+		m.addInfo(fmt.Sprintf("  watching: %s  (%s; /watch off stops)", redactedWatchCommand(w.Command()), state))
 		return nil
 
 	case args == "off":
 		if w := m.app.watchSt.disarm(); w != nil {
 			m.watchFails = 0
-			m.app.loop.Session.AppendNote("info", "watch disarmed: "+w.Command())
-			return noticeCmd("", "watch off; "+w.Command()+" no longer runs")
+			command := redactedWatchCommand(w.Command())
+			m.app.loop.Session.AppendNote("info", "watch disarmed: "+command)
+			return noticeCmd("", "watch off; "+command+" no longer runs")
 		}
 		return noticeCmd("", "no watch was set")
 
@@ -401,8 +822,9 @@ func cmdWatch(m *tuiModel, args string) tea.Cmd {
 		}
 		m.app.watchSt.arm(watch.New(args, m.app.workspace))
 		m.watchFails = 0
-		m.app.loop.Session.AppendNote("info", "watch armed: "+args)
-		m.addNotice("watch", fmt.Sprintf("watching with `%s`: it runs after the model's edits, unconfined, as you would run it; only changes are reported, and new failures count toward escalation", args))
+		command := redactedWatchCommand(args)
+		m.app.loop.Session.AppendNote("info", "watch armed: "+command)
+		m.addNotice("watch", fmt.Sprintf("watching with `%s`: it runs after the model's edits, unconfined, as you would run it; only changes are reported, and new failures count toward escalation", command))
 		return nil
 	}
 }

@@ -218,6 +218,19 @@ ceiling governs dollars only — a local or plan rung passes the gate, because
 the three meterings are never collapsed — and an unpriced target passes too,
 with /budget saying so, since a ceiling cannot govern what has no price.
 
+**An output cap belongs to the rung, including its outage path.** A positive
+`[tiers.<id>] max_output` is copied into the concrete identity of the primary
+and every ordered fallback, sent on each successful provider request, and used
+unchanged by routing, context, and hard-budget admission. Save refuses an
+in-memory fallback whose cap differs from its primary rather than silently
+rewriting either target. An omitted allowance with no adapter or catalog bound
+stays unknown; a finite context window therefore refuses it instead of guessing
+a server default. Adapter-required defaults may be derived only while the cap
+is omitted. In particular, Anthropic's token-budget dialect may raise its own
+default above `budget_tokens`, but an explicit cap that does not exceed the
+reasoning budget is a typed capability conflict and is never raised behind the
+user's back.
+
 **A profile is a ladder, not a mode.** `[profiles.<name>]`
 (`internal/config`) holds tiers and nothing else — slots, auth, and
 settings stay global — and the undecoded-keys check refuses anything
@@ -244,7 +257,9 @@ that the substitution renders before content is sent and is recorded on
 the session, so every call site of `probeTierFallback` must surface the
 note it returns rather than dropping it. Entries resolve the provider's
 default serving surface; a non-default-surface fallback is not expressible
-and that is a stated limit, not an oversight.
+and that is a stated limit, not an oversight. `max_output` is the exception to
+otherwise target-specific fallback parameters because it is rung policy: the
+same value constrains the primary and every fallback.
 
 **An outcome is worth less as evidence than it looks.** §8.4's labelling rules
 are in `internal/router` because each prevents a specific failure. A clean
@@ -628,6 +643,29 @@ notice fires once per session at 70 percent, below the compaction threshold on
 purpose — a warning that arrived at the boundary would be advice with no turn
 left to act on it — and says what crosses and what does not.
 
+**Compaction commits a validated handoff, not arbitrary model prose.** TUI and
+REPL share `compactSession`: historical roles are projected as bounded,
+text-only, credential-redacted data with explicit provenance, and the
+summarizer is told that none of it may change its job. Output is capped at 32
+KiB and must contain the exact seven headings plus the four nonempty execution
+frontier fields in order. That validation happens before `CreateStaged`; only a
+validated, fully seeded child may be published, and every earlier failure keeps
+the source authoritative. Do not move validation after staging or let one
+surface invent a looser prompt, projection, bound, or publication path.
+
+Schema is not authority. Before the summary request, every compaction derives
+one credential-redacted objective mechanically: the explicit `/compact`
+argument, or the latest substantive `AuthoredKnown` user opening plus its later
+verified user steers. Legacy mixed text, repository expansion, tool results,
+injected reports, and synthetic seeds cannot supply it; without such scope,
+automatic and no-argument compaction refuse. After the response, Switchboard
+overwrites `## Objective` with that exact value and overwrites `Next` with a
+fixed instruction to re-evaluate the recorded frontier before acting. The
+summarizer's Done/In-progress/proposed-Next/Blocked values remain explicitly
+untrusted evidence; they never become an executable task merely by satisfying
+the Markdown schema. Automatic continuation names only the mechanically
+verified objective and the fixed reconciliation step.
+
 **A process this program started and forgot is this program's fault.**
 `internal/execution/background.go` reuses `Run`'s body rather than
 reimplementing it, so the confinement is applied by the same code and fails
@@ -913,6 +951,16 @@ content for the token is the guarantee. Do not add a path that writes the
 distiller's output to disk without that scan, and do not register a freshly
 written pack into a running session's registry.
 
+Publication is an absent-target transaction, not `MkdirAll` followed by
+`WriteFile`. The workspace and every skill-directory component are retained as
+physical, current-user-owned directory capabilities; a symlink, FIFO,
+replacement, parent retarget, or existing `SKILL.md` refuses the write. A
+private per-workspace lock serializes recovery and publication across
+processes, and the checkpoint cleanup ledger covers the atomic no-replace
+commit. Recovery state stays in the machine-local session store rather than in
+the repository. If the cleanup store and workspace cannot support the same
+atomic transaction (notably different Windows volumes), `/learn` fails closed.
+
 The pack ends with a provenance paragraph — the session it was distilled
 from, the date, the writing model — because a rule whose rationale is
 lost can never be safely deleted, and instruction files rot by exactly
@@ -980,17 +1028,21 @@ ride the fork — it names a point the new log does not contain — and no
 pin promises anything about files, because the log cannot keep that
 promise.
 
-/retry is a composition, not a mechanism: the last turn's files revert
-through the checkpoint recorder only when the stack's top turn carries the
-retried prompt's label, the conversation goes back via the same fork
-machinery with its same guarantees, and the recorded opening replays
-byte-for-byte — deliberately not re-expanded, so the retried rung reads
-what the original rung read and the pair is a controlled comparison. A
-retry onto another rung is the /tN one-shot, probe and restore included.
-The set-aside answer's log gets a user_corrected note before the fork
-cuts, and routing consumes none of it. `lastTurnOpening` exists because
-injected advice, watch reports, and steers are user-role messages that did
-not open a turn; a retry that replayed one would replay a fragment.
+/retry is a composition, not a mechanism: the last turn's files are eligible
+only when the checkpoint stack's top scope has the exact
+`TurnIdentity{SessionID, OpeningMessage}` of the durable opening — its display
+label is never identity. The conversation goes back through a staged retry
+fork, which first records the replay intent and stays undiscoverable. The
+prepared restore installs every pre-image and publishes that child as one
+commit; any restore or pre-publication failure rolls every path forward to its
+post-image, retains the source session, and consumes no checkpoint evidence.
+A visible-but-not-confirmed-durable publication retains recovery evidence and
+stops before another workspace mutation. Only after adoption succeeds does the
+source answer receive its non-fatal `user_corrected` note. The recorded opening
+then replays byte-for-byte — deliberately not re-expanded — and a retry onto
+another rung uses the /tN one-shot, probe and restore included. `lastTurnOpening`
+exists because injected advice and watch reports are user-role messages that
+did not open a turn; a retry that replayed one would replay a fragment.
 
 **A race arm is byte-identical upstream and read-only downstream.** /race
 (`cmd/sb/race.go`) runs one prompt on two rungs from two forks of the
@@ -1027,6 +1079,30 @@ Phase 3's TUI is built and is the default surface. Its phase-3 obligations from
 once per completed block through glamour, completed entries cache per width so
 repaints never re-render markdown, and diffs highlight once at load. Keep it
 that way.
+
+**A modal is queued interaction with an owner, never replaceable UI state.**
+Every permission ask, model question, and asynchronous picker enters through
+the one FIFO broker. Permission starts on No, and a delayed picker starts with
+no selection, so a stray Enter cannot authorize or choose. Active and queued
+dialogs keep cancellation callbacks and asynchronous identity tokens; Esc,
+Ctrl-C, context cancellation, exit, and a committed session swap must resolve
+or cancel the exact owner and unblock its waiter rather than merely hiding it.
+
+**Prompt history is private convenience data, and the live draft is not
+history.** Durable records are bounded and credential-redacted. Unix requires
+mode 0600; Windows creates a protected DACL before writing and verifies through
+the handle that its only non-inherited allow ACE names the current user.
+Failure to establish or re-verify that posture fails the history operation
+closed. Up-arrow captures the unsent draft as the temporary end entry; while
+traversal is active its arrows outrank popups and multiline editing, and an edit
+or committed session swap clears traversal without replacing the visible text.
+
+**Composer character movement and deletion are extended-grapheme operations.**
+Left/right and Ctrl-B/F, plus Backspace/Delete and Ctrl-H/D, use the same ANSI
+segmenter as rendering so combining marks, emoji modifiers, ZWJ sequences, and
+flags stay atomic. At a logical newline boundary they defer to textarea's line
+merge/crossing behavior. Do not add a rune-wise alias to a user-facing
+character operation.
 
 The TUI's look has its own invariants, pinned by the design tests. The
 transcript anchors at the top and scrolling clamps to the content, so a

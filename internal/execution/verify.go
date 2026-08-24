@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 )
 
 // wrapFunc turns a command into the same command under confinement.
@@ -180,6 +182,8 @@ type checkRecord struct {
 	CheckedAt  time.Time `json:"checked_at"`
 }
 
+const maxCheckCacheBytes = 64 << 10
+
 func cachedVerification(profileKey, hostKey string, run func() (bool, string)) (bool, string) {
 	path, err := checkCachePath()
 	if err == nil {
@@ -216,7 +220,7 @@ func checkCachePath() (string, error) {
 
 func readCheck(path string) (checkRecord, error) {
 	var rec checkRecord
-	data, err := os.ReadFile(path)
+	data, err := rootedfs.ReadFile(filepath.Dir(path), filepath.Base(path), maxCheckCacheBytes)
 	if err != nil {
 		return rec, err
 	}
@@ -239,7 +243,9 @@ func shortHash(s string) string {
 // commandOutput runs a small informational command and returns its trimmed
 // output, or "unknown". It is used for host identity, never for policy.
 func commandOutput(name string, args ...string) string {
-	out, err := exec.Command(name, args...).Output()
+	cmd := exec.Command(name, args...)
+	cmd.Env = childEnv()
+	out, err := cmd.Output()
 	if err != nil {
 		return "unknown"
 	}

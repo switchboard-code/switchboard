@@ -18,8 +18,10 @@ package tools
 // links rather than no results.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -44,6 +46,22 @@ const (
 
 	ddgEndpoint = "https://html.duckduckgo.com/html/"
 )
+
+var errWebResponseTooLarge = errors.New("response exceeded the 2097152-byte read limit; content withheld")
+
+// readWebBody distinguishes a complete response at the wire cap from a
+// prefix. Returning a prefix would let the cap remove the last byte that made
+// a credential recognizable and hand the remaining fragment to the provider.
+func readWebBody(r io.Reader) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, webFetchLimit+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > webFetchLimit {
+		return nil, errWebResponseTooLarge
+	}
+	return body, nil
+}
 
 func newWebClient() *http.Client {
 	return &http.Client{Timeout: 30 * time.Second}
@@ -188,7 +206,11 @@ func (t *websearchTool) search(ctx context.Context, query string, count int) (Re
 	if resp.StatusCode != http.StatusOK {
 		return errorf("websearch: the search backend answered %s", resp.Status)
 	}
-	results, err := parseDDG(io.LimitReader(resp.Body, webFetchLimit))
+	body, err := readWebBody(resp.Body)
+	if err != nil {
+		return errorf("websearch: %v", err)
+	}
+	results, err := parseDDG(bytes.NewReader(body))
 	if err != nil {
 		return errorf("websearch: %v", err)
 	}
@@ -382,7 +404,7 @@ func (t *webfetchTool) fetch(ctx context.Context, u *url.URL) (Result, error) {
 
 	ctype := resp.Header.Get("Content-Type")
 	mediatype := strings.TrimSpace(strings.SplitN(ctype, ";", 2)[0])
-	body, err := io.ReadAll(io.LimitReader(resp.Body, webFetchLimit))
+	body, err := readWebBody(resp.Body)
 	if err != nil {
 		return errorf("webfetch: reading %s: %v", u.Hostname(), err)
 	}
@@ -411,8 +433,12 @@ func (t *webfetchTool) fetch(ctx context.Context, u *url.URL) (Result, error) {
 	if final := resp.Request.URL; final.String() != u.String() {
 		notes = append(notes, fmt.Sprintf("[fetched %s after redirect]", final))
 	}
+	// Scan the complete extracted component before the context cap. A cap can
+	// otherwise remove the final byte that made a credential recognizable and
+	// return the rest as apparently safe provider context.
+	text = credential.Redact(text, credential.ScanPrompt(text))
 	if len(text) > webTextLimit {
-		text = text[:webTextLimit]
+		text = truncateValidUTF8Bytes(text, webTextLimit)
 		notes = append(notes, fmt.Sprintf("[truncated at %d characters]", webTextLimit))
 	}
 	if len(notes) > 0 {

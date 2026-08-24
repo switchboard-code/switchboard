@@ -1,8 +1,10 @@
 // Package scm provides a bounded, read-only view of a Git worktree.
 //
-// It never updates the index, refs, or worktree. Repository configuration is
-// still consulted for ordinary Git semantics, but external diff drivers,
-// textconv filters, filesystem monitors, and lazy object fetches are disabled.
+// It never intentionally updates the index, refs, or worktree. Repository
+// configuration is still consulted for ordinary Git semantics. External diff
+// drivers, textconv filters, filesystem monitors, and lazy object fetches are
+// disabled, but Git status can still invoke clean/process filters and hooks;
+// every process therefore requires explicit repository execution authority.
 package scm
 
 import (
@@ -16,6 +18,9 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/switchboard-code/switchboard/internal/execution"
+	"github.com/switchboard-code/switchboard/internal/safeexec"
 )
 
 const (
@@ -28,18 +33,28 @@ const (
 )
 
 var (
-	ErrNotRepository   = errors.New("not a Git worktree")
-	ErrOutputLimit     = errors.New("Git output exceeded the limit")
-	ErrOutsideRepo     = errors.New("path is outside the repository")
-	ErrTooManyPaths    = errors.New("too many Git pathspecs")
-	ErrMalformedStatus = errors.New("malformed Git porcelain-v2 status")
+	ErrNotRepository       = errors.New("not a Git worktree")
+	ErrOutputLimit         = errors.New("Git output exceeded the limit")
+	ErrOutsideRepo         = errors.New("path is outside the repository")
+	ErrTooManyPaths        = errors.New("too many Git pathspecs")
+	ErrMalformedStatus     = errors.New("malformed Git porcelain-v2 status")
+	ErrExecutionNotTrusted = errors.New("Git execution requires a trusted workspace")
 )
+
+// ExecutionAuthority is the standing user decision that repository-controlled
+// Git filters and hooks may execute. Discover checks it before the first Git
+// process, and Repository checks it again before every later process.
+type ExecutionAuthority interface {
+	Trusted(workspace string) bool
+}
 
 // Repository is one discovered Git worktree. Root is absolute and symlink
 // resolved when the platform permits it.
 type Repository struct {
-	Root string
-	git  string
+	Root      string
+	workspace string
+	authority ExecutionAuthority
+	git       safeexec.Executable
 }
 
 // GitError is a failed Git invocation. Stderr is bounded, but retained because
@@ -64,10 +79,9 @@ func (e *GitError) Error() string {
 
 // Discover finds the nearest containing Git worktree for workspace. Bare
 // repositories and ordinary directories return ErrNotRepository.
-func Discover(ctx context.Context, workspace string) (*Repository, error) {
-	git, err := exec.LookPath("git")
-	if err != nil {
-		return nil, fmt.Errorf("finding git: %w", err)
+func Discover(ctx context.Context, workspace string, authority ExecutionAuthority) (*Repository, error) {
+	if authority == nil || !authority.Trusted(workspace) {
+		return nil, ErrExecutionNotTrusted
 	}
 	abs, err := filepath.Abs(workspace)
 	if err != nil {
@@ -77,6 +91,14 @@ func Discover(ctx context.Context, workspace string) (*Repository, error) {
 		return nil, fmt.Errorf("opening workspace: %w", statErr)
 	} else if !info.IsDir() {
 		return nil, fmt.Errorf("opening workspace: %s is not a directory", abs)
+	}
+	roots, err := safeexec.WorkspaceAndCurrentAuthorityRoots(abs)
+	if err != nil {
+		return nil, fmt.Errorf("resolving Git workspace authority: %w", err)
+	}
+	git, err := safeexec.ResolveOutside("git", roots...)
+	if err != nil {
+		return nil, fmt.Errorf("finding trusted git executable: %w", err)
 	}
 
 	inside := runGit(ctx, git, abs, maxDiagnosticBytes, "rev-parse", "--is-inside-work-tree")
@@ -108,7 +130,17 @@ func Discover(ctx context.Context, workspace string) (*Repository, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolving Git worktree root: %w", err)
 	}
-	return &Repository{Root: filepath.Clean(root), git: git}, nil
+	// The parent marker scan above protects the commands needed to discover
+	// Root; now bind the result explicitly outside the root Git reported too.
+	finalRoots := append(append([]string(nil), roots...), root)
+	git, err = safeexec.ResolvePathOutside(git.Path(), finalRoots...)
+	if err != nil {
+		return nil, fmt.Errorf("binding git outside repository authority: %w", err)
+	}
+	return &Repository{
+		Root: filepath.Clean(root), workspace: abs,
+		authority: authority, git: git,
+	}, nil
 }
 
 type commandResult struct {
@@ -135,6 +167,9 @@ func (r commandResult) commandError(operation string) error {
 	if errors.Is(r.err, context.Canceled) || errors.Is(r.err, context.DeadlineExceeded) {
 		return r.err
 	}
+	if errors.Is(r.err, safeexec.ErrChanged) || errors.Is(r.err, safeexec.ErrUntrustedPath) {
+		return fmt.Errorf("%s: %w", operation, r.err)
+	}
 	stderr := string(r.stderr)
 	if r.stderrTruncated {
 		stderr += "\n… stderr truncated …"
@@ -142,19 +177,33 @@ func (r commandResult) commandError(operation string) error {
 	return &GitError{Operation: operation, ExitCode: r.exitCode(), Stderr: stderr}
 }
 
-func runGit(ctx context.Context, git, dir string, stdoutLimit int, args ...string) commandResult {
+func runGit(ctx context.Context, git safeexec.Executable, dir string, stdoutLimit int, args ...string) commandResult {
 	common := []string{
 		"-c", "color.ui=false",
 		"-c", "core.quotepath=false",
 		"-c", "core.fsmonitor=false",
 	}
-	cmd := exec.CommandContext(ctx, git, append(common, args...)...)
+	// RunProcess owns cancellation for the entire process group. Git status may
+	// invoke repository filters; CommandContext would kill only Git and can then
+	// wait forever on a descendant that retained a stdout or stderr pipe.
+	cmd, err := git.Command(append(common, args...)...)
+	if err != nil {
+		return commandResult{err: err}
+	}
 	cmd.Dir = dir
-	cmd.Env = stableGitEnv(os.Environ())
+	roots, err := safeexec.WorkspaceAndCurrentAuthorityRoots(dir)
+	if err != nil {
+		return commandResult{err: fmt.Errorf("resolving Git workspace authority: %w", err)}
+	}
+	environ, err := safeexec.FilterEnvironmentPath(execution.ScrubbedChildEnv(), roots...)
+	if err != nil {
+		return commandResult{err: fmt.Errorf("preparing trusted Git interpreter path: %w", err)}
+	}
+	cmd.Env = stableGitEnv(environ)
 	out := &cappedBuffer{max: stdoutLimit}
 	errout := &cappedBuffer{max: maxDiagnosticBytes}
 	cmd.Stdout, cmd.Stderr = out, errout
-	err := cmd.Run()
+	err = execution.RunProcess(ctx, cmd)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		err = ctxErr
 	}
@@ -209,11 +258,13 @@ func stableGitEnv(environ []string) []string {
 		"GIT_DIR": true, "GIT_WORK_TREE": true, "GIT_INDEX_FILE": true,
 		"GIT_OBJECT_DIRECTORY": true, "GIT_ALTERNATE_OBJECT_DIRECTORIES": true,
 		"GIT_COMMON_DIR": true, "GIT_NAMESPACE": true, "GIT_PREFIX": true,
+		"GIT_EXEC_PATH": true, "GIT_CEILING_DIRECTORIES": true,
+		"GIT_DISCOVERY_ACROSS_FILESYSTEM": true, "GIT_CONFIG": true,
 	}
 	out := make([]string, 0, len(environ)+len(set))
 	for _, entry := range environ {
 		key, _, ok := strings.Cut(entry, "=")
-		if !ok || envKeyIn(key, remove) {
+		if !ok || envKeyIn(key, remove) || strings.HasPrefix(strings.ToUpper(key), "GIT_CONFIG_") {
 			continue
 		}
 		if _, replace := envValue(key, set); replace {
@@ -223,6 +274,13 @@ func stableGitEnv(environ []string) []string {
 	}
 	out = append(out, overrides...)
 	return out
+}
+
+func (r *Repository) executionAllowed() error {
+	if r == nil || r.authority == nil || !r.authority.Trusted(r.workspace) {
+		return ErrExecutionNotTrusted
+	}
+	return nil
 }
 
 func envKeyIn(key string, values map[string]bool) bool {

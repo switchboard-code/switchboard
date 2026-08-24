@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -92,6 +93,9 @@ func TestDiffHEADUnbornRepository(t *testing.T) {
 }
 
 func TestDiffHEADLiteralOddPaths(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Win32 filenames cannot represent the literal pathspec fixtures")
+	}
 	root := initTestRepo(t)
 	writeTestFile(t, root, "ordinary.txt", []byte("ordinary\n"))
 	commitTestFiles(t, root, "base")
@@ -240,7 +244,8 @@ func TestDiffHEADUnmergedFile(t *testing.T) {
 }
 
 func TestDiffHEADNonRepository(t *testing.T) {
-	repo := &Repository{Root: t.TempDir(), git: "git"}
+	repo := openTestRepo(t, initTestRepo(t))
+	repo.Root = t.TempDir()
 	_, err := repo.DiffHEAD(context.Background(), DiffOptions{})
 	var gitErr *GitError
 	if !errors.As(err, &gitErr) {

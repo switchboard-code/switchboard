@@ -57,6 +57,63 @@ func TestFindSearchesTheConversation(t *testing.T) {
 	}
 }
 
+func TestFindSearchesOnlyProvenUserWordingAndModelAnswers(t *testing.T) {
+	legacy := provider.Message{Role: provider.RoleUser, Content: []provider.Block{
+		provider.Text{Text: "inspect @config\nLEGACY_FILE_SENTINEL"},
+	}}
+	modern := provider.Message{Role: provider.RoleUser, AuthoredKnown: true, Authored: "inspect @config",
+		Content: []provider.Block{provider.Text{Text: "inspect @config\nMODERN_FILE_SENTINEL\nshell MODERN_SHELL_SENTINEL"}}}
+	injected := provider.UserText("MACHINE_INJECTION_SENTINEL")
+	injected.Injected = true
+	steer := provider.UserText("USER_STEER_SENTINEL")
+	steer.Injected = true
+	steer.UserSteer = true
+
+	messages := []provider.Message{legacy, modern, injected, steer, {
+		Role: provider.RoleAssistant, Content: []provider.Block{provider.Text{Text: "MODEL_ANSWER_SENTINEL"}},
+	}}
+	for _, query := range []string{"legacy_file_sentinel", "modern_file_sentinel", "modern_shell_sentinel", "machine_injection_sentinel"} {
+		if hits, snippet := searchMessages(messages, query); hits != 0 || snippet != "" {
+			t.Errorf("unproven query %q matched %d: %q", query, hits, snippet)
+		}
+	}
+	for _, query := range []string{"inspect @config", "user_steer_sentinel", "model_answer_sentinel"} {
+		if hits, _ := searchMessages(messages, query); hits != 1 {
+			t.Errorf("proven query %q matched %d, want 1", query, hits)
+		}
+	}
+}
+
+func TestFindLabelsLegacyOpeningWithoutRenderingExpandedBytes(t *testing.T) {
+	store, err := session.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	sess, err := store.Create(workspace, "test/local/model", "rev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AppendMessage(provider.Message{Role: provider.RoleUser, Content: []provider.Block{
+		provider.Text{Text: "@secret.env\nLEGACY_EXPANDED_OPENING"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AppendMessage(provider.Message{Role: provider.RoleAssistant, Content: []provider.Block{
+		provider.Text{Text: "the model discussed NEEDLE"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out := strings.Join(findLines(store, workspace, "needle"), "\n")
+	if strings.Contains(out, "LEGACY_EXPANDED_OPENING") || strings.Contains(out, "@secret.env") ||
+		!strings.Contains(out, "authored wording unavailable") {
+		t.Fatalf("legacy find label crossed the authorship boundary:\n%s", out)
+	}
+}
+
 // The all-form answers "which project was that": matches grouped under the
 // workspace each log's own header names.
 func TestFindAllSpansWorkspaces(t *testing.T) {

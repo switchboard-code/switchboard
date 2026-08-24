@@ -5,9 +5,10 @@
 // draws: ~/.switchboard is the user speaking, a repository's .switchboard is
 // whoever was cloned. Content a repository provides may speak to the model;
 // configuration that starts processes on the user's machine — an MCP server,
-// a hook — runs only after the user has said this specific checkout may do
-// that. The grant is per resolved path, persisted, and revocable, so cloning
-// a repository is never by itself permission to execute what it declares.
+// a hook, a language server, or Git's repository filters and hooks during
+// /diff — runs only after the user has said this specific checkout may do that.
+// The grant is per resolved path, persisted, and revocable, so cloning a
+// repository is never by itself permission to execute what it declares.
 package trust
 
 import (
@@ -15,12 +16,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 )
 
 const FileName = "trust.toml"
@@ -29,7 +31,7 @@ const maxTrustFileBytes = 1 << 20
 
 // header explains the file to whoever opens it, the same contract as
 // config.toml: the program regenerates it, hand annotation does not survive.
-const header = `# Workspaces trusted to run what they declare (MCP servers, hooks).
+const header = `# Workspaces trusted for repository execution (MCP, hooks, LSP, Git filters).
 #
 # sb rewrites this file when trust is granted or revoked in the TUI, and a
 # rewrite regenerates everything: comments placed here do not survive.
@@ -71,6 +73,9 @@ func Open() (*Store, error) {
 
 func OpenFile(path string) (*Store, error) {
 	s := &Store{path: path, grants: map[string]Grant{}}
+	if err := fileprivacy.EnsurePrivateDir(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("securing %s: %w", filepath.Dir(path), err)
+	}
 	pathInfo, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -81,7 +86,7 @@ func OpenFile(path string) (*Store, error) {
 	if pathInfo.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("reading %s: trust store must not be a symbolic link", path)
 	}
-	f, err := os.Open(path)
+	f, err := fileprivacy.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", path, err)
 	}
@@ -96,8 +101,12 @@ func OpenFile(path string) (*Store, error) {
 	if !openedInfo.Mode().IsRegular() {
 		return nil, fmt.Errorf("reading %s: trust store is not a regular file", path)
 	}
-	if runtime.GOOS != "windows" && openedInfo.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("reading %s: trust store permissions are %04o, want 0600", path, openedInfo.Mode().Perm())
+	ownerOnly, err := fileprivacy.IsOwnerOnly(f)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s permissions: %w", path, err)
+	}
+	if !ownerOnly {
+		return nil, fmt.Errorf("reading %s: trust store permissions are not owner-only", path)
 	}
 	raw, err := io.ReadAll(io.LimitReader(f, maxTrustFileBytes+1))
 	if err != nil {
@@ -187,7 +196,7 @@ func (s *Store) Granted() []string {
 // file in the same directory, then a rename, so a crash leaves the old file
 // rather than half a new one. Caller holds the lock.
 func (s *Store) save() error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+	if err := fileprivacy.EnsurePrivateDir(filepath.Dir(s.path)); err != nil {
 		return fmt.Errorf("creating %s: %w", filepath.Dir(s.path), err)
 	}
 
@@ -196,15 +205,11 @@ func (s *Store) save() error {
 	}
 	file.Workspaces = s.grants
 
-	tmp, err := os.CreateTemp(filepath.Dir(s.path), FileName+".*")
+	tmp, err := fileprivacy.CreateTemp(filepath.Dir(s.path), FileName+".*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
 	if _, err := tmp.WriteString(header); err != nil {
 		tmp.Close()
 		return err

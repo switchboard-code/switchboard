@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -110,6 +111,45 @@ func TestTheSamePrefixIsRecognisedAcrossTurns(t *testing.T) {
 	}
 	if got := tracker.Expect("t/s/m", c.lastHash, time.Now()); got.HitProbability == 0 {
 		t.Errorf("the tracker expects nothing from a prefix it just watched being written: %+v", got)
+	}
+}
+
+func TestIncompleteAssistantDoesNotEnterTheCachePrefix(t *testing.T) {
+	system := []provider.Block{provider.Text{Text: "system"}}
+	baseline := []provider.Message{
+		provider.UserText("settled request"),
+		provider.UserText("current request"),
+	}
+	withPartial := []provider.Message{
+		baseline[0],
+		{
+			Role:       provider.RoleAssistant,
+			Incomplete: true,
+			Content:    []provider.Block{provider.Text{Text: "partial must not be cached"}},
+		},
+		baseline[1],
+	}
+
+	newCache := func() *Cache {
+		return &Cache{
+			Manager: &breakpoint.Manager{Policy: explicitPolicy(), Target: "t/s/m"},
+			Policy:  explicitPolicy(),
+			Target:  "t/s/m",
+		}
+	}
+	baseCache := newCache()
+	basePlan := baseCache.plan(system, nil, baseline)
+	partialCache := newCache()
+	partialPlan := partialCache.plan(system, nil, withPartial)
+
+	if baseCache.lastHash != partialCache.lastHash {
+		t.Fatalf("incomplete assistant changed cache identity: %q != %q", baseCache.lastHash, partialCache.lastHash)
+	}
+	if !reflect.DeepEqual(basePlan, partialPlan) {
+		t.Fatalf("incomplete assistant shifted cache markers:\nbase: %+v\nwith partial: %+v", basePlan, partialPlan)
+	}
+	if len(withPartial) != 3 || !withPartial[1].Incomplete {
+		t.Fatal("cache planning mutated the durable history")
 	}
 }
 

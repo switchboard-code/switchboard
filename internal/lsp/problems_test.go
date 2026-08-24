@@ -2,7 +2,6 @@ package lsp
 
 import (
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -276,6 +275,33 @@ func TestProblemStoreBoundsMessagesRelatedAndTotals(t *testing.T) {
 	}
 }
 
+func TestProblemStoreRedactsCredentialFieldsBeforeTheirCaps(t *testing.T) {
+	token := "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	prefix := strings.Repeat("x", maxProblemMessageBytes-len(token)+1)
+	store := NewProblemStore(t.TempDir())
+	if err := store.publish(problemPublish{URI: "untitled:credential", Problems: []Problem{{
+		Line: 1, Column: 1,
+		Code:    strings.Repeat("c", maxProblemCodeBytes-len(token)+1) + token,
+		Source:  strings.Repeat("s", maxProblemSourceBytes-len(token)+1) + token,
+		Message: prefix + token,
+		Related: []RelatedProblem{{URI: "untitled:related", Message: prefix + token}},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	problem := onlyProblemDocument(t, store.Snapshot(ProblemFilter{})).Problems[0]
+	for name, value := range map[string]string{
+		"code": problem.Code, "source": problem.Source, "message": problem.Message,
+		"related": problem.Related[0].Message,
+	} {
+		if strings.Contains(value, token) || strings.Contains(value, "ghp_") {
+			t.Fatalf("%s cap exposed a credential fragment: %q", name, value)
+		}
+		if !strings.Contains(value, "[redacted: a GitHub token]") {
+			t.Fatalf("%s was not redacted before its cap: %q", name, value)
+		}
+	}
+}
+
 func TestProblemStoreSubscriptionCoalescesAndCancels(t *testing.T) {
 	store := NewProblemStore(t.TempDir())
 	changes, cancel := store.Subscribe()
@@ -324,13 +350,9 @@ func TestProblemStoreOnlyNavigatesCanonicalWorkspaceFiles(t *testing.T) {
 	}
 	inside := writeProblemFile(t, root, "dir/name #1.go")
 	outside := writeProblemFile(t, outsideRoot, "outside.go")
-	symlink := filepath.Join(root, "escape.go")
-	if err := os.Symlink(outside, symlink); err != nil {
-		t.Fatal(err)
-	}
 
 	insideURI := problemFileURI(inside)
-	updates := []string{insideURI, problemFileURI(outside), problemFileURI(symlink), "https://example.test/a.go"}
+	updates := []string{insideURI, problemFileURI(outside), "https://example.test/a.go"}
 	store := NewProblemStore(root)
 	for i, uri := range updates {
 		if err := store.publish(problemPublish{
@@ -356,6 +378,23 @@ func TestProblemStoreOnlyNavigatesCanonicalWorkspaceFiles(t *testing.T) {
 	if len(filtered.Documents) != 1 || filtered.Documents[0].URI != insideURI {
 		t.Fatalf("relative path filter = %+v", filtered.Documents)
 	}
+
+	t.Run("symlink escape", func(t *testing.T) {
+		symlink := filepath.Join(root, "escape.go")
+		if err := os.Symlink(outside, symlink); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		symlinkStore := NewProblemStore(root)
+		if err := symlinkStore.publish(problemPublish{
+			URI:      problemFileURI(symlink),
+			Problems: []Problem{{Line: 1, Column: 1, Message: "symlink escape"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := symlinkStore.Snapshot(ProblemFilter{NavigableOnly: true}); len(got.Documents) != 0 {
+			t.Fatalf("symlink escape was navigable: %+v", got.Documents)
+		}
+	})
 }
 
 func TestProblemStoreSnapshotFiltersSortsAndDoesNotAlias(t *testing.T) {
@@ -483,5 +522,5 @@ func writeProblemFile(t *testing.T, root, relative string) string {
 }
 
 func problemFileURI(path string) string {
-	return (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String()
+	return fileURI(path)
 }

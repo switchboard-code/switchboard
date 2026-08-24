@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -98,6 +99,9 @@ func FuzzParsePorcelainV2Z(f *testing.F) {
 }
 
 func TestStatusMixedStatesAndOddPaths(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Win32 paths cannot represent this odd-filename fixture")
+	}
 	root := initTestRepo(t)
 	writeTestFile(t, root, ".gitignore", []byte("ignored.log\n"))
 	writeTestFile(t, root, "mixed.txt", []byte("base\n"))
