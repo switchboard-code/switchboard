@@ -323,7 +323,7 @@ func TestAcquireWindowsNamespaceLeaseRejectsReparseDirectory(t *testing.T) {
 }
 
 func TestWindowsNamespaceLeaseEmptyNameOpensAndDeleteLeasesExactRoot(t *testing.T) {
-	root, dir := openWindowsTestRoot(t)
+	root, dir := openWindowsDeleteShareTestRoot(t)
 	rootFile, err := root.Open(".")
 	if err != nil {
 		t.Fatal(err)
@@ -1387,6 +1387,29 @@ func openWindowsTestRoot(t *testing.T) (*os.Root, string) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	return root, dir
+}
+
+func openWindowsDeleteShareTestRoot(t *testing.T) (*os.Root, string) {
+	t.Helper()
+	dir := t.TempDir()
+	// A directly opened Windows root does not share delete access. Open the
+	// test leaf relative to its parent so only the lease under test can fence
+	// the DELETE-capable calibration handle.
+	parent, err := os.OpenRoot(filepath.Dir(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := parent.OpenRoot(filepath.Base(dir))
+	closeErr := parent.Close()
+	if err != nil {
+		t.Fatal(errors.Join(err, closeErr))
+	}
+	if closeErr != nil {
+		_ = root.Close()
+		t.Fatal(closeErr)
 	}
 	t.Cleanup(func() { _ = root.Close() })
 	return root, dir
