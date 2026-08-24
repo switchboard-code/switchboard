@@ -322,6 +322,79 @@ func TestAcquireWindowsNamespaceLeaseRejectsReparseDirectory(t *testing.T) {
 	}
 }
 
+func TestWindowsNamespaceLeaseReopensAndDeleteLeasesExactRoot(t *testing.T) {
+	root, _ := openWindowsTestRoot(t)
+	rootFile, err := root.Open(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rootFile.Close()
+	openDelete := func() (windows.Handle, error) {
+		return reopenWindowsTestDirectoryDeleteHandle(windows.Handle(rootFile.Fd()))
+	}
+	probe, err := openDelete()
+	if err != nil {
+		t.Fatalf("calibrating exact root DELETE access: %v", err)
+	}
+	if err := windows.CloseHandle(probe); err != nil {
+		t.Fatal(err)
+	}
+
+	lease, err := acquireWindowsDestinationNamespaceLease(root, "target", "source")
+	if err != nil {
+		t.Fatalf("reopening exact namespace root for lease: %v", err)
+	}
+	defer lease.close()
+	leasedRoot, err := lease.directory("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := requireSameWindowsHandle(windows.Handle(rootFile.Fd()), leasedRoot); err != nil {
+		t.Fatalf("namespace root lease changed identity: %v", err)
+	}
+	if probe, err = openDelete(); err == nil {
+		_ = windows.CloseHandle(probe)
+		t.Fatal("DELETE-capable root handle opened while no-delete namespace lease was active")
+	} else if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+		t.Fatalf("opening DELETE-capable root handle during lease = %v, want sharing violation", err)
+	}
+	if err := lease.close(); err != nil {
+		t.Fatal(err)
+	}
+	probe, err = openDelete()
+	if err != nil {
+		t.Fatalf("root DELETE access remained blocked after lease close: %v", err)
+	}
+	if err := windows.CloseHandle(probe); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWindowsNamespaceLeaseRejectsReparseRoot(t *testing.T) {
+	root, dir := openWindowsTestRoot(t)
+	target := t.TempDir()
+	if err := setWindowsTestMountPoint(dir, target); err != nil {
+		if windowsReparseTestUnavailable(err) {
+			t.Skipf("this Windows environment cannot install a directory reparse point: %v", err)
+		}
+		t.Fatalf("installing root reparse point: %v", err)
+	}
+	defer func() {
+		if err := deleteWindowsTestMountPoint(dir); err != nil {
+			t.Errorf("cleaning root reparse point: %v", err)
+		}
+	}()
+
+	lease, err := acquireWindowsDestinationNamespaceLease(root, "target", "source")
+	if lease != nil {
+		_ = lease.close()
+		t.Fatal("namespace lease accepted a reparse-point root")
+	}
+	if err == nil {
+		t.Fatal("namespace lease did not reject a reparse-point root")
+	}
+}
+
 func TestWindowsNamespaceLeaseFencesWriteCapableAncestorHandles(t *testing.T) {
 	root, dir := openWindowsTestRoot(t)
 	parent := filepath.Join(dir, "nested")
@@ -1345,4 +1418,21 @@ func openWindowsDirectoryWriteHandle(path string) (windows.Handle, error) {
 		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
 		0,
 	)
+}
+
+func reopenWindowsTestDirectoryDeleteHandle(handle windows.Handle) (windows.Handle, error) {
+	result, _, callErr := reOpenFileWindows.Call(
+		uintptr(handle),
+		uintptr(uint32(windows.DELETE)),
+		uintptr(uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)),
+		uintptr(uint32(windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT)),
+	)
+	reopened := windows.Handle(result)
+	if reopened == windows.InvalidHandle || reopened == 0 {
+		if callErr == nil || callErr == windows.ERROR_SUCCESS {
+			callErr = windows.ERROR_INVALID_HANDLE
+		}
+		return windows.InvalidHandle, callErr
+	}
+	return reopened, nil
 }

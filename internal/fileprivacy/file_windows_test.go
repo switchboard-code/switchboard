@@ -6,7 +6,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -390,6 +392,111 @@ func TestWindowsSecureNormalizesOrdinaryCreationToExactUserOwner(t *testing.T) {
 	}
 	if private, err := IsOwnerOnly(f); err != nil || !private {
 		t.Fatalf("repaired protected owner-only=%v err=%v", private, err)
+	}
+}
+
+func TestWindowsSecureBootstrapsWriteOwnerFromTokenDefaultOwner(t *testing.T) {
+	current, defaultOwner, err := currentWindowsAuthoritySIDs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Equals(defaultOwner) {
+		t.Skip("TokenOwner equals TokenUser for this process")
+	}
+
+	for _, directory := range []bool{false, true} {
+		name := "file"
+		if directory {
+			name = "directory"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), name)
+			aceFlags := ""
+			if directory {
+				aceFlags = "OICI"
+			}
+			limited, err := windows.SecurityDescriptorFromString(
+				"D:P(A;" + aceFlags + ";FRFW;;;" + current.String() + ")")
+			if err != nil {
+				t.Fatal(err)
+			}
+			attributes := &windows.SecurityAttributes{
+				Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+				SecurityDescriptor: limited,
+			}
+
+			var f *os.File
+			if directory {
+				path16, err := windows.UTF16PtrFromString(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := windows.CreateDirectory(path16, attributes); err != nil {
+					t.Fatal(err)
+				}
+				f, err = openWindowsDirectory(path, false)
+			} else {
+				f, err = openWindowsFile(path, windows.GENERIC_READ|windows.READ_CONTROL,
+					attributes, windows.CREATE_NEW)
+			}
+			runtime.KeepAlive(limited)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if f != nil {
+					_ = f.Close()
+				}
+			}()
+
+			security, err := windows.GetSecurityInfo(windows.Handle(f.Fd()), windows.SE_FILE_OBJECT,
+				windows.OWNER_SECURITY_INFORMATION)
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner, _, err := security.Owner()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if owner == nil || !owner.Equals(defaultOwner) {
+				t.Skip("filesystem did not assign TokenOwner to the test object")
+			}
+			if direct, err := reopenWindowsObjectWithSecurityAccess(f, directory, true); err == nil {
+				_ = direct.Close()
+				t.Skip("token can acquire WRITE_OWNER without the DACL bootstrap")
+			} else if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+				t.Fatalf("direct WRITE_OWNER reopen: %v", err)
+			}
+
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			f = nil
+			if directory {
+				err = EnsurePrivateDir(path)
+				if err == nil {
+					f, err = openWindowsDirectory(path, false)
+				}
+			} else {
+				f, err = OpenWritable(path)
+				if err == nil {
+					err = Secure(f)
+				}
+			}
+			if err != nil {
+				t.Fatalf("securing TokenOwner-owned %s: %v", name, err)
+			}
+			if exact, err := IsCurrentUserOwner(f); err != nil || !exact {
+				t.Fatalf("exact TokenUser owner=%v err=%v", exact, err)
+			}
+			if directory {
+				if private, err := DirectoryIsOwnerOnly(f); err != nil || !private {
+					t.Fatalf("protected directory DACL=%v err=%v", private, err)
+				}
+			} else if private, err := IsOwnerOnly(f); err != nil || !private {
+				t.Fatalf("protected file DACL=%v err=%v", private, err)
+			}
+		})
 	}
 }
 

@@ -213,11 +213,12 @@ func acquireWindowsNamespaceLeaseForDestination(root *os.Root, destinationParent
 		return nil, errors.Join(err, lease.close())
 	}
 	rootHandle := windows.Handle(rootFile.Fd())
-	// Use the same no-reparse open and attribute check as every nested
-	// component. For a cross-root sink this runs after its anchor is created, so
-	// a reparse tag installed while the directory was empty is rejected and a
-	// later installation is blocked by the retained anchor entry.
-	leasedRoot, err := openWindowsNamespaceAncestor(rootHandle, ".", destinationParent == ".")
+	// ReOpenFile narrows the exact root handle's sharing without resolving a
+	// pathname. NtCreateFile rejects "." as a relative object name on Windows.
+	// For a cross-root sink this runs after its anchor is created, so a reparse
+	// tag installed while the directory was empty is rejected and a later
+	// installation is blocked by the retained anchor entry.
+	leasedRoot, err := reopenWindowsNamespaceRoot(rootHandle, destinationParent == ".")
 	if err != nil {
 		return fail(fmt.Errorf("leasing checkpoint namespace root: %w", err))
 	}
@@ -280,6 +281,30 @@ func (lease *windowsNamespaceLease) directory(name string) (windows.Handle, erro
 	return handle, nil
 }
 
+func reopenWindowsNamespaceRoot(root windows.Handle, shareWrites bool) (windows.Handle, error) {
+	share := uint32(windows.FILE_SHARE_READ)
+	if shareWrites {
+		share |= windows.FILE_SHARE_WRITE
+	}
+	result, _, callErr := reOpenFileWindows.Call(
+		uintptr(root),
+		uintptr(uint32(windows.FILE_TRAVERSE|windows.FILE_READ_ATTRIBUTES|windows.SYNCHRONIZE)),
+		uintptr(share),
+		uintptr(uint32(windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT)),
+	)
+	handle := windows.Handle(result)
+	if handle == windows.InvalidHandle || handle == 0 {
+		if callErr == nil || callErr == windows.ERROR_SUCCESS {
+			callErr = windows.ERROR_INVALID_HANDLE
+		}
+		return windows.InvalidHandle, callErr
+	}
+	if err := validateWindowsNamespaceDirectory(handle); err != nil {
+		return windows.InvalidHandle, errors.Join(err, windows.CloseHandle(handle))
+	}
+	return handle, nil
+}
+
 func openWindowsNamespaceAncestor(parent windows.Handle, component string, shareWrites bool) (windows.Handle, error) {
 	objectName, err := windows.NewNTUnicodeString(component)
 	if err != nil {
@@ -313,29 +338,27 @@ func openWindowsNamespaceAncestor(parent windows.Handle, component string, share
 	if err != nil {
 		return windows.InvalidHandle, err
 	}
-	var info windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
+	if err := validateWindowsNamespaceDirectory(handle); err != nil {
 		return windows.InvalidHandle, errors.Join(err, windows.CloseHandle(handle))
 	}
+	return handle, nil
+}
+
+func validateWindowsNamespaceDirectory(handle windows.Handle) error {
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
+		return err
+	}
 	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
-		return windows.InvalidHandle, errors.Join(
-			errors.New("checkpoint namespace ancestor is not a directory"),
-			windows.CloseHandle(handle),
-		)
+		return errors.New("checkpoint namespace ancestor is not a directory")
 	}
 	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return windows.InvalidHandle, errors.Join(
-			errors.New("checkpoint namespace ancestor is a reparse point"),
-			windows.CloseHandle(handle),
-		)
+		return errors.New("checkpoint namespace ancestor is a reparse point")
 	}
 	if _, err := stableWindowsFileID(handle); err != nil {
-		return windows.InvalidHandle, errors.Join(
-			fmt.Errorf("checkpoint namespace ancestor has no stable identity: %w", err),
-			windows.CloseHandle(handle),
-		)
+		return fmt.Errorf("checkpoint namespace ancestor has no stable identity: %w", err)
 	}
-	return handle, nil
+	return nil
 }
 
 func (lease *windowsNamespaceLease) close() error {
@@ -712,7 +735,7 @@ func disposeCapabilityProbeHandleWindows(handle windows.Handle) error {
 		uint32(unsafe.Sizeof(disposition)),
 	)
 	if exErr == nil {
-		return windows.FlushFileBuffers(handle)
+		return flushCapabilityProbeCleanupWindows(handle)
 	}
 	// The Ex form can remove a read-only probe directly. If the filesystem
 	// rejects it, clear the attribute through the exact handle before trying
@@ -745,7 +768,19 @@ func disposeCapabilityProbeHandleWindows(handle windows.Handle) error {
 	if legacyErr != nil {
 		return errors.Join(exErr, legacyErr)
 	}
-	return windows.FlushFileBuffers(handle)
+	return flushCapabilityProbeCleanupWindows(handle)
+}
+
+func flushCapabilityProbeCleanupWindows(handle windows.Handle) error {
+	// Every probe cleanup handle is synchronous and write-through. The exact
+	// failure-cleanup reopen intentionally requests only DELETE and attribute
+	// access, so FlushFileBuffers can report ACCESS_DENIED even after disposition
+	// succeeded. In that case the completed write-through namespace operation is
+	// the durability barrier, matching the production read-only-handle path.
+	if err := windows.FlushFileBuffers(handle); err != nil && !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		return err
+	}
+	return nil
 }
 
 func cleanupWindowsCapabilityProbe(probe *windowsCapabilityProbeFile) error {

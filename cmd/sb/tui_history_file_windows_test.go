@@ -3,11 +3,15 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"unsafe"
 
 	"github.com/switchboard-code/switchboard/internal/checkpoint"
+	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 	"golang.org/x/sys/windows"
 )
 
@@ -131,6 +135,66 @@ func TestWindowsHistoryDACLRepairReopensExactRootHandleAcrossPathSubstitution(t 
 	}
 	if private, err := historyFileIsOwnerOnly(replacement); err != nil || private {
 		t.Fatalf("replacement history owner-only=%v err=%v; exact-handle repair touched the path replacement", private, err)
+	}
+}
+
+func TestWindowsHistoryDACLRepairBootstrapsTokenDefaultOwner(t *testing.T) {
+	current, err := currentHistoryUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	limited, err := windows.SecurityDescriptorFromString(
+		"D:P(A;;FR;;;" + current.String() + ")")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attributes := &windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: limited,
+	}
+	path := filepath.Join(t.TempDir(), "token-owner.hist")
+	path16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := windows.CreateFile(path16, windows.GENERIC_READ|windows.READ_CONTROL,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		attributes, windows.CREATE_NEW,
+		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	runtime.KeepAlive(limited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := os.NewFile(uintptr(handle), path)
+	if f == nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal("converting TokenOwner prompt history handle")
+	}
+	defer f.Close()
+
+	if exact, err := fileprivacy.IsCurrentUserOwner(f); err != nil {
+		t.Fatal(err)
+	} else if exact {
+		t.Skip("TokenOwner equals TokenUser for this process")
+	}
+	if admitted, err := fileprivacy.IsOwnedByCurrentTokenAuthority(f); err != nil || !admitted {
+		t.Fatalf("TokenOwner authority admitted=%v err=%v", admitted, err)
+	}
+	if direct, err := reopenHistorySecurityFileWithAccess(f, true); err == nil {
+		_ = direct.Close()
+		t.Skip("token can acquire WRITE_OWNER without the DACL bootstrap")
+	} else if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		t.Fatalf("direct WRITE_OWNER reopen: %v", err)
+	}
+
+	if err := secureHistoryFile(f); err != nil {
+		t.Fatalf("securing TokenOwner prompt history: %v", err)
+	}
+	if exact, err := fileprivacy.IsCurrentUserOwner(f); err != nil || !exact {
+		t.Fatalf("exact TokenUser owner=%v err=%v", exact, err)
+	}
+	if private, err := historyFileIsOwnerOnly(f); err != nil || !private {
+		t.Fatalf("protected prompt history DACL=%v err=%v", private, err)
 	}
 }
 

@@ -34,11 +34,12 @@ func OpenInRoot(root *os.Root, name string) (*os.File, error) {
 		windows.FILE_GENERIC_READ|windows.READ_CONTROL, windows.FILE_OPEN, nil)
 }
 
-// OpenWritable opens an existing regular single-link file with the rights
-// needed to migrate its owner and DACL through the bound handle.
+// OpenWritable opens an existing regular single-link file for read/write use.
+// Secure reacquires ACL rights through this exact handle, including its
+// TokenOwner bootstrap when the current DACL does not grant WRITE_OWNER.
 func OpenWritable(path string) (*os.File, error) {
 	return openWindowsFile(path,
-		windows.GENERIC_READ|windows.GENERIC_WRITE|windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER,
+		windows.GENERIC_READ|windows.GENERIC_WRITE|windows.READ_CONTROL,
 		nil, windows.OPEN_EXISTING)
 }
 
@@ -277,7 +278,7 @@ func CreatePrivateDirInRoot(root *os.Root, name string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	directory, err := openWindowsRootDirectory(root, name, windows.FILE_CREATE, descriptor)
+	directory, err := openWindowsRootDirectory(root, name, windows.FILE_CREATE, descriptor, true)
 	if err != nil {
 		return nil, err
 	}
@@ -299,10 +300,10 @@ func openPrivateDirectoryInRoot(root *os.Root, name string) (*os.File, error) {
 	if err := validateRootLeaf(root, name); err != nil {
 		return nil, err
 	}
-	return openWindowsRootDirectory(root, name, windows.FILE_OPEN, nil)
+	return openWindowsRootDirectory(root, name, windows.FILE_OPEN, nil, false)
 }
 
-func openWindowsRootDirectory(root *os.Root, name string, disposition uint32, descriptor *windows.SECURITY_DESCRIPTOR) (*os.File, error) {
+func openWindowsRootDirectory(root *os.Root, name string, disposition uint32, descriptor *windows.SECURITY_DESCRIPTOR, writableACL bool) (*os.File, error) {
 	directory, err := root.Open(".")
 	if err != nil {
 		return nil, err
@@ -319,11 +320,14 @@ func openWindowsRootDirectory(root *os.Root, name string, disposition uint32, de
 		SecurityDescriptor: descriptor,
 	}
 	attributes.Length = uint32(unsafe.Sizeof(*attributes))
+	access := uint32(windows.FILE_LIST_DIRECTORY | windows.FILE_READ_ATTRIBUTES | windows.READ_CONTROL | windows.SYNCHRONIZE)
+	if writableACL {
+		access |= windows.WRITE_DAC | windows.WRITE_OWNER
+	}
 	var handle windows.Handle
 	err = windows.NtCreateFile(
 		&handle,
-		windows.FILE_LIST_DIRECTORY|windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL|
-			windows.WRITE_DAC|windows.WRITE_OWNER|windows.SYNCHRONIZE,
+		access,
 		attributes,
 		&windows.IO_STATUS_BLOCK{},
 		nil,
@@ -366,43 +370,12 @@ func EnsurePrivateDir(path string) error {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return err
 	}
-	f, err := openWindowsDirectory(path, true)
+	f, err := openWindowsDirectory(path, false)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	owned, err := IsOwnedByCurrentTokenAuthority(f)
-	if err != nil {
-		return fmt.Errorf("checking owner-private directory owner: %w", err)
-	}
-	if !owned {
-		return errors.New("owner-private directory is not owned by the current user")
-	}
-	descriptor, err := ownerOnlyWindowsDirectoryDescriptor()
-	if err != nil {
-		return err
-	}
-	dacl, _, err := descriptor.DACL()
-	if err != nil {
-		return err
-	}
-	current, err := currentWindowsUserSID()
-	if err != nil {
-		return err
-	}
-	if err := windows.SetSecurityInfo(windows.Handle(f.Fd()), windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		current, nil, dacl, nil); err != nil {
-		return fmt.Errorf("setting current-user-only directory DACL: %w", err)
-	}
-	ownerOnly, err := windowsObjectIsOwnerOnly(f, true)
-	if err != nil {
-		return err
-	}
-	if !ownerOnly {
-		return errors.New("Windows did not retain the current-user-only directory DACL")
-	}
-	return nil
+	return SecureDirectory(f)
 }
 
 // SecureDirectory applies the same owner and ACL contract as EnsurePrivateDir
@@ -432,7 +405,7 @@ func SecureDirectory(f *os.File) error {
 	if err != nil {
 		return err
 	}
-	mutation, err := reopenWindowsObjectForSecurity(f, true, !exactOwner)
+	mutation, err := reopenWindowsObjectForSecurity(f, true, !exactOwner, dacl)
 	if err != nil {
 		return fmt.Errorf("reopening owner-private directory for security repair: %w", err)
 	}
@@ -516,7 +489,7 @@ func Secure(f *os.File) error {
 	if err != nil {
 		return err
 	}
-	mutation, err := reopenWindowsObjectForSecurity(f, false, !exactOwner)
+	mutation, err := reopenWindowsObjectForSecurity(f, false, !exactOwner, dacl)
 	if err != nil {
 		return fmt.Errorf("reopening owner-private file for security repair: %w", err)
 	}
@@ -546,7 +519,34 @@ func Secure(f *os.File) error {
 // object selected by f. ReOpenFile is identity-bound, so callers that received
 // an os.Root handle without WRITE_DAC can repair it without a pathname reopen
 // or a final-component substitution race.
-func reopenWindowsObjectForSecurity(f *os.File, directory, writeOwner bool) (*os.File, error) {
+//
+// A token's default owner can differ from TokenUser, notably for an elevated
+// process. Ownership implicitly grants WRITE_DAC but not WRITE_OWNER. In that
+// case, first use WRITE_DAC to give TokenUser full control without changing the
+// owner, close that handle, and only then request WRITE_OWNER for the final
+// owner normalization.
+func reopenWindowsObjectForSecurity(f *os.File, directory, writeOwner bool, dacl *windows.ACL) (*os.File, error) {
+	if writeOwner {
+		if dacl == nil {
+			return nil, errors.New("owner-private security repair has no bootstrap DACL")
+		}
+		bootstrap, err := reopenWindowsObjectWithSecurityAccess(f, directory, false)
+		if err != nil {
+			return nil, fmt.Errorf("reopening exact object for DACL bootstrap: %w", err)
+		}
+		setErr := windows.SetSecurityInfo(windows.Handle(bootstrap.Fd()), windows.SE_FILE_OBJECT,
+			windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+			nil, nil, dacl, nil)
+		closeErr := bootstrap.Close()
+		if setErr != nil || closeErr != nil {
+			return nil, fmt.Errorf("bootstrapping current-user DACL before owner repair: %w",
+				errors.Join(setErr, closeErr))
+		}
+	}
+	return reopenWindowsObjectWithSecurityAccess(f, directory, writeOwner)
+}
+
+func reopenWindowsObjectWithSecurityAccess(f *os.File, directory, writeOwner bool) (*os.File, error) {
 	if f == nil {
 		return nil, errors.New("owner-private security repair has no object handle")
 	}

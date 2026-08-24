@@ -32,7 +32,10 @@ func openHistoryDataDescriptor(path string, writable, createNew bool) (*os.File,
 	}
 	access := uint32(windows.GENERIC_READ | windows.READ_CONTROL)
 	if writable {
-		access |= windows.GENERIC_WRITE | windows.WRITE_DAC | windows.WRITE_OWNER
+		access |= windows.GENERIC_WRITE
+	}
+	if createNew {
+		access |= windows.WRITE_DAC | windows.WRITE_OWNER
 	}
 	disposition := uint32(windows.OPEN_EXISTING)
 	var attributes *windows.SecurityAttributes
@@ -213,7 +216,7 @@ func secureHistoryFile(f *os.File) error {
 	if err != nil {
 		return err
 	}
-	mutation, err := reopenHistorySecurityFile(f, !exactOwner)
+	mutation, err := reopenHistorySecurityFile(f, !exactOwner, dacl)
 	if err != nil {
 		return fmt.Errorf("reopening exact prompt history for DACL repair: %w", err)
 	}
@@ -243,7 +246,28 @@ func secureHistoryFile(f *os.File) error {
 	return nil
 }
 
-func reopenHistorySecurityFile(f *os.File, writeOwner bool) (*os.File, error) {
+func reopenHistorySecurityFile(f *os.File, writeOwner bool, dacl *windows.ACL) (*os.File, error) {
+	if writeOwner {
+		if dacl == nil {
+			return nil, errors.New("prompt history DACL repair has no bootstrap DACL")
+		}
+		bootstrap, err := reopenHistorySecurityFileWithAccess(f, false)
+		if err != nil {
+			return nil, fmt.Errorf("reopening exact prompt history for DACL bootstrap: %w", err)
+		}
+		setErr := windows.SetSecurityInfo(windows.Handle(bootstrap.Fd()), windows.SE_FILE_OBJECT,
+			windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+			nil, nil, dacl, nil)
+		closeErr := bootstrap.Close()
+		if setErr != nil || closeErr != nil {
+			return nil, fmt.Errorf("bootstrapping current-user prompt history DACL before owner repair: %w",
+				errors.Join(setErr, closeErr))
+		}
+	}
+	return reopenHistorySecurityFileWithAccess(f, writeOwner)
+}
+
+func reopenHistorySecurityFileWithAccess(f *os.File, writeOwner bool) (*os.File, error) {
 	if f == nil {
 		return nil, errors.New("prompt history DACL repair has no file handle")
 	}
@@ -359,8 +383,7 @@ func syncHistoryBoundDirectory(*os.Root) error { return nil }
 func reopenHistoryMutationFile(f *os.File) (*os.File, error) {
 	result, _, callErr := historyReOpenFileWindows.Call(
 		f.Fd(),
-		uintptr(uint32(windows.GENERIC_READ|windows.GENERIC_WRITE|windows.READ_CONTROL|
-			windows.WRITE_DAC|windows.WRITE_OWNER|windows.DELETE)),
+		uintptr(uint32(windows.GENERIC_READ|windows.GENERIC_WRITE|windows.READ_CONTROL|windows.DELETE)),
 		uintptr(uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)),
 		uintptr(uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_WRITE_THROUGH)),
 	)

@@ -142,7 +142,7 @@ func createPrivateWindowsDirectory(path string) (bool, error) {
 }
 
 func securePrivateSessionDirectoryPath(path string) error {
-	f, err := openPrivateSessionWindowsObject(path, true, true)
+	f, err := openPrivateSessionWindowsObject(path, true, false)
 	if err != nil {
 		return err
 	}
@@ -150,7 +150,7 @@ func securePrivateSessionDirectoryPath(path string) error {
 }
 
 func securePrivateSessionFilePath(path string) error {
-	f, err := openPrivateSessionWindowsObject(path, false, true)
+	f, err := openPrivateSessionWindowsObject(path, false, false)
 	if err != nil {
 		return err
 	}
@@ -241,28 +241,13 @@ func securePrivateSessionWindowsObject(f *os.File, directory bool) error {
 	if err := verifyPrivateSessionWindowsKind(f, directory); err != nil {
 		return err
 	}
-	owned, err := fileprivacy.IsOwnedByCurrentTokenAuthority(f)
+	var err error
+	if directory {
+		err = fileprivacy.SecureDirectory(f)
+	} else {
+		err = fileprivacy.Secure(f)
+	}
 	if err != nil {
-		return fmt.Errorf("checking private session object owner: %w", err)
-	}
-	if !owned {
-		return errors.New("private session object is not owned by the current user")
-	}
-	descriptor, err := privateSessionWindowsDescriptor(directory)
-	if err != nil {
-		return err
-	}
-	dacl, _, err := descriptor.DACL()
-	if err != nil {
-		return err
-	}
-	current, err := currentSessionWindowsUserSID()
-	if err != nil {
-		return err
-	}
-	if err := windows.SetSecurityInfo(windows.Handle(f.Fd()), windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		current, nil, dacl, nil); err != nil {
 		return fmt.Errorf("setting current-user-only session DACL: %w", err)
 	}
 	ownerOnly, err := privateSessionWindowsObjectIsOwnerOnly(f, directory)

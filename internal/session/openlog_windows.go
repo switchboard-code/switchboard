@@ -15,7 +15,7 @@ func openSessionLogDescriptor(path string, writable bool) (*os.File, error) {
 	}
 	access := uint32(windows.GENERIC_READ)
 	if writable {
-		access |= windows.GENERIC_WRITE | windows.READ_CONTROL | windows.WRITE_DAC | windows.WRITE_OWNER
+		access |= windows.GENERIC_WRITE | windows.READ_CONTROL
 	} else {
 		access |= windows.READ_CONTROL
 	}
