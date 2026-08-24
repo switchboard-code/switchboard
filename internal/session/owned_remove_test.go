@@ -21,11 +21,10 @@ func TestOwnedRemoveMismatchRestoresWithoutOverwrite(t *testing.T) {
 			if err := os.WriteFile(path, []byte("owned original"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			expected, err := os.Lstat(path)
+			owner, expected := openedOwnedRemoveIdentity(t, path)
+			defer owner.Close()
+			err := os.Rename(path, original)
 			if err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Rename(path, original); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(path, []byte("foreign replacement"), 0o600); err != nil {
@@ -87,10 +86,8 @@ func TestOwnedRemoveExactMatchLeavesNoRecoveryArtifact(t *testing.T) {
 	if err := os.WriteFile(path, []byte("owned"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	expected, err := os.Lstat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	owner, expected := openedOwnedRemoveIdentity(t, path)
+	defer owner.Close()
 	if err := removePathIfSame(path, expected); err != nil {
 		t.Fatal(err)
 	}
@@ -98,6 +95,25 @@ func TestOwnedRemoveExactMatchLeavesNoRecoveryArtifact(t *testing.T) {
 		t.Fatalf("owned path still exists: %v", err)
 	}
 	assertNoOwnedRemoveQuarantine(t, dir)
+}
+
+// removePathIfSame accepts a descriptor-derived identity. That distinction is
+// observable on Windows: os.Lstat defers loading a file ID until SameFile and
+// would try to resolve the old pathname only after removePathIfSame quarantines
+// it. Keeping this descriptor open also verifies that the Windows opener grants
+// delete sharing, as maintenance does while it owns the session lock.
+func openedOwnedRemoveIdentity(t *testing.T, path string) (*os.File, os.FileInfo) {
+	t.Helper()
+	f, err := openSessionLogDescriptor(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	return f, info
 }
 
 func assertNoOwnedRemoveQuarantine(t *testing.T, dir string) {

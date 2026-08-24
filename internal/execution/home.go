@@ -31,11 +31,20 @@ func accountHomeDir() (string, error) {
 // this directory too when it differs from the account home, but it never uses
 // it as a substitute for the account-home security boundary.
 func ambientHomeDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolving ambient home: %w", err)
+	// os.UserHomeDir consults HOME on Unix, but USERPROFILE (or
+	// HOMEDRIVE/HOMEPATH) on Windows. Switchboard's functional child
+	// environment deliberately treats an explicit HOME consistently across
+	// platforms: Unix-oriented build tools honor it on Windows too, and the
+	// confinement boundary must cover the same directory those tools see.
+	home := os.Getenv("HOME")
+	if home == "" {
+		var err error
+		home, err = os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolving ambient home: %w", err)
+		}
 	}
-	return canonicalHomeDirectory(home, "ambient home")
+	return canonicalAmbientHomeDirectory(home)
 }
 
 func canonicalHomeDirectory(path, kind string) (string, error) {

@@ -302,6 +302,65 @@ func TestProblemStoreRedactsCredentialFieldsBeforeTheirCaps(t *testing.T) {
 	}
 }
 
+func TestRedactThenTruncateUTF8DoesNotLeakAcrossTheBoundary(t *testing.T) {
+	token := "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+	privateBlock := "-----BEGIN RSA PRIVATE KEY-----\nprivate-body\n-----END RSA PRIVATE KEY-----"
+	longPrivateHeader := "-----BEGIN " + strings.Repeat("A", 128) + "PRIVATE KEY-----\nprivate-body"
+	cases := []struct {
+		name      string
+		value     string
+		limit     int
+		forbidden []string
+	}{
+		{
+			name:      "token starts immediately before cap",
+			value:     strings.Repeat("p", 63) + token,
+			limit:     64,
+			forbidden: []string{"ghp_", token},
+		},
+		{
+			name:      "private key body crosses cap",
+			value:     "prefix " + privateBlock,
+			limit:     48,
+			forbidden: []string{"-----BEGIN", "private-body", "-----END"},
+		},
+		{
+			name:      "unbounded private key label crosses cap",
+			value:     "prefix " + longPrivateHeader,
+			limit:     32,
+			forbidden: []string{"-----BEGIN", "private-body"},
+		},
+		{
+			name:      "complete private key before cap",
+			value:     privateBlock + " trailing diagnostic",
+			limit:     256,
+			forbidden: []string{"-----BEGIN", "private-body", "-----END"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactThenTruncateUTF8(tc.value, tc.limit)
+			if len(got) > tc.limit || !utf8.ValidString(got) {
+				t.Fatalf("result is not a valid bounded string: %q", got)
+			}
+			for _, forbidden := range tc.forbidden {
+				if strings.Contains(got, forbidden) {
+					t.Fatalf("result exposed %q across its cap: %q", forbidden, got)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkRedactThenTruncateUTF8LongBenign(b *testing.B) {
+	value := strings.Repeat("é", maxProblemMessageBytes)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(value)))
+	for i := 0; i < b.N; i++ {
+		redactThenTruncateUTF8(value, maxProblemMessageBytes)
+	}
+}
+
 func TestProblemStoreSubscriptionCoalescesAndCancels(t *testing.T) {
 	store := NewProblemStore(t.TempDir())
 	changes, cancel := store.Subscribe()

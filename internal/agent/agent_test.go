@@ -1395,21 +1395,57 @@ func TestNoDefaultRoundLimit(t *testing.T) {
 	}
 }
 
+type cancellationBlockingTool struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (*cancellationBlockingTool) Name() string        { return "cancel-block" }
+func (*cancellationBlockingTool) Description() string { return "wait for cancellation" }
+func (*cancellationBlockingTool) Schema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","additionalProperties":false}`)
+}
+func (*cancellationBlockingTool) ParallelSafe() bool { return false }
+func (t *cancellationBlockingTool) Plan(json.RawMessage) (tools.Plan, error) {
+	return tools.Plan{
+		Request: permission.Request{Tool: "cancel-block", Effect: permission.EffectRead},
+		Run: func(ctx context.Context) (tools.Result, error) {
+			t.once.Do(func() { close(t.started) })
+			<-ctx.Done()
+			return tools.Result{}, ctx.Err()
+		},
+	}, nil
+}
+
 func TestCancellationStillPairsResultsWithCalls(t *testing.T) {
 	h := newHarness(t, permission.ModeDefault,
 		toolTurn(
-			use("call_1", "exec", `{"command":["sleep","10"],"timeout_seconds":30}`),
-			use("call_2", "exec", `{"command":["echo","never"]}`),
+			use("call_1", "cancel-block", `{}`),
+			use("call_2", "cancel-block", `{}`),
 		),
 	)
+	blocking := &cancellationBlockingTool{started: make(chan struct{})}
+	if err := h.loop.Tools.AddExternal(blocking); err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
 	go func() {
-		time.Sleep(150 * time.Millisecond)
-		cancel()
+		result <- h.loop.Turn(ctx, "run things")
 	}()
-
-	err := h.loop.Turn(ctx, "run things")
+	select {
+	case <-blocking.started:
+		cancel()
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking tool did not start")
+	}
+	var err error
+	select {
+	case err = <-result:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled tool batch did not settle")
+	}
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}

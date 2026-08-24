@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestScanPromptFindsKnownTokenShapes(t *testing.T) {
@@ -115,6 +116,104 @@ func TestSafePrefixForTruncationLeavesOrdinaryAndExcludedTokensAlone(t *testing.
 				t.Fatalf("SafePrefixForTruncation = %q, %d; want %q, %d", got, cut, tc.want, tc.cut)
 			}
 		})
+	}
+}
+
+func TestSafePrefixForTruncationRedactsEveryCredentialAcrossEveryBoundary(t *testing.T) {
+	cases := []struct {
+		name   string
+		secret string
+		kind   string
+	}{
+		{"anthropic", "sk-ant-api03-" + "abcdefghijklmnopqrstuvwx", "an Anthropic API key"},
+		{"openai", "sk-proj-" + "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN", "an OpenAI API key"},
+		{"github", "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789", "a GitHub token"},
+		{"github fine grained", "github_pat_" + "11ABCDEFG0abcdefghijklm", "a GitHub fine-grained token"},
+		{"gitlab", "glpat-" + "abcdefghij0123456789", "a GitLab token"},
+		{"slack", "xoxb-" + "1234567890-abcdef", "a Slack token"},
+		{"aws", "AKIAIOSFODNN7EXAMPLE", "an AWS access key ID"},
+		{"google", "AIza" + "SyA-abcdefghijklmnopqrstuvwxyz01234", "a Google API key"},
+		{"stripe", "sk_live_" + "abcdefghij0123456789", "a Stripe live key"},
+		{"npm", "npm_" + "abcdefghijklmnopqrstuvwxyz0123456789", "an npm token"},
+		{"hugging face", "hf_" + "abcdefghijklmnopqrstuvwxyz01234", "a Hugging Face token"},
+		{"private key", "-----BEGIN RSA PRIVATE KEY-----\nbody\n-----END RSA PRIVATE KEY-----", "a private key block"},
+	}
+	const before = "safe prefix: "
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			text := before + tc.secret + " harmless tail"
+			for boundary := len(before) + 1; boundary < len(before)+len(tc.secret); boundary++ {
+				got, cut := SafePrefixForTruncation(text, boundary)
+				if cut != len(before) {
+					t.Fatalf("boundary %d retained %d source bytes, want %d", boundary, cut, len(before))
+				}
+				want := before + "[redacted: " + tc.kind + "]"
+				if got != want {
+					t.Fatalf("boundary %d = %q, want %q", boundary, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestSafePrefixForTruncationConservativelyBoundsAnAmbiguousPrivateKeyHeader(t *testing.T) {
+	const before = "safe prefix: "
+	longLabel := strings.Repeat("A", scanShape.boundaryLookahead+64)
+	text := before + privateKeyBegin + longLabel + privateKeySuffix + "\nbody"
+	boundary := len(before) + len(privateKeyBegin) + 1
+	got, cut := SafePrefixForTruncation(text, boundary)
+	if cut != len(before) || got != before+"[redacted: a private key block]" {
+		t.Fatalf("long boundary-spanning header = %q, %d", got, cut)
+	}
+
+	// Put the bounded scan's end inside the suffix hyphens. Seeing '-' is
+	// normally enough to reject a non-key PEM label, but a partial copy of the
+	// required suffix must remain ambiguous until the bytes after the cap are
+	// considered.
+	boundary = len(before) + 1
+	scanEnd := boundary + scanShape.boundaryLookahead
+	suffixPrefix := "PRIVATE KEY--"
+	labelBytes := scanEnd - len(before) - len(privateKeyBegin) - len(suffixPrefix)
+	straddlingSuffix := before + privateKeyBegin + strings.Repeat("A", labelBytes) + privateKeySuffix + "\nbody"
+	got, cut = SafePrefixForTruncation(straddlingSuffix, boundary)
+	if cut != len(before) || got != before+"[redacted: a private key block]" {
+		t.Fatalf("suffix-straddling private header = %q, %d", got, cut)
+	}
+
+	certificate := before + "-----BEGIN CERTIFICATE-----\nbody"
+	got, cut = SafePrefixForTruncation(certificate, boundary)
+	if cut != boundary || got != certificate[:boundary] {
+		t.Fatalf("ordinary PEM label was treated as a private key: %q, %d", got, cut)
+	}
+}
+
+func TestSafePrefixForTruncationBoundsOrdinaryTailWork(t *testing.T) {
+	if testing.Short() {
+		t.Skip("performance regression check")
+	}
+	// The retained prefix is 4 KiB; making the omitted tail four MiB must not
+	// make each call scan that tail. The generous threshold only distinguishes
+	// bounded prefix work from the prior all-pattern, whole-tail regexp scan,
+	// particularly under -race.
+	text := strings.Repeat("é", 2<<20)
+	started := time.Now()
+	for i := 0; i < 8; i++ {
+		got, cut := SafePrefixForTruncation(text, 4<<10)
+		if cut != 4<<10 || len(got) != 4<<10 {
+			t.Fatalf("bounded prefix = %d bytes, cut %d", len(got), cut)
+		}
+	}
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Fatalf("bounded truncation scanned the ordinary tail: %s", elapsed)
+	}
+}
+
+func BenchmarkSafePrefixForTruncationBoundedTail(b *testing.B) {
+	text := strings.Repeat("é", 2<<20)
+	b.ReportAllocs()
+	b.SetBytes(4 << 10)
+	for i := 0; i < b.N; i++ {
+		SafePrefixForTruncation(text, 4<<10)
 	}
 }
 

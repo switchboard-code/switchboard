@@ -78,7 +78,14 @@ func TestExternalEditorRefusesHardlink(t *testing.T) {
 		t.Skipf("hard links unavailable: %v", err)
 	}
 	msg := finishEditorDraft(draft, nil)
-	if msg.err == nil || !strings.Contains(msg.err.Error(), "single-link") || msg.content != "" {
+	refusal := ""
+	if msg.err != nil {
+		refusal = msg.err.Error()
+	}
+	// Unix reports the policy-level single-link refusal; Windows' handle-level
+	// verifier reports the observed hard-link count. Both prove the same
+	// fail-closed decision, and neither platform may return the prompt.
+	if msg.err == nil || (!strings.Contains(refusal, "single-link") && !strings.Contains(refusal, "hard links")) || msg.content != "" {
 		t.Fatalf("hardlinked editor result = %q, %v", msg.content, msg.err)
 	}
 	_ = os.Remove(link)

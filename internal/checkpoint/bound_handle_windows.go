@@ -19,11 +19,9 @@ import (
 var reOpenFileWindows = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReOpenFile")
 
 // fileRenameInfoWindows is FILE_RENAME_INFORMATION's legacy no-replace
-// layout. Go supplies the architecture-specific padding between the BOOLEAN
-// and RootDirectory. The extended information class is deliberately not used:
-// some supported Windows kernels reject FileRenameInformationEx when its flags
-// are zero, while zero flags are exactly the legacy no-replace operation this
-// package needs.
+// layout. FileRenameInformation interprets the first union member as a
+// BOOLEAN; the DWORD Flags member belongs to FileRenameInformationEx. Keeping
+// this byte zero is the kernel-enforced no-replace guarantee.
 type fileRenameInfoWindows struct {
 	ReplaceIfExists byte
 	RootDirectory   windows.Handle
@@ -42,6 +40,13 @@ type fileDispositionInfoWindows struct {
 type fileIDInfoWindows struct {
 	VolumeSerialNumber uint64
 	FileID             [16]byte
+}
+
+type fileBasicInfoWindows struct {
+	CreationTime, LastAccessTime int64
+	LastWriteTime, ChangeTime    int64
+	FileAttributes               uint32
+	_                            uint32
 }
 
 type windowsHandlePhase uint8
@@ -67,18 +72,130 @@ var windowsHandlePhaseTestHook func(windowsHandlePhase) error
 var windowsBeforeNativeRenameTestHook func(from, to string) error
 
 // windowsNamespaceLease keeps every directory ancestor below the retained
-// root open with read sharing only. An attacker that already holds a
-// write- or delete-capable handle makes acquisition fail; once acquisition
-// succeeds, opening either kind of handle is refused until close. That fences
-// both ancestor rename/removal and in-place reparse metadata changes.
-// Components are opened one at a time under the retained root with
+// root open through an exact handle. Source-only ancestors use read sharing
+// only, fencing both rename/removal and in-place reparse metadata changes. A
+// nested destination's final parent additionally shares writes because
+// FileRenameInformation reopens that directory for FILE_ADD_FILE; it still
+// refuses delete sharing, so the selected directory cannot be moved or
+// removed. Components are opened one at a time under the retained root with
 // OBJ_DONT_REPARSE, so a junction cannot redirect acquisition itself.
 type windowsNamespaceLease struct {
-	root      *os.File
-	ancestors []windows.Handle
+	root        *os.File
+	ancestors   []windows.Handle
+	directories map[string]windows.Handle
+}
+
+// windowsNamespaceAnchor keeps a separate retirement sink nonempty while
+// FileRenameInformation derives and reopens its destination directory by
+// pathname. NTFS refuses to install a directory reparse point on a nonempty
+// directory; the anchor's no-delete share mode prevents an attacker from
+// removing or moving this exact link until the cross-root mutation finishes.
+type windowsNamespaceAnchor struct {
+	name   string
+	handle windows.Handle
+}
+
+func createWindowsNamespaceAnchor(root *os.Root) (*windowsNamespaceAnchor, error) {
+	if root == nil {
+		return nil, errors.New("Windows namespace anchor requires a bound root")
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		return nil, fmt.Errorf("opening Windows namespace anchor root: %w", err)
+	}
+	closeDirectory := func(err error) error {
+		return errors.Join(err, directory.Close())
+	}
+	for range 100 {
+		name, err := randomQuarantineName()
+		if err != nil {
+			return nil, closeDirectory(err)
+		}
+		objectName, err := windows.NewNTUnicodeString(name)
+		if err != nil {
+			return nil, closeDirectory(err)
+		}
+		attributes := &windows.OBJECT_ATTRIBUTES{
+			RootDirectory: windows.Handle(directory.Fd()),
+			ObjectName:    objectName,
+			Attributes:    windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
+		}
+		attributes.Length = uint32(unsafe.Sizeof(*attributes))
+		handle := windows.InvalidHandle
+		err = windows.NtCreateFile(
+			&handle,
+			windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE|windows.DELETE,
+			attributes,
+			&windows.IO_STATUS_BLOCK{},
+			nil,
+			windows.FILE_ATTRIBUTE_NORMAL,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+			windows.FILE_CREATE,
+			windows.FILE_NON_DIRECTORY_FILE|windows.FILE_SYNCHRONOUS_IO_NONALERT|
+				windows.FILE_OPEN_REPARSE_POINT|windows.FILE_WRITE_THROUGH|windows.FILE_DELETE_ON_CLOSE,
+			0,
+			0,
+		)
+		runtime.KeepAlive(objectName)
+		runtime.KeepAlive(directory)
+		if status, ok := err.(windows.NTStatus); ok && status == windows.STATUS_OBJECT_NAME_COLLISION {
+			continue
+		}
+		if err != nil {
+			return nil, closeDirectory(fmt.Errorf("creating private Windows namespace anchor: %w", err))
+		}
+		anchor := &windowsNamespaceAnchor{name: name, handle: handle}
+		if closeErr := directory.Close(); closeErr != nil {
+			return nil, errors.Join(closeErr, anchor.close())
+		}
+		return anchor, nil
+	}
+	return nil, closeDirectory(errors.New("could not allocate a private Windows namespace anchor"))
+}
+
+func (anchor *windowsNamespaceAnchor) close() error {
+	if anchor == nil || anchor.handle == windows.InvalidHandle || anchor.handle == 0 {
+		return nil
+	}
+	handle := anchor.handle
+	anchor.handle = windows.InvalidHandle
+	// FILE_DELETE_ON_CLOSE makes cleanup part of the kernel handle lifetime:
+	// normal close and abrupt process termination both retire the exact anchor
+	// link, with no pathname lookup and no unjournaled crash debris.
+	return windows.CloseHandle(handle)
 }
 
 func acquireWindowsNamespaceLease(root *os.Root, names ...string) (*windowsNamespaceLease, error) {
+	return acquireWindowsNamespaceLeaseForDestination(root, "", names...)
+}
+
+// acquireWindowsDestinationNamespaceLease gives the exact destination parent
+// the write sharing required by FileRenameInformation without weakening any
+// source-only ancestor. A nested destination is therefore permitted only when
+// every named file is its sibling; cross-parent moves may target only the
+// already-bound root.
+func acquireWindowsDestinationNamespaceLease(root *os.Root, destination string, names ...string) (*windowsNamespaceLease, error) {
+	if err := validateBoundRelativeWindows(destination); err != nil {
+		return nil, err
+	}
+	destinationParent := filepath.Dir(destination)
+	allNames := make([]string, 0, len(names)+1)
+	allNames = append(allNames, names...)
+	allNames = append(allNames, destination)
+	if destinationParent != "." {
+		for _, name := range allNames {
+			if err := validateBoundRelativeWindows(name); err != nil {
+				return nil, err
+			}
+			if filepath.Dir(name) != destinationParent {
+				return nil, errors.New("secure Windows destination lease requires sibling names or a destination in the bound root")
+			}
+		}
+	}
+	return acquireWindowsNamespaceLeaseForDestination(root, destinationParent, allNames...)
+}
+
+func acquireWindowsNamespaceLeaseForDestination(root *os.Root, destinationParent string, names ...string) (*windowsNamespaceLease, error) {
 	if root == nil {
 		return nil, errors.New("Windows namespace lease requires a bound root")
 	}
@@ -95,18 +212,32 @@ func acquireWindowsNamespaceLease(root *os.Root, names ...string) (*windowsNames
 	fail := func(err error) (*windowsNamespaceLease, error) {
 		return nil, errors.Join(err, lease.close())
 	}
+	rootHandle := windows.Handle(rootFile.Fd())
+	// Use the same no-reparse open and attribute check as every nested
+	// component. For a cross-root sink this runs after its anchor is created, so
+	// a reparse tag installed while the directory was empty is rejected and a
+	// later installation is blocked by the retained anchor entry.
+	leasedRoot, err := openWindowsNamespaceAncestor(rootHandle, ".", destinationParent == ".")
+	if err != nil {
+		return fail(fmt.Errorf("leasing checkpoint namespace root: %w", err))
+	}
+	if err := requireSameWindowsHandle(rootHandle, leasedRoot); err != nil {
+		return fail(errors.Join(err, windows.CloseHandle(leasedRoot)))
+	}
+	lease.ancestors = append(lease.ancestors, leasedRoot)
 
 	// Canonical paths let shared prefixes reuse the exact leased handle. Keep
 	// the spelling case-sensitive here: on a case-sensitive NTFS directory two
 	// differently cased components may genuinely be distinct, and redundant
 	// handles on ordinary NTFS are harmless.
-	opened := map[string]windows.Handle{".": windows.Handle(rootFile.Fd())}
+	opened := map[string]windows.Handle{".": leasedRoot}
+	lease.directories = opened
 	for _, name := range names {
 		parent := filepath.Dir(name)
 		if parent == "." {
 			continue
 		}
-		current := windows.Handle(rootFile.Fd())
+		current := leasedRoot
 		prefix := ""
 		for _, component := range strings.Split(parent, string(filepath.Separator)) {
 			if prefix == "" {
@@ -118,7 +249,7 @@ func acquireWindowsNamespaceLease(root *os.Root, names ...string) (*windowsNames
 				current = handle
 				continue
 			}
-			handle, err := openWindowsNamespaceAncestor(current, component)
+			handle, err := openWindowsNamespaceAncestor(current, component, prefix == destinationParent)
 			if err != nil {
 				return fail(fmt.Errorf("leasing checkpoint namespace ancestor %q: %w", prefix, err))
 			}
@@ -131,7 +262,25 @@ func acquireWindowsNamespaceLease(root *os.Root, names ...string) (*windowsNames
 	return lease, nil
 }
 
-func openWindowsNamespaceAncestor(parent windows.Handle, component string) (windows.Handle, error) {
+// directory returns the already-leased exact parent of name. When it is used
+// as FileRenameInformation's RootDirectory, the object manager may reopen the
+// directory; the nonzero handle remains the authority for that relative open.
+func (lease *windowsNamespaceLease) directory(name string) (windows.Handle, error) {
+	if lease == nil || lease.root == nil {
+		return windows.InvalidHandle, errors.New("Windows namespace lease is closed")
+	}
+	parent := filepath.Dir(name)
+	handle, ok := lease.directories[parent]
+	if !ok {
+		return windows.InvalidHandle, fmt.Errorf("checkpoint parent %q was not leased", parent)
+	}
+	if handle == 0 || handle == windows.InvalidHandle {
+		return windows.InvalidHandle, fmt.Errorf("checkpoint parent %q has no live exact handle", parent)
+	}
+	return handle, nil
+}
+
+func openWindowsNamespaceAncestor(parent windows.Handle, component string, shareWrites bool) (windows.Handle, error) {
 	objectName, err := windows.NewNTUnicodeString(component)
 	if err != nil {
 		return windows.InvalidHandle, err
@@ -142,6 +291,10 @@ func openWindowsNamespaceAncestor(parent windows.Handle, component string) (wind
 		Attributes:    windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
 	}
 	attributes.Length = uint32(unsafe.Sizeof(*attributes))
+	share := uint32(windows.FILE_SHARE_READ)
+	if shareWrites {
+		share |= windows.FILE_SHARE_WRITE
+	}
 	var handle windows.Handle
 	err = windows.NtCreateFile(
 		&handle,
@@ -150,7 +303,7 @@ func openWindowsNamespaceAncestor(parent windows.Handle, component string) (wind
 		&windows.IO_STATUS_BLOCK{},
 		nil,
 		0,
-		windows.FILE_SHARE_READ,
+		share,
 		windows.FILE_OPEN,
 		windows.FILE_DIRECTORY_FILE|windows.FILE_SYNCHRONOUS_IO_NONALERT,
 		0,
@@ -194,6 +347,7 @@ func (lease *windowsNamespaceLease) close() error {
 		err = errors.Join(err, windows.CloseHandle(lease.ancestors[i]))
 	}
 	lease.ancestors = nil
+	lease.directories = nil
 	if lease.root != nil {
 		err = errors.Join(err, lease.root.Close())
 		lease.root = nil
@@ -209,7 +363,28 @@ var windowsRetirementCapabilities = struct {
 type windowsCapabilityProbeFile struct {
 	name     string
 	opened   *os.File
-	mutation windows.Handle
+	mutation windowsMutationHandle
+	disposed bool
+}
+
+// windowsMutationHandle distinguishes a normal write-capable mutation handle
+// from the minimal DELETE handle needed for a read-only inode. Both are opened
+// with FILE_FLAG_WRITE_THROUGH. The former also gets an explicit
+// FlushFileBuffers barrier; the latter cannot legally request GENERIC_WRITE
+// while FILE_ATTRIBUTE_READONLY is set, so completion of its synchronous
+// write-through namespace operation is the barrier.
+type windowsMutationHandle struct {
+	handle        windows.Handle
+	original      windows.Handle
+	explicitFlush bool
+}
+
+func invalidWindowsMutationHandle() windowsMutationHandle {
+	return windowsMutationHandle{handle: windows.InvalidHandle}
+}
+
+func (handle windowsMutationHandle) valid() bool {
+	return handle.handle != windows.InvalidHandle && handle.handle != 0
 }
 
 // ensureRetirementCompatible proves the Windows namespace primitives on
@@ -310,7 +485,14 @@ func probeWindowsRetirementPrimitives(root *os.Root) (err error) {
 	// A false ReplaceIfExists field in FileRenameInformation is a no-replace
 	// request. First prove that an occupied exact destination is retained, then
 	// prove that the same call succeeds and flushes when its destination is
-	// absent.
+	// absent. Drop the occupied file's DELETE lease for the collision attempt:
+	// its retained read/write handle shares deletion, so only the kernel's
+	// no-replace decision can refuse the rename. Keeping the mutation handle
+	// open here would turn a broken replace request into a sharing violation and
+	// let the probe pass for the wrong reason.
+	if err := closeMutationHandleWindows(&occupied.mutation); err != nil {
+		return fmt.Errorf("releasing occupied no-replace probe lease: %w", err)
+	}
 	published, collisionErr := renameMutationHandleWindows(
 		root, root, source.opened, source.mutation, windows.Handle(directory.Fd()), source.name, occupied.name,
 	)
@@ -323,6 +505,10 @@ func probeWindowsRetirementPrimitives(root *os.Root) (err error) {
 	}
 	if err := requireBoundNameWindows(root, occupied.name, occupied.opened); err != nil {
 		return fmt.Errorf("FileRenameInformation replaced an occupied no-replace destination: %w", err)
+	}
+	occupied.mutation, err = reopenMutationHandleWindows(occupied.opened)
+	if err != nil {
+		return fmt.Errorf("rebinding occupied FileDispositionInfoEx probe: %w", err)
 	}
 
 	published, renameErr := renameMutationHandleWindows(
@@ -343,14 +529,68 @@ func probeWindowsRetirementPrimitives(root *os.Root) (err error) {
 	if err := disposeMutationHandleWindows(source.opened, &source.mutation, false); err != nil {
 		return fmt.Errorf("FileDispositionInfoEx probe failed: %w", err)
 	}
+	source.disposed = true
 	if _, err := root.Lstat(destination); !errors.Is(err, fs.ErrNotExist) {
 		return errors.Join(err, errors.New("FileDispositionInfoEx did not remove its exact link on handle close"))
 	}
 	if err := disposeMutationHandleWindows(occupied.opened, &occupied.mutation, false); err != nil {
 		return fmt.Errorf("cleaning occupied FileDispositionInfoEx probe: %w", err)
 	}
+	occupied.disposed = true
 	if _, err := root.Lstat(occupied.name); !errors.Is(err, fs.ErrNotExist) {
 		return errors.Join(err, errors.New("FileDispositionInfoEx retained an occupied probe link"))
+	}
+
+	// A read-only file cannot be reopened with GENERIC_WRITE, but DELETE access
+	// remains sufficient for an exact-handle rename and POSIX disposition. Pin
+	// that fallback against the live filesystem before accepting the root.
+	readOnly, err := createWindowsCapabilityProbe(root)
+	if err != nil {
+		return err
+	}
+	probes = append(probes, readOnly)
+	if err := closeMutationHandleWindows(&readOnly.mutation); err != nil {
+		return fmt.Errorf("closing writable read-only capability probe handle: %w", err)
+	}
+	var basic fileBasicInfoWindows
+	if err := windows.GetFileInformationByHandleEx(
+		windows.Handle(readOnly.opened.Fd()), windows.FileBasicInfo,
+		(*byte)(unsafe.Pointer(&basic)), uint32(unsafe.Sizeof(basic)),
+	); err != nil {
+		return fmt.Errorf("reading Windows capability probe attributes: %w", err)
+	}
+	basic.FileAttributes &^= windows.FILE_ATTRIBUTE_NORMAL
+	basic.FileAttributes |= windows.FILE_ATTRIBUTE_READONLY
+	if err := windows.SetFileInformationByHandle(
+		windows.Handle(readOnly.opened.Fd()), windows.FileBasicInfo,
+		(*byte)(unsafe.Pointer(&basic)), uint32(unsafe.Sizeof(basic)),
+	); err != nil {
+		return fmt.Errorf("marking Windows capability probe read-only: %w", err)
+	}
+	readOnly.mutation, err = reopenMutationHandleWindows(readOnly.opened)
+	if err != nil {
+		return fmt.Errorf("binding read-only Windows capability probe: %w", err)
+	}
+	readOnlyDestination, err := unusedQuarantineName(root)
+	if err != nil {
+		return err
+	}
+	published, renameErr = renameMutationHandleWindows(
+		root, root, readOnly.opened, readOnly.mutation, windows.Handle(directory.Fd()), readOnly.name, readOnlyDestination,
+	)
+	if !published || renameErr != nil {
+		return errors.Join(renameErr, errors.New("read-only FileRenameInformation no-replace probe failed"))
+	}
+	readOnly.name = readOnlyDestination
+	if err := flushMutationHandleWindows(readOnly.mutation, "read-only Windows retirement capability rename"); err != nil {
+		return err
+	}
+	if err := disposeMutationHandleWindows(readOnly.opened, &readOnly.mutation, false); err != nil {
+		return fmt.Errorf("read-only FileDispositionInfoEx probe failed: %w", err)
+	}
+	readOnly.disposed = true
+	if _, err := root.Lstat(readOnlyDestination); !errors.Is(err, fs.ErrNotExist) {
+		return errors.Join(err, errors.New("read-only FileDispositionInfoEx retained its probe link"))
 	}
 	return nil
 }
@@ -379,7 +619,7 @@ func createWindowsCapabilityProbe(root *os.Root) (*windowsCapabilityProbeFile, e
 		var handle windows.Handle
 		err = windows.NtCreateFile(
 			&handle,
-			windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE|windows.DELETE,
+			windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE,
 			attributes,
 			&windows.IO_STATUS_BLOCK{},
 			nil,
@@ -400,18 +640,18 @@ func createWindowsCapabilityProbe(root *os.Root) (*windowsCapabilityProbeFile, e
 		}
 		opened := os.NewFile(uintptr(handle), name)
 		if opened == nil {
-			cleanupErr := disposeCapabilityProbeHandleWindows(handle)
+			cleanupErr := disposeCapabilityProbeOriginalWindows(handle)
 			closeErr := windows.CloseHandle(handle)
 			return nil, errors.Join(errors.New("wrapping private Windows capability probe handle"), cleanupErr, closeErr)
 		}
 		probe := &windowsCapabilityProbeFile{
 			name:     name,
 			opened:   opened,
-			mutation: windows.InvalidHandle,
+			mutation: invalidWindowsMutationHandle(),
 		}
 		mutation, reopenErr := reopenMutationHandleWindows(opened)
 		if reopenErr != nil {
-			cleanupErr := disposeCapabilityProbeHandleWindows(handle)
+			cleanupErr := disposeCapabilityProbeOriginalWindows(handle)
 			closeErr := opened.Close()
 			return nil, errors.Join(
 				fmt.Errorf("ReOpenFile could not bind DELETE access to private probe %s: %w", name, reopenErr),
@@ -427,6 +667,34 @@ func createWindowsCapabilityProbe(root *os.Root) (*windowsCapabilityProbeFile, e
 		return probe, nil
 	}
 	return nil, errors.New("could not allocate a private Windows capability probe")
+}
+
+// disposeCapabilityProbeOriginalWindows reopens a freshly-created probe by
+// its exact retained handle for failure cleanup. The retained handle omits
+// DELETE so the production mutation handle can own the no-delete-sharing link
+// lease; this permissively shared cleanup handle is used only before returning
+// a failed capability result. No pathname is consulted, so a replacement at
+// the probe's former name can never be removed.
+func disposeCapabilityProbeOriginalWindows(original windows.Handle) error {
+	result, _, callErr := reOpenFileWindows.Call(
+		uintptr(original),
+		uintptr(uint32(windows.DELETE|windows.FILE_READ_ATTRIBUTES|windows.FILE_WRITE_ATTRIBUTES|windows.SYNCHRONIZE)),
+		uintptr(uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)),
+		uintptr(uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_WRITE_THROUGH)),
+	)
+	handle := windows.Handle(result)
+	if handle == windows.InvalidHandle {
+		if callErr == nil || callErr == windows.ERROR_SUCCESS {
+			callErr = windows.ERROR_INVALID_HANDLE
+		}
+		return callErr
+	}
+	if err := requireSameWindowsHandle(original, handle); err != nil {
+		return errors.Join(err, windows.CloseHandle(handle))
+	}
+	disposeErr := disposeCapabilityProbeHandleWindows(handle)
+	closeErr := windows.CloseHandle(handle)
+	return errors.Join(disposeErr, closeErr)
 }
 
 // disposeCapabilityProbeHandleWindows is a cleanup path, not a capability
@@ -446,6 +714,27 @@ func disposeCapabilityProbeHandleWindows(handle windows.Handle) error {
 	if exErr == nil {
 		return windows.FlushFileBuffers(handle)
 	}
+	// The Ex form can remove a read-only probe directly. If the filesystem
+	// rejects it, clear the attribute through the exact handle before trying
+	// legacy disposition so a failed capability check never strands its own
+	// private probe.
+	var basic fileBasicInfoWindows
+	if err := windows.GetFileInformationByHandleEx(
+		handle,
+		windows.FileBasicInfo,
+		(*byte)(unsafe.Pointer(&basic)),
+		uint32(unsafe.Sizeof(basic)),
+	); err == nil && basic.FileAttributes&windows.FILE_ATTRIBUTE_READONLY != 0 {
+		basic.FileAttributes &^= windows.FILE_ATTRIBUTE_READONLY
+		if err := windows.SetFileInformationByHandle(
+			handle,
+			windows.FileBasicInfo,
+			(*byte)(unsafe.Pointer(&basic)),
+			uint32(unsafe.Sizeof(basic)),
+		); err != nil {
+			return errors.Join(exErr, fmt.Errorf("clearing read-only capability probe attribute: %w", err))
+		}
+	}
 	legacy := fileDispositionInfoWindows{DeleteFile: 1}
 	legacyErr := windows.SetFileInformationByHandle(
 		handle,
@@ -464,14 +753,26 @@ func cleanupWindowsCapabilityProbe(probe *windowsCapabilityProbeFile) error {
 		return nil
 	}
 	var cleanupErr error
-	if probe.mutation != windows.InvalidHandle {
-		if disposeErr := disposeCapabilityProbeHandleWindows(probe.mutation); disposeErr != nil {
+	if probe.mutation.valid() && !probe.disposed {
+		if disposeErr := disposeCapabilityProbeHandleWindows(probe.mutation.handle); disposeErr != nil {
 			cleanupErr = errors.Join(cleanupErr, disposeErr,
 				fmt.Errorf("private probe %s could not be disposed by its exact handle and may remain", probe.name))
+		} else {
+			probe.disposed = true
 		}
+	}
+	if probe.mutation.valid() {
 		cleanupErr = errors.Join(cleanupErr, closeMutationHandleWindows(&probe.mutation))
 	}
 	if probe.opened != nil {
+		if !probe.disposed {
+			if disposeErr := disposeCapabilityProbeOriginalWindows(windows.Handle(probe.opened.Fd())); disposeErr != nil {
+				cleanupErr = errors.Join(cleanupErr, disposeErr,
+					fmt.Errorf("private probe %s could not be disposed by its original exact handle and may remain", probe.name))
+			} else {
+				probe.disposed = true
+			}
+		}
 		cleanupErr = errors.Join(cleanupErr, probe.opened.Close())
 		probe.opened = nil
 	}
@@ -513,44 +814,48 @@ func renameBoundOpenFile(root *os.Root, source, displaced *os.File, fromName, to
 	if replace && filepath.Dir(fromName) != filepath.Dir(toName) {
 		return false, errors.New("checkpoint exchange names must share one parent directory")
 	}
-	lease, err := acquireWindowsNamespaceLease(root, fromName, toName)
+	if filepath.Dir(fromName) != filepath.Dir(toName) && filepath.Dir(toName) != "." {
+		// A nested destination parent would have to be both a write-sharing
+		// rename target and a strict source-chain fence. Production cross-parent
+		// moves target the bound root; refuse every other shape instead of
+		// weakening either authority.
+		return false, errors.New("secure Windows cross-parent rename requires a destination in the bound root")
+	}
+	lease, err := acquireWindowsDestinationNamespaceLease(root, toName, fromName)
 	if err != nil {
 		return false, fmt.Errorf("acquiring checkpoint namespace lease: %w", err)
 	}
 	defer func() { err = errors.Join(err, lease.close()) }()
-
-	sourceMutation, err := reopenMutationHandleWindows(source)
+	directory, err := lease.directory(toName)
 	if err != nil {
-		return false, fmt.Errorf("reopening checkpoint file for exact-handle rename: %w", err)
+		return false, err
 	}
-	defer func() { err = errors.Join(err, windows.CloseHandle(sourceMutation)) }()
-	var displacedMutation windows.Handle
+
+	sourceMutation, err := openBoundMutationHandleWindows(lease, fromName, source)
+	if err != nil {
+		return false, fmt.Errorf("binding checkpoint source link for exact-handle rename: %w", err)
+	}
+	defer func() { err = errors.Join(err, closeMutationHandleWindows(&sourceMutation)) }()
+	displacedMutation := invalidWindowsMutationHandle()
 	if replace {
-		displacedMutation, err = reopenMutationHandleWindows(displaced)
+		displacedMutation, err = openBoundMutationHandleWindows(lease, toName, displaced)
 		if err != nil {
-			return false, fmt.Errorf("reopening displaced checkpoint file for exact-handle exchange: %w", err)
+			return false, fmt.Errorf("binding displaced checkpoint link for exact-handle exchange: %w", err)
 		}
-		defer func() { err = errors.Join(err, windows.CloseHandle(displacedMutation)) }()
+		defer func() { err = errors.Join(err, closeMutationHandleWindows(&displacedMutation)) }()
 	}
-
-	directory, err := root.Open(".")
-	if err != nil {
-		return false, fmt.Errorf("opening bound checkpoint parent: %w", err)
-	}
-	defer func() { err = errors.Join(err, directory.Close()) }()
 
 	if err := requireBoundNameWindows(root, fromName, source); err != nil {
 		return false, err
 	}
 	if !replace {
 		published, renameErr := renameMutationHandleWindows(
-			root, root, source, sourceMutation, windows.Handle(directory.Fd()), fromName, toName,
+			root, root, source, sourceMutation, directory, fromName, toName,
 		)
 		if !published {
 			return false, fmt.Errorf("renaming checkpoint file by handle: %w", renameErr)
 		}
 		flushErr := flushMutationHandleWindows(sourceMutation, "checkpoint rename")
-		runtime.KeepAlive(directory)
 		return true, errors.Join(renameErr, flushErr)
 	}
 	if err := requireBoundNameWindows(root, toName, displaced); err != nil {
@@ -577,79 +882,76 @@ func renameBoundOpenFile(root *os.Root, source, displaced *os.File, fromName, to
 	if err := requireBoundNameWindows(root, toName, displaced); err != nil {
 		return false, fmt.Errorf("rebinding displaced checkpoint target: %w", err)
 	}
-
 	// Windows has no rename-exchange primitive. Build the equivalent from
 	// three no-replace operations on exact handles. At every intermediate
 	// state an injected name makes the next operation fail; no caller-owned
 	// inode is ever overwritten or unlinked.
 	stepOne, stepOneErr := renameMutationHandleWindows(
-		root, root, source, sourceMutation, windows.Handle(directory.Fd()), fromName, staging,
+		root, root, source, sourceMutation, directory, fromName, staging,
 	)
 	if !stepOne {
 		return false, fmt.Errorf("staging checkpoint source by handle: %w", stepOneErr)
 	}
 	published = true
 	if stepOneErr != nil {
-		rollbackErr := rollbackOneRenameWindows(root, source, sourceMutation, windows.Handle(directory.Fd()), staging, fromName)
+		rollbackErr := rollbackOneRenameWindows(root, source, sourceMutation, directory, staging, fromName)
 		return true, finishBoundRenameRollback(stepOneErr, rollbackErr)
 	}
 	if hookErr := runWindowsHandlePhase(windowsBeforeSourceStagingFlush); hookErr != nil {
-		rollbackErr := rollbackOneRenameWindows(root, source, sourceMutation, windows.Handle(directory.Fd()), staging, fromName)
+		rollbackErr := rollbackOneRenameWindows(root, source, sourceMutation, directory, staging, fromName)
 		return true, finishBoundRenameRollback(hookErr, rollbackErr)
 	}
 	if flushErr := flushMutationHandleWindows(sourceMutation, "staged checkpoint source"); flushErr != nil {
-		rollbackErr := rollbackOneRenameWindows(root, source, sourceMutation, windows.Handle(directory.Fd()), staging, fromName)
+		rollbackErr := rollbackOneRenameWindows(root, source, sourceMutation, directory, staging, fromName)
 		return true, finishBoundRenameRollback(flushErr, rollbackErr)
 	}
 	if hookErr := runWindowsHandlePhase(windowsAfterSourceStagingFlush); hookErr != nil {
-		rollbackErr := rollbackOneRenameWindows(root, source, sourceMutation, windows.Handle(directory.Fd()), staging, fromName)
+		rollbackErr := rollbackOneRenameWindows(root, source, sourceMutation, directory, staging, fromName)
 		return true, finishBoundRenameRollback(hookErr, rollbackErr)
 	}
 
 	stepTwo, stepTwoErr := renameMutationHandleWindows(
-		root, root, displaced, displacedMutation, windows.Handle(directory.Fd()), toName, fromName,
+		root, root, displaced, displacedMutation, directory, toName, fromName,
 	)
 	if !stepTwo {
-		rollbackErr := rollbackOneRenameWindows(root, source, sourceMutation, windows.Handle(directory.Fd()), staging, fromName)
+		rollbackErr := rollbackOneRenameWindows(root, source, sourceMutation, directory, staging, fromName)
 		return true, finishBoundRenameRollback(fmt.Errorf("staging displaced checkpoint target by handle: %w", stepTwoErr), rollbackErr)
 	}
 	if stepTwoErr != nil {
 		rollbackErr := rollbackExchangeWindows(root, source, displaced, sourceMutation, displacedMutation,
-			windows.Handle(directory.Fd()), staging, fromName, toName)
+			directory, staging, fromName, toName)
 		return true, finishBoundRenameRollback(stepTwoErr, rollbackErr)
 	}
 	if hookErr := runWindowsHandlePhase(windowsBeforeDisplacedStagingFlush); hookErr != nil {
 		rollbackErr := rollbackExchangeWindows(root, source, displaced, sourceMutation, displacedMutation,
-			windows.Handle(directory.Fd()), staging, fromName, toName)
+			directory, staging, fromName, toName)
 		return true, finishBoundRenameRollback(hookErr, rollbackErr)
 	}
 	if flushErr := flushMutationHandleWindows(displacedMutation, "staged displaced checkpoint target"); flushErr != nil {
 		rollbackErr := rollbackExchangeWindows(root, source, displaced, sourceMutation, displacedMutation,
-			windows.Handle(directory.Fd()), staging, fromName, toName)
+			directory, staging, fromName, toName)
 		return true, finishBoundRenameRollback(flushErr, rollbackErr)
 	}
 	if hookErr := runWindowsHandlePhase(windowsAfterDisplacedStagingFlush); hookErr != nil {
 		rollbackErr := rollbackExchangeWindows(root, source, displaced, sourceMutation, displacedMutation,
-			windows.Handle(directory.Fd()), staging, fromName, toName)
+			directory, staging, fromName, toName)
 		return true, finishBoundRenameRollback(hookErr, rollbackErr)
 	}
 
 	stepThree, stepThreeErr := renameMutationHandleWindows(
-		root, root, source, sourceMutation, windows.Handle(directory.Fd()), staging, toName,
+		root, root, source, sourceMutation, directory, staging, toName,
 	)
 	if !stepThree {
 		rollbackErr := rollbackExchangeWindows(root, source, displaced, sourceMutation, displacedMutation,
-			windows.Handle(directory.Fd()), staging, fromName, toName)
+			directory, staging, fromName, toName)
 		return true, finishBoundRenameRollback(fmt.Errorf("publishing checkpoint source by handle: %w", stepThreeErr), rollbackErr)
 	}
 	beforeFlushErr := runWindowsHandlePhase(windowsBeforeSourcePublicationFlush)
 	if beforeFlushErr != nil {
-		runtime.KeepAlive(directory)
 		return true, beforeFlushErr
 	}
 	flushErr := flushMutationHandleWindows(sourceMutation, "published checkpoint source")
 	afterFlushErr := runWindowsHandlePhase(windowsAfterSourcePublicationFlush)
-	runtime.KeepAlive(directory)
 	return true, errors.Join(stepThreeErr, flushErr, afterFlushErr)
 }
 
@@ -668,15 +970,19 @@ func retireBoundOpenFile(root *os.Root, name string, file *os.File, owned bool, 
 	if root == nil || file == nil {
 		return errors.New("checkpoint retirement requires live root and file handles")
 	}
-	lease, err := acquireWindowsNamespaceLease(root, name)
+	quarantine, err := unusedQuarantineSibling(root, name)
+	if err != nil {
+		return err
+	}
+	lease, err := acquireWindowsDestinationNamespaceLease(root, quarantine, name)
 	if err != nil {
 		return fmt.Errorf("acquiring checkpoint retirement namespace lease: %w", err)
 	}
 	defer func() { err = errors.Join(err, lease.close()) }()
 
-	mutation, err := reopenMutationHandleWindows(file)
+	mutation, err := openBoundMutationHandleWindows(lease, name, file)
 	if err != nil {
-		return fmt.Errorf("reopening checkpoint file for exact-handle retirement: %w", err)
+		return fmt.Errorf("binding checkpoint source link for exact-handle retirement: %w", err)
 	}
 	defer func() { err = errors.Join(err, closeMutationHandleWindows(&mutation)) }()
 
@@ -694,15 +1000,10 @@ func retireBoundOpenFile(root *os.Root, name string, file *os.File, owned bool, 
 		return err
 	}
 
-	quarantine, err := unusedQuarantineSibling(root, name)
+	directory, err := lease.directory(quarantine)
 	if err != nil {
 		return err
 	}
-	directory, err := root.Open(".")
-	if err != nil {
-		return fmt.Errorf("opening bound checkpoint parent: %w", err)
-	}
-	defer func() { err = errors.Join(err, directory.Close()) }()
 
 	// This is the final pathname observation. The hook deliberately runs after
 	// it: the following operation names the already-open inode, so even a swap
@@ -714,7 +1015,7 @@ func retireBoundOpenFile(root *os.Root, name string, file *os.File, owned bool, 
 		before()
 	}
 	published, renameErr := renameMutationHandleWindows(
-		root, root, file, mutation, windows.Handle(directory.Fd()), name, quarantine,
+		root, root, file, mutation, directory, name, quarantine,
 	)
 	if !published {
 		return fmt.Errorf("quarantining checkpoint file by handle: %w", renameErr)
@@ -723,13 +1024,9 @@ func retireBoundOpenFile(root *os.Root, name string, file *os.File, owned bool, 
 		after(quarantine)
 	}
 
-	flushErr := windows.FlushFileBuffers(mutation)
-	runtime.KeepAlive(directory)
+	flushErr := flushMutationHandleWindows(mutation, "checkpoint quarantine rename")
 	identityErr := requireBoundNameWindows(root, quarantine, file)
-	if flushErr != nil || identityErr != nil {
-		if flushErr != nil {
-			flushErr = fmt.Errorf("flushing checkpoint quarantine rename: %w", flushErr)
-		}
+	if flushErr != nil {
 		return errors.Join(renameErr, flushErr, identityErr)
 	}
 	cleanupErr := disposeRetiredMutationWindows(file, &mutation, owned)
@@ -752,21 +1049,29 @@ func retireBoundOpenFileTo(sourceRoot, sinkRoot *os.Root, name string, file *os.
 	if sinkRoot == nil {
 		return retireBoundOpenFile(sourceRoot, name, file, owned, before, after)
 	}
-	sourceLease, err := acquireWindowsNamespaceLease(sourceRoot, name)
+	quarantine := retiredSinkName(name)
+	// The source root is also the exact fallback destination when the sink is
+	// unexpectedly on another volume. Lease that destination up front so the
+	// fallback cannot reopen or rename an unbound parent.
+	sourceLease, err := acquireWindowsDestinationNamespaceLease(sourceRoot, quarantine, name)
 	if err != nil {
 		return fmt.Errorf("acquiring checkpoint retirement source lease: %w", err)
 	}
 	defer func() { err = errors.Join(err, sourceLease.close()) }()
-	quarantine := retiredSinkName(name)
-	sinkLease, err := acquireWindowsNamespaceLease(sinkRoot, quarantine)
+	sinkAnchor, err := createWindowsNamespaceAnchor(sinkRoot)
+	if err != nil {
+		return fmt.Errorf("anchoring checkpoint retirement sink: %w", err)
+	}
+	defer func() { err = errors.Join(err, sinkAnchor.close()) }()
+	sinkLease, err := acquireWindowsDestinationNamespaceLease(sinkRoot, quarantine)
 	if err != nil {
 		return fmt.Errorf("acquiring checkpoint retirement sink lease: %w", err)
 	}
 	defer func() { err = errors.Join(err, sinkLease.close()) }()
 
-	mutation, err := reopenMutationHandleWindows(file)
+	mutation, err := openBoundMutationHandleWindows(sourceLease, name, file)
 	if err != nil {
-		return fmt.Errorf("reopening checkpoint file for exact-handle retirement: %w", err)
+		return fmt.Errorf("binding checkpoint source link for exact-handle retirement: %w", err)
 	}
 	defer func() { err = errors.Join(err, closeMutationHandleWindows(&mutation)) }()
 
@@ -777,11 +1082,10 @@ func retireBoundOpenFileTo(sourceRoot, sinkRoot *os.Root, name string, file *os.
 		return errors.Join(err,
 			fmt.Errorf("%w: deterministic checkpoint retirement name is occupied", ErrStale))
 	}
-	directory, err := sinkRoot.Open(".")
+	directory, err := sinkLease.directory(quarantine)
 	if err != nil {
-		return fmt.Errorf("opening bound checkpoint retirement sink: %w", err)
+		return err
 	}
-	defer func() { err = errors.Join(err, directory.Close()) }()
 
 	// The hook is the final adversarial seam. Everything after it addresses
 	// the selected source handle and the bound sink directory handle directly.
@@ -792,23 +1096,21 @@ func retireBoundOpenFileTo(sourceRoot, sinkRoot *os.Root, name string, file *os.
 		before()
 	}
 	published, renameErr := renameMutationHandleWindows(
-		sourceRoot, sinkRoot, file, mutation, windows.Handle(directory.Fd()), name, quarantine,
+		sourceRoot, sinkRoot, file, mutation, directory, name, quarantine,
 	)
 	retirementRoot := sinkRoot
-	retirementDirectory := directory
 	if !published && errors.Is(renameErr, windows.ERROR_NOT_SAME_DEVICE) {
 		if _, localErr := sourceRoot.Lstat(quarantine); !errors.Is(localErr, fs.ErrNotExist) {
 			return errors.Join(renameErr, localErr,
 				fmt.Errorf("%w: same-volume checkpoint retirement name is occupied", ErrStale))
 		}
-		localDirectory, localErr := sourceRoot.Open(".")
+		localDirectory, localErr := sourceLease.directory(quarantine)
 		if localErr != nil {
 			return errors.Join(renameErr,
 				fmt.Errorf("opening same-volume checkpoint retirement directory: %w", localErr))
 		}
-		defer func() { err = errors.Join(err, localDirectory.Close()) }()
 		published, localErr = renameMutationHandleWindows(
-			sourceRoot, sourceRoot, file, mutation, windows.Handle(localDirectory.Fd()), name, quarantine,
+			sourceRoot, sourceRoot, file, mutation, localDirectory, name, quarantine,
 		)
 		if !published {
 			return errors.Join(renameErr,
@@ -816,7 +1118,6 @@ func retireBoundOpenFileTo(sourceRoot, sinkRoot *os.Root, name string, file *os.
 		}
 		renameErr = localErr
 		retirementRoot = sourceRoot
-		retirementDirectory = localDirectory
 	}
 	if !published {
 		return fmt.Errorf("moving checkpoint file to trusted retirement sink: %w", renameErr)
@@ -825,7 +1126,6 @@ func retireBoundOpenFileTo(sourceRoot, sinkRoot *os.Root, name string, file *os.
 		after(quarantine)
 	}
 	flushErr := flushMutationHandleWindows(mutation, "checkpoint retirement-sink rename")
-	runtime.KeepAlive(retirementDirectory)
 	identityErr := requireBoundNameWindows(retirementRoot, quarantine, file)
 	if flushErr != nil {
 		return errors.Join(renameErr, flushErr, identityErr)
@@ -852,9 +1152,9 @@ func removeTrustedRetiredFile(root *os.Root, name string, file *os.File, owned b
 	if err := requireBoundNameWindows(root, name, file); err != nil {
 		return err
 	}
-	mutation, err := reopenMutationHandleWindows(file)
+	mutation, err := openBoundMutationHandleWindows(lease, name, file)
 	if err != nil {
-		return fmt.Errorf("reopening trusted checkpoint file for disposition: %w", err)
+		return fmt.Errorf("binding trusted checkpoint link for disposition: %w", err)
 	}
 	defer func() { err = errors.Join(err, closeMutationHandleWindows(&mutation)) }()
 	return disposeRetiredMutationWindows(file, &mutation, owned)
@@ -904,26 +1204,122 @@ func boundNameMatchesWindows(root *os.Root, name string, file *os.File) (bool, e
 	return same, err
 }
 
-func reopenMutationHandleWindows(file *os.File) (windows.Handle, error) {
-	original := windows.Handle(file.Fd())
-	result, _, callErr := reOpenFileWindows.Call(
-		uintptr(original),
-		uintptr(uint32(windows.GENERIC_WRITE|windows.FILE_READ_ATTRIBUTES|windows.DELETE)),
-		uintptr(uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)),
-		uintptr(uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_WRITE_THROUGH)),
-	)
-	runtime.KeepAlive(file)
-	handle := windows.Handle(result)
-	if handle == windows.InvalidHandle {
-		if callErr == nil || callErr == windows.ERROR_SUCCESS {
-			callErr = windows.ERROR_INVALID_HANDLE
+// openBoundMutationHandleWindows binds the exact source link named beneath an
+// already-leased parent, then proves it is the inode selected by the caller's
+// retained handle. ReOpenFile alone is insufficient: if that original link
+// was moved before lease acquisition and a same-inode hard link was put back
+// at name, ReOpenFile would keep following the moved link. Opening the checked
+// leaf here preserves move semantics while the no-delete share mode leases the
+// selected source link through rename, rollback, or disposition.
+func openBoundMutationHandleWindows(lease *windowsNamespaceLease, name string, file *os.File) (windowsMutationHandle, error) {
+	if file == nil {
+		return invalidWindowsMutationHandle(), errors.New("checkpoint mutation requires a retained file handle")
+	}
+	if err := validateBoundRelativeWindows(name); err != nil {
+		return invalidWindowsMutationHandle(), err
+	}
+	parent, err := lease.directory(name)
+	if err != nil {
+		return invalidWindowsMutationHandle(), err
+	}
+	objectName, err := windows.NewNTUnicodeString(filepath.Base(name))
+	if err != nil {
+		return invalidWindowsMutationHandle(), err
+	}
+	open := func(access uint32) (windows.Handle, error) {
+		attributes := &windows.OBJECT_ATTRIBUTES{
+			RootDirectory: parent,
+			ObjectName:    objectName,
+			Attributes:    windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
 		}
-		return windows.InvalidHandle, callErr
+		attributes.Length = uint32(unsafe.Sizeof(*attributes))
+		var handle windows.Handle
+		openErr := windows.NtCreateFile(
+			&handle,
+			access,
+			attributes,
+			&windows.IO_STATUS_BLOCK{},
+			nil,
+			0,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+			windows.FILE_OPEN,
+			windows.FILE_NON_DIRECTORY_FILE|windows.FILE_SYNCHRONOUS_IO_NONALERT|
+				windows.FILE_OPEN_REPARSE_POINT|windows.FILE_WRITE_THROUGH,
+			0,
+			0,
+		)
+		if status, ok := openErr.(windows.NTStatus); ok {
+			openErr = status.Errno()
+		}
+		if openErr != nil {
+			return windows.InvalidHandle, openErr
+		}
+		return handle, nil
+	}
+	handle, openErr := open(windows.FILE_GENERIC_WRITE | windows.FILE_READ_ATTRIBUTES | windows.DELETE)
+	explicitFlush := true
+	if errors.Is(openErr, windows.ERROR_ACCESS_DENIED) {
+		handle, openErr = open(windows.DELETE | windows.FILE_READ_ATTRIBUTES | windows.FILE_WRITE_ATTRIBUTES | windows.SYNCHRONIZE)
+		explicitFlush = false
+	}
+	runtime.KeepAlive(objectName)
+	if openErr != nil {
+		return invalidWindowsMutationHandle(), openErr
+	}
+	original := windows.Handle(file.Fd())
+	sameErr := requireSameWindowsHandle(original, handle)
+	runtime.KeepAlive(file)
+	if sameErr != nil {
+		return invalidWindowsMutationHandle(), errors.Join(sameErr, windows.CloseHandle(handle))
+	}
+	return windowsMutationHandle{handle: handle, original: original, explicitFlush: explicitFlush}, nil
+}
+
+// reopenMutationHandleWindows is used by private capability probes whose
+// freshly allocated source link has not crossed an adversarial seam.
+func reopenMutationHandleWindows(file *os.File) (windowsMutationHandle, error) {
+	original := windows.Handle(file.Fd())
+	reopen := func(access uint32) (windows.Handle, error) {
+		result, _, callErr := reOpenFileWindows.Call(
+			uintptr(original),
+			uintptr(access),
+			// The mutation handle is also the lease on the exact source
+			// link. Refusing delete sharing makes acquisition fail when a
+			// delete-capable opener already exists and prevents a new opener
+			// from moving that link between the final identity check and the
+			// native rename. The destination parent is independently bound;
+			// both authorities are required to select one exact source link and
+			// one exact destination directory.
+			uintptr(uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE)),
+			uintptr(uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_WRITE_THROUGH)),
+		)
+		handle := windows.Handle(result)
+		if handle == windows.InvalidHandle {
+			if callErr == nil || callErr == windows.ERROR_SUCCESS {
+				callErr = windows.ERROR_INVALID_HANDLE
+			}
+			return windows.InvalidHandle, callErr
+		}
+		return handle, nil
+	}
+	handle, callErr := reopen(windows.GENERIC_WRITE | windows.FILE_READ_ATTRIBUTES | windows.DELETE)
+	explicitFlush := true
+	if errors.Is(callErr, windows.ERROR_ACCESS_DENIED) {
+		// FILE_ATTRIBUTE_READONLY and a pre-existing read-only descriptor can
+		// reject GENERIC_WRITE even though exact-handle rename/disposition needs
+		// only DELETE. Keep the same link-leasing, write-through contract and
+		// fall back to the minimum access needed for the namespace operation.
+		handle, callErr = reopen(windows.DELETE | windows.FILE_READ_ATTRIBUTES | windows.FILE_WRITE_ATTRIBUTES | windows.SYNCHRONIZE)
+		explicitFlush = false
+	}
+	runtime.KeepAlive(file)
+	if callErr != nil {
+		return invalidWindowsMutationHandle(), callErr
 	}
 	if err := requireSameWindowsHandle(original, handle); err != nil {
-		return windows.InvalidHandle, errors.Join(err, windows.CloseHandle(handle))
+		return invalidWindowsMutationHandle(), errors.Join(err, windows.CloseHandle(handle))
 	}
-	return handle, nil
+	return windowsMutationHandle{handle: handle, original: original, explicitFlush: explicitFlush}, nil
 }
 
 func requireSameWindowsHandle(left, right windows.Handle) error {
@@ -932,7 +1328,7 @@ func requireSameWindowsHandle(left, right windows.Handle) error {
 		return err
 	}
 	if !same {
-		return fmt.Errorf("%w: ReOpenFile returned a different checkpoint inode", ErrStale)
+		return fmt.Errorf("%w: exact Windows handle selected a different checkpoint inode", ErrStale)
 	}
 	return nil
 }
@@ -968,8 +1364,14 @@ func stableWindowsFileID(file windows.Handle) (fileIDInfoWindows, error) {
 	return info, nil
 }
 
-func renameMutationHandleWindows(sourceRoot, destinationRoot *os.Root, opened *os.File, file, directory windows.Handle, from, to string) (bool, error) {
-	encoded, err := windows.UTF16FromString(to)
+func renameMutationHandleWindows(sourceRoot, destinationRoot *os.Root, opened *os.File, file windowsMutationHandle, directory windows.Handle, from, to string) (bool, error) {
+	if !file.valid() {
+		return false, errors.New("checkpoint rename requires a live mutation handle")
+	}
+	if directory == 0 || directory == windows.InvalidHandle {
+		return false, errors.New("checkpoint rename requires a live exact destination-parent handle")
+	}
+	encoded, err := windows.UTF16FromString(filepath.Base(to))
 	if err != nil {
 		return false, err
 	}
@@ -994,7 +1396,7 @@ func renameMutationHandleWindows(sourceRoot, destinationRoot *os.Root, opened *o
 		}
 	}
 	renameErr := windows.NtSetInformationFile(
-		file,
+		file.handle,
 		&windows.IO_STATUS_BLOCK{},
 		&buffer[0],
 		uint32(len(buffer)),
@@ -1010,14 +1412,28 @@ func renameMutationHandleWindows(sourceRoot, destinationRoot *os.Root, opened *o
 	return classifyRenameFailureWindows(sourceRoot, destinationRoot, opened, from, to, renameErr)
 }
 
-func flushMutationHandleWindows(file windows.Handle, operation string) error {
-	if err := windows.FlushFileBuffers(file); err != nil {
+func flushMutationHandleWindows(file windowsMutationHandle, operation string) error {
+	if !file.valid() {
+		return errors.New("checkpoint flush requires a live mutation handle")
+	}
+	if !file.explicitFlush {
+		// The minimal DELETE handle is synchronous and FILE_FLAG_WRITE_THROUGH.
+		// Prefer an explicit barrier through the retained original descriptor
+		// when it was opened writable (as owned temporaries are). An existing
+		// read-only target can legally reject that flush; its completed
+		// write-through namespace operation remains the durability boundary.
+		if err := windows.FlushFileBuffers(file.original); err != nil && !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			return fmt.Errorf("flushing %s through the original file handle: %w", operation, err)
+		}
+		return nil
+	}
+	if err := windows.FlushFileBuffers(file.handle); err != nil {
 		return fmt.Errorf("flushing %s: %w", operation, err)
 	}
 	return nil
 }
 
-func rollbackOneRenameWindows(root *os.Root, opened *os.File, file, directory windows.Handle, from, to string) error {
+func rollbackOneRenameWindows(root *os.Root, opened *os.File, file windowsMutationHandle, directory windows.Handle, from, to string) error {
 	published, renameErr := renameMutationHandleWindows(root, root, opened, file, directory, from, to)
 	if !published {
 		return fmt.Errorf("rolling back checkpoint namespace: %w", renameErr)
@@ -1025,7 +1441,7 @@ func rollbackOneRenameWindows(root *os.Root, opened *os.File, file, directory wi
 	return errors.Join(renameErr, flushMutationHandleWindows(file, "checkpoint namespace rollback"))
 }
 
-func rollbackExchangeWindows(root *os.Root, source, displaced *os.File, sourceHandle, displacedHandle, directory windows.Handle, staging, from, to string) error {
+func rollbackExchangeWindows(root *os.Root, source, displaced *os.File, sourceHandle, displacedHandle windowsMutationHandle, directory windows.Handle, staging, from, to string) error {
 	displacedRestored, displacedErr := renameMutationHandleWindows(
 		root, root, displaced, displacedHandle, directory, from, to,
 	)
@@ -1063,7 +1479,7 @@ func classifyRenameFailureWindows(sourceRoot, destinationRoot *os.Root, opened *
 		errors.New("checkpoint rename outcome is ambiguous"))
 }
 
-func disposeRetiredMutationWindows(opened *os.File, file *windows.Handle, scrub bool) error {
+func disposeRetiredMutationWindows(opened *os.File, file *windowsMutationHandle, scrub bool) error {
 	if err := runWindowsHandlePhase(windowsBeforeRetirementDisposition); err != nil {
 		return err
 	}
@@ -1073,8 +1489,8 @@ func disposeRetiredMutationWindows(opened *os.File, file *windows.Handle, scrub 
 	return runWindowsHandlePhase(windowsAfterRetirementDisposition)
 }
 
-func disposeMutationHandleWindows(opened *os.File, file *windows.Handle, scrub bool) error {
-	if opened == nil || file == nil || *file == windows.InvalidHandle {
+func disposeMutationHandleWindows(opened *os.File, file *windowsMutationHandle, scrub bool) error {
+	if opened == nil || file == nil || !file.valid() {
 		return errors.New("checkpoint disposition requires live exact handles")
 	}
 	if scrub {
@@ -1095,15 +1511,15 @@ func disposeMutationHandleWindows(opened *os.File, file *windows.Handle, scrub b
 		windows.FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK |
 		windows.FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE}
 	if err := windows.SetFileInformationByHandle(
-		*file,
+		file.handle,
 		windows.FileDispositionInfoEx,
 		(*byte)(unsafe.Pointer(&disposition)),
 		uint32(unsafe.Sizeof(disposition)),
 	); err != nil {
 		return fmt.Errorf("disposing checkpoint file by handle: %w", err)
 	}
-	if err := windows.FlushFileBuffers(*file); err != nil {
-		return fmt.Errorf("flushing checkpoint disposition: %w", err)
+	if err := flushMutationHandleWindows(*file, "checkpoint disposition"); err != nil {
+		return err
 	}
 	// POSIX disposition removes the link when the disposition handle closes,
 	// while opened keeps the exact inode alive for the post-unlink hardlink
@@ -1143,13 +1559,13 @@ func windowsHandleLinkCount(file *os.File) (uint32, error) {
 	return info.NumberOfLinks, nil
 }
 
-func closeMutationHandleWindows(file *windows.Handle) error {
-	if file == nil || *file == windows.InvalidHandle {
+func closeMutationHandleWindows(file *windowsMutationHandle) error {
+	if file == nil || !file.valid() {
 		return nil
 	}
-	if err := windows.CloseHandle(*file); err != nil {
+	if err := windows.CloseHandle(file.handle); err != nil {
 		return err
 	}
-	*file = windows.InvalidHandle
+	*file = invalidWindowsMutationHandle()
 	return nil
 }

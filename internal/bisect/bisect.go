@@ -412,9 +412,15 @@ func normalizeState(state checkpoint.FileState) (checkpoint.FileState, error) {
 	if int64(len(state.Content)) > maxBisectFileBytes {
 		return checkpoint.FileState{}, fmt.Errorf("file state exceeds the %d-byte checkpoint limit", maxBisectFileBytes)
 	}
-	if state.Mode != bisectRestorableMode(state.Mode) {
+	// Recorder snapshots are already normalized, but Runner is also an
+	// internal API and durable snapshots from before Windows normalization can
+	// legitimately carry a Unix permission mask such as 0644. Accept only the
+	// portable permission/special-bit vocabulary, then reduce it to the exact
+	// mode this platform can restore. File-type bits still fail closed.
+	if state.Mode&^(fs.ModePerm|fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky) != 0 {
 		return checkpoint.FileState{}, errors.New("file state carries unsupported mode bits")
 	}
+	state.Mode = bisectRestorableMode(state.Mode)
 	return state, nil
 }
 

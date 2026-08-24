@@ -225,15 +225,6 @@ func TestTaskVerifierIgnoresCopiedRepositoryGoOnPATH(t *testing.T) {
 }
 
 func TestTaskVerifierRejectsLaunchCheckoutGoForDifferentWorkspace(t *testing.T) {
-	realGo, err := exec.LookPath("go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	realGoInfo, err := os.Stat(realGo)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	launchWorkspace := t.TempDir()
 	if err := os.Mkdir(filepath.Join(launchWorkspace, ".git"), 0o755); err != nil {
 		t.Fatal(err)
@@ -283,6 +274,23 @@ func TestTaskVerifierRejectsLaunchCheckoutGoForDifferentWorkspace(t *testing.T) 
 	if err := task.Setup(copyDir); err != nil {
 		t.Fatal(err)
 	}
+	// Capture the resolver's trusted baseline through the same sanitized path
+	// policy the verifier uses. On Windows, setup-go installs the active
+	// toolchain behind a cross-volume junction that filepath.EvalSymlinks may
+	// conservatively omit, so an unsanitized exec.LookPath result is not a
+	// portable oracle for which remaining trusted toolchain will be selected.
+	baselineEnv, err := verifierGoEnv(source, copyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := verifierGoExecutable(baselineEnv, source, copyDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselineInfo, err := os.Stat(baseline.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	marker := filepath.Join(t.TempDir(), "fake-go-ran")
 	t.Setenv(fakeGoHelperEnv, "1")
@@ -314,8 +322,13 @@ func TestTaskVerifierRejectsLaunchCheckoutGoForDifferentWorkspace(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !filepath.IsAbs(resolved.Path()) || !os.SameFile(realGoInfo, resolvedInfo) {
-		t.Fatalf("verifier Go = %q, want the trusted executable found at %q", resolved.Path(), realGo)
+	fakeInfo, err := os.Stat(fakeGo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(resolved.Path()) || !os.SameFile(baselineInfo, resolvedInfo) || os.SameFile(fakeInfo, resolvedInfo) {
+		t.Fatalf("verifier Go = %q, want trusted baseline %q and not launch-checkout shadow %q",
+			resolved.Path(), baseline.Path(), fakeGo)
 	}
 
 	solved, detail, err := task.Verify(context.Background(), copyDir)

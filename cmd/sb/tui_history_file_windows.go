@@ -14,6 +14,7 @@ import (
 	"strings"
 	"unsafe"
 
+	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 	"golang.org/x/sys/windows"
 )
 
@@ -96,7 +97,7 @@ func createHistoryBoundPrivateFile(root *os.Root, name string) (*os.File, error)
 	var handle windows.Handle
 	err = windows.NtCreateFile(
 		&handle,
-		windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE|windows.DELETE|
+		windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE|
 			windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER,
 		attributes,
 		&windows.IO_STATUS_BLOCK{},
@@ -193,12 +194,16 @@ func historyOwnerOnlyDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {
 }
 
 func secureHistoryFile(f *os.File) error {
-	owned, err := historyFileIsCurrentUserOwner(f)
+	owned, err := fileprivacy.IsOwnedByCurrentTokenAuthority(f)
 	if err != nil {
 		return fmt.Errorf("checking prompt history owner: %w", err)
 	}
 	if !owned {
 		return errors.New("prompt history is not owned by the current user")
+	}
+	exactOwner, err := fileprivacy.IsCurrentUserOwner(f)
+	if err != nil {
+		return fmt.Errorf("checking exact prompt history owner: %w", err)
 	}
 	descriptor, err := historyOwnerOnlyDescriptor()
 	if err != nil {
@@ -208,14 +213,25 @@ func secureHistoryFile(f *os.File) error {
 	if err != nil {
 		return err
 	}
-	current, err := currentHistoryUserSID()
+	mutation, err := reopenHistorySecurityFile(f, !exactOwner)
 	if err != nil {
-		return err
+		return fmt.Errorf("reopening exact prompt history for DACL repair: %w", err)
 	}
-	if err := windows.SetSecurityInfo(windows.Handle(f.Fd()), windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		current, nil, dacl, nil); err != nil {
-		return fmt.Errorf("setting current-user-only prompt history DACL: %w", err)
+	securityInformation := windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION)
+	var owner *windows.SID
+	if !exactOwner {
+		securityInformation |= windows.OWNER_SECURITY_INFORMATION
+		owner, err = currentHistoryUserSID()
+		if err != nil {
+			_ = mutation.Close()
+			return err
+		}
+	}
+	setErr := windows.SetSecurityInfo(windows.Handle(mutation.Fd()), windows.SE_FILE_OBJECT,
+		securityInformation, owner, nil, dacl, nil)
+	closeErr := mutation.Close()
+	if setErr != nil || closeErr != nil {
+		return fmt.Errorf("setting current-user-only prompt history DACL: %w", errors.Join(setErr, closeErr))
 	}
 	ownerOnly, err := historyFileIsOwnerOnly(f)
 	if err != nil {
@@ -225,6 +241,46 @@ func secureHistoryFile(f *os.File) error {
 		return errors.New("Windows did not retain the current-user-only prompt history DACL")
 	}
 	return nil
+}
+
+func reopenHistorySecurityFile(f *os.File, writeOwner bool) (*os.File, error) {
+	if f == nil {
+		return nil, errors.New("prompt history DACL repair has no file handle")
+	}
+	access := uint32(windows.READ_CONTROL | windows.WRITE_DAC | windows.FILE_READ_ATTRIBUTES)
+	if writeOwner {
+		access |= windows.WRITE_OWNER
+	}
+	result, _, callErr := historyReOpenFileWindows.Call(
+		f.Fd(),
+		uintptr(access),
+		uintptr(uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)),
+		uintptr(uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)),
+	)
+	runtime.KeepAlive(f)
+	handle := windows.Handle(result)
+	if handle == windows.InvalidHandle {
+		if callErr == nil || callErr == windows.ERROR_SUCCESS {
+			callErr = windows.ERROR_INVALID_HANDLE
+		}
+		return nil, callErr
+	}
+	mutation := os.NewFile(uintptr(handle), f.Name()+" (history DACL repair)")
+	if mutation == nil {
+		_ = windows.CloseHandle(handle)
+		return nil, errors.New("converting exact prompt history DACL-repair handle")
+	}
+	want, wantErr := historyFileIdentity(f)
+	got, gotErr := historyFileIdentity(mutation)
+	links, linkErr := historyFileLinkCount(mutation)
+	var info windows.ByHandleFileInformation
+	infoErr := windows.GetFileInformationByHandle(handle, &info)
+	if wantErr != nil || gotErr != nil || linkErr != nil || infoErr != nil || want != got || links != 1 ||
+		info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+		return nil, errors.Join(errors.New("DACL-repair reopen returned a different or unsafe prompt history file"),
+			wantErr, gotErr, linkErr, infoErr, mutation.Close())
+	}
+	return mutation, nil
 }
 
 // historyFileIsOwnerOnly verifies the ACL through the open handle rather than

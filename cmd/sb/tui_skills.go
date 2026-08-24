@@ -86,10 +86,10 @@ func skillOriginPath(m *tuiModel, sk skills.Skill) string {
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		if rel, err := filepath.Rel(home, path); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return filepath.Join("~", rel)
+			return filepath.ToSlash(filepath.Join("~", rel))
 		}
 	}
-	return m.app.displayPath(path)
+	return filepath.ToSlash(m.app.displayPath(path))
 }
 
 func cmdSkill(m *tuiModel, args string) tea.Cmd {

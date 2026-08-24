@@ -3,12 +3,14 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/switchboard-code/switchboard/internal/checkpoint"
 	"github.com/switchboard-code/switchboard/internal/session"
 )
 
@@ -461,11 +463,17 @@ func TestHistoryRemoveFinalSeamSameInodeMutationIsRestored(t *testing.T) {
 }
 
 func appendHistoryTestBytes(path, data string) (resultErr error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	// Use the production descriptor opener so the adversarial mutation shares
+	// deletion on Windows and can coexist with the exact-handle publication
+	// lease. os.OpenFile's Windows sharing defaults are not this contract.
+	f, err := openHistoryDataDescriptor(path, true, false)
 	if err != nil {
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, f.Close()) }()
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		return err
+	}
 	if _, err := f.WriteString(data); err != nil {
 		return err
 	}
@@ -988,7 +996,27 @@ func TestHistoryRewriteParentMoveUsesBoundDirectoryOnly(t *testing.T) {
 		}
 	})
 	if hookErr != nil {
-		t.Fatal(hookErr)
+		if !historyParentMoveBlockedByRetainedHandle(hookErr) {
+			t.Fatal(hookErr)
+		}
+		// Windows refuses to rename a directory while Switchboard retains the
+		// root handle that makes this transaction capability-bound. That kernel
+		// refusal is stronger than the namespace-race outcome exercised on Unix:
+		// prove the write stayed in the retained directory and the proposed
+		// replacement namespace was never reached.
+		if err != nil {
+			t.Fatalf("rewrite after kernel-blocked parent move: %v", err)
+		}
+		if got, readErr := os.ReadFile(outsidePath); readErr != nil || string(got) != "outside sentinel\n" {
+			t.Fatalf("outside history = %q, err=%v", got, readErr)
+		}
+		if got, readErr := os.ReadFile(path); readErr != nil || string(got) != `"bound result"`+"\n" {
+			t.Fatalf("bound history = %q, err=%v", got, readErr)
+		}
+		if _, statErr := os.Lstat(moved); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("blocked parent move unexpectedly published %s: %v", moved, statErr)
+		}
+		return
 	}
 	if err == nil {
 		t.Fatal("parent namespace move was not reported")
@@ -1036,6 +1064,29 @@ func TestHistoryRewriteRollbackFailureRetainsEveryImageAndRecoveryEvidence(t *te
 	})
 
 	err = rewriteHistoryIfUnchanged(path, []string{"desired"}, snapshot, nil)
+	if historySubstitutionRefusesBeforePublication() {
+		if !errors.Is(err, checkpoint.ErrStale) || errors.Is(err, rollbackFailure) {
+			t.Fatalf("exact-handle substitution refusal = %v, want checkpoint.ErrStale without rollback", err)
+		}
+		if got, readErr := os.ReadFile(retired); readErr != nil || string(got) != original {
+			t.Fatalf("externally retired original = %q, err=%v", got, readErr)
+		}
+		if got, readErr := os.ReadFile(path); readErr != nil || string(got) != foreign {
+			t.Fatalf("foreign canonical = %q, err=%v", got, readErr)
+		}
+		assertLiveHistoryTransaction(t, path)
+		data, _, recoveryErr := readHistoryFile(path, nil)
+		if recoveryErr != nil || string(data) != foreign {
+			t.Fatalf("recovering unpublished exact-handle refusal = %q, %v", data, recoveryErr)
+		}
+		if got, readErr := os.ReadFile(retired); readErr != nil || string(got) != original {
+			t.Fatalf("recovery changed externally retired original = %q, err=%v", got, readErr)
+		}
+		assertNoLiveHistoryTransaction(t, path)
+		assertHistoryArtifactsDoNotContain(t, dir, `"desired"`)
+		assertRetiredHistoryArtifactsArePrivateAndEmpty(t, dir)
+		return
+	}
 	if !errors.Is(err, errHistoryRecoveryRequired) || !errors.Is(err, rollbackFailure) {
 		t.Fatalf("rollback failure = %v", err)
 	}

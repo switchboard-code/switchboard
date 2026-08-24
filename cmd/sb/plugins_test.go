@@ -239,10 +239,24 @@ func TestPluginActionsRefuseCatalogOnlyEnableAndRenderProvenance(t *testing.T) {
 	if err := runPluginsAction(&list, workspace, inv, nil); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"codex:review", "available", pluginRoot} {
+	for _, want := range []string{"codex:review", "available"} {
 		if !strings.Contains(list.String(), want) {
 			t.Errorf("plugin list missing %q:\n%s", want, list.String())
 		}
+	}
+	var listedPath string
+	for _, line := range strings.Split(strings.TrimSpace(list.String()), "\n") {
+		fields := strings.Split(line, "\t")
+		if len(fields) >= 5 && fields[0] == "codex:review" {
+			listedPath = fields[4]
+			break
+		}
+	}
+	wantInfo, wantErr := os.Stat(pluginRoot)
+	gotInfo, gotErr := os.Stat(listedPath)
+	if listedPath == "" || wantErr != nil || gotErr != nil || !os.SameFile(gotInfo, wantInfo) {
+		t.Errorf("plugin list path %q does not identify discovered root %q: listed=%v root=%v\n%s",
+			listedPath, pluginRoot, gotErr, wantErr, list.String())
 	}
 	var inspect strings.Builder
 	if err := runPluginsAction(&inspect, workspace, inv, []string{"inspect", "review@personal"}); err != nil {

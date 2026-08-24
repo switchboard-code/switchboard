@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"unsafe"
 
 	"github.com/switchboard-code/switchboard/internal/fileprivacy"
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 	"golang.org/x/sys/windows"
 )
 
@@ -28,6 +30,26 @@ func prepareInstallCacheDirectory(path string) error {
 		return err
 	}
 	return secureInstallWindowsPath(path, true, nil)
+}
+
+func createPrivateInstallDirectoryPlatform(root *os.Root, rel string) error {
+	clean, err := safeRelativePath(rel)
+	if err != nil {
+		return err
+	}
+	parent := root
+	if parentRel := path.Dir(clean); parentRel != "." {
+		parent, err = rootedfs.OpenRootAt(root, filepath.FromSlash(parentRel))
+		if err != nil {
+			return fmt.Errorf("opening plugin cache namespace parent: %w", err)
+		}
+		defer parent.Close()
+	}
+	directory, err := fileprivacy.CreatePrivateDirInRoot(parent, path.Base(clean))
+	if err != nil {
+		return err
+	}
+	return directory.Close()
 }
 
 func validateInstallCacheDirectory(path string, info os.FileInfo) error {

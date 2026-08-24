@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -66,10 +65,7 @@ func TestSetupChecklistCoversTheMachine(t *testing.T) {
 	}
 
 	// With a codex login on the machine and no helper wired, the offer appears.
-	codexDir := filepath.Join(home, ".codex")
-	os.MkdirAll(codexDir, 0o755)
-	os.WriteFile(filepath.Join(codexDir, "auth.json"),
-		[]byte(`{"tokens":{"access_token":"not-a-real-token"}}`), 0o600)
+	writePrivateCodexAuth(t, home, []byte(`{"tokens":{"access_token":"not-a-real-token"}}`))
 	msg = setupChecklist(m)().(pickerMsg)
 	found := false
 	for _, it := range msg.items {

@@ -343,18 +343,7 @@ func ensureInstallNamespace(root *os.Root, rel string) error {
 }
 
 func createPrivateInstallDirectory(root *os.Root, rel string) error {
-	osPath := filepath.FromSlash(rel)
-	if err := root.Mkdir(osPath, 0o700); err != nil {
-		return err
-	}
-	if err := securePrivateInstallDirectory(root, rel); err != nil {
-		removeErr := root.Remove(osPath)
-		if removeErr != nil && !os.IsNotExist(removeErr) {
-			return errors.Join(err, fmt.Errorf("removing incompletely secured plugin directory: %w", removeErr))
-		}
-		return err
-	}
-	return nil
+	return createPrivateInstallDirectoryPlatform(root, rel)
 }
 
 func openInstallSource(plugin Plugin) (*os.Root, error) {

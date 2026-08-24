@@ -25,6 +25,10 @@ func ValidateAtomicNamespaceRoot(root *os.Root) error {
 // and to are canonical local paths relative to root, not paths relative to a
 // separately opened parent directory.
 //
+// On Windows, a cross-parent move is supported only when the destination is
+// directly in the bound root. Nested cross-parent destinations fail closed so
+// the implementation can retain restrictive no-reparse ancestor leases.
+//
 // This is a namespace primitive, not a transaction. A caller that must recover
 // process interruption is responsible for durably recording the selected
 // source identity and both names before calling it, and for reconciling that

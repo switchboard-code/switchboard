@@ -597,6 +597,7 @@ func truncateUTF8(value string, limit int) string {
 }
 
 func redactThenTruncateUTF8(value string, limit int) string {
+	value, _ = credential.SafePrefixForTruncation(value, limit)
 	value = credential.Redact(value, credential.ScanPrompt(value))
 	return truncateUTF8(value, limit)
 }

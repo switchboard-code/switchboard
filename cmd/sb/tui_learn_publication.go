@@ -55,7 +55,12 @@ func (d *learnedSkillDirectory) verifyOwnerBound() error {
 		return fmt.Errorf("opening learn publication directory %s: %w", d.path, err)
 	}
 	defer directory.Close()
-	owned, ownerErr := fileprivacy.IsCurrentUserOwner(directory)
+	// Elevated Windows tokens commonly create ordinary workspace directories
+	// with TokenOwner (for example, Administrators) rather than TokenUser. That
+	// SID is still part of the current token's owner authority. Accept it for
+	// binding the user-selected workspace tree; owner-private recovery files
+	// and locks below retain their exact protected TokenUser-only DACL check.
+	owned, ownerErr := fileprivacy.IsOwnedByCurrentTokenAuthority(directory)
 	if ownerErr != nil || !owned {
 		if ownerErr == nil {
 			ownerErr = errors.New("directory is not owned by the current user")

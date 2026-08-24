@@ -296,7 +296,7 @@ func TestWorkspaceNarrowEmptyErrorAndTruncationRendering(t *testing.T) {
 	m := workspaceModel(t, filepath.Join(t.TempDir(), "missing"))
 	drainWorkspace(t, m, cmdFiles(m, ""))
 	view := activeWorkspaceView(t, m)
-	if view.err == nil || !strings.Contains(view.err.Error(), "no such file") || !strings.Contains(stripANSI(view.view(60, 6, darkTheme())), "error:") {
+	if view.err == nil || !errors.Is(view.err, os.ErrNotExist) || !strings.Contains(stripANSI(view.view(60, 6, darkTheme())), "error:") {
 		t.Fatalf("workspace error = %v, view=%q", view.err, stripANSI(view.view(60, 6, darkTheme())))
 	}
 }

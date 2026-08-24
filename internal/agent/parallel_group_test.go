@@ -45,9 +45,26 @@ func TestParallelBatchGroupOverlapsAndJoinsInCallOrder(t *testing.T) {
 	if err := h.loop.Tools.AddExternal(group); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := h.loop.Turn(ctx, "run both"); err != nil {
+	turnDone := make(chan error, 1)
+	go func() { turnDone <- h.loop.Turn(ctx, "run both") }()
+	select {
+	case <-group.release:
+		// Both calls reached the barrier concurrently. Waiting on this event
+		// distinguishes a scheduling delay from a serialized-call deadlock.
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Fatal("parallel group did not reach its two-call barrier")
+	}
+	var err error
+	select {
+	case err = <-turnDone:
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Fatal("parallel group did not settle after releasing its barrier")
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
 	if group.peak.Load() != 2 {

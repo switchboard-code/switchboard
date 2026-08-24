@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 )
 
 const (
@@ -324,10 +326,21 @@ func writeDurableUndoJournal(prepared *PreparedUndo, journalDir, workspace, chil
 	if hook != nil {
 		hook(durableUndoJournalAfterInstall, -1)
 	}
-	reopened, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	reopenRoot, err := rootedfs.OpenRoot(dir)
 	if err != nil {
 		return nil, errors.Join(ErrDurableUndoRecoveryRequired,
-			fmt.Errorf("reopening published retry transaction journal: %w", err), handle.close())
+			fmt.Errorf("binding published retry transaction journal directory: %w", err), handle.close())
+	}
+	reopened, reopenErr := reopenRoot.OpenFile(durableUndoJournalName, os.O_RDWR, 0o600)
+	rootCloseErr := reopenRoot.Close()
+	err = errors.Join(reopenErr, rootCloseErr)
+	if err != nil {
+		var reopenedCloseErr error
+		if reopened != nil {
+			reopenedCloseErr = reopened.Close()
+		}
+		return nil, errors.Join(ErrDurableUndoRecoveryRequired,
+			fmt.Errorf("reopening published retry transaction journal: %w", err), reopenedCloseErr, handle.close())
 	}
 	linked, err := reopened.Stat()
 	if err != nil || !os.SameFile(written, linked) {

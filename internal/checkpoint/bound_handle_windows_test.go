@@ -3,11 +3,15 @@
 package checkpoint
 
 import (
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"unsafe"
 
@@ -147,6 +151,87 @@ func TestRenameBoundOpenFileWindowsAncestorLeaseCoversEveryExchangeStep(t *testi
 	}
 }
 
+func TestRenameBoundOpenFileWindowsMutationHandleLeasesSourceLink(t *testing.T) {
+	root, dir := openWindowsTestRoot(t)
+	for _, parent := range []string{"nested", "other"} {
+		if err := os.Mkdir(filepath.Join(dir, parent), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sourceName := filepath.Join("nested", "source")
+	targetName := filepath.Join("nested", "target")
+	source := createWindowsRootFile(t, root, sourceName, "new")
+	attackerName := filepath.Join("other", "source")
+	var moveErr error
+	windowsBeforeNativeRenameTestHook = func(_, _ string) error {
+		moveErr = root.Rename(sourceName, attackerName)
+		if moveErr == nil {
+			return errors.Join(
+				errors.New("exact checkpoint source link was movable at the native rename seam"),
+				root.Rename(attackerName, sourceName),
+			)
+		}
+		return nil
+	}
+	t.Cleanup(func() { windowsBeforeNativeRenameTestHook = nil })
+
+	published, err := renameBoundOpenFile(root, source, nil, sourceName, targetName, false)
+	windowsBeforeNativeRenameTestHook = nil
+	if err != nil || !published {
+		t.Fatalf("leased rename = published %v, %v", published, err)
+	}
+	if moveErr == nil {
+		t.Fatal("source-link move unexpectedly succeeded")
+	}
+	if got := readWindowsRootFile(t, root, targetName); got != "new" {
+		t.Fatalf("target = %q, want new", got)
+	}
+	if _, err := root.Lstat(attackerName); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("attacker destination appeared: %v", err)
+	}
+}
+
+func TestRenameBoundOpenFileWindowsBindsSourceAndDestinationAfterPreMove(t *testing.T) {
+	root, dir := openWindowsTestRoot(t)
+	for _, parent := range []string{"intended", "outside"} {
+		if err := os.Mkdir(filepath.Join(dir, parent), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sourceName := filepath.Join("intended", "source")
+	targetName := filepath.Join("intended", "target")
+	movedName := filepath.Join("outside", "moved")
+	escapedTarget := filepath.Join("outside", "target")
+	source := createWindowsRootFile(t, root, sourceName, "new")
+
+	// Move the open link before renameBoundOpenFile can acquire its source-link
+	// lease, then put a hard link to the same inode back at the checked name.
+	// Stable file identity alone cannot distinguish this state.
+	if err := root.Rename(sourceName, movedName); err != nil {
+		t.Fatalf("pre-moving selected source link: %v", err)
+	}
+	if err := os.Link(filepath.Join(dir, movedName), filepath.Join(dir, sourceName)); err != nil {
+		t.Fatalf("hard-linking selected inode back at source: %v", err)
+	}
+
+	published, err := renameBoundOpenFile(root, source, nil, sourceName, targetName, false)
+	if err != nil || !published {
+		t.Fatalf("destination-bound rename = published %v, %v", published, err)
+	}
+	if got := readWindowsRootFile(t, root, targetName); got != "new" {
+		t.Fatalf("bound target = %q, want new", got)
+	}
+	if _, err := root.Lstat(sourceName); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("checked source alias remains after move: %v", err)
+	}
+	if got := readWindowsRootFile(t, root, movedName); got != "new" {
+		t.Fatalf("pre-moved external alias = %q, want new", got)
+	}
+	if _, err := root.Lstat(escapedTarget); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("rename escaped into the source link's former parent: %v", err)
+	}
+}
+
 func TestRenameBoundOpenFileWindowsAncestorLeaseCoversRollback(t *testing.T) {
 	root, dir := openWindowsTestRoot(t)
 	parent := filepath.Join(dir, "nested")
@@ -197,7 +282,7 @@ func TestRenameBoundOpenFileWindowsAncestorLeaseCoversRollback(t *testing.T) {
 	}
 }
 
-func TestRenameBoundOpenFileWindowsLeasesBothNoReplaceParentChains(t *testing.T) {
+func TestRenameBoundOpenFileWindowsRefusesNestedCrossParentDestination(t *testing.T) {
 	root, dir := openWindowsTestRoot(t)
 	for _, parent := range []string{filepath.Join("left", "deep"), filepath.Join("right", "deep")} {
 		if err := os.MkdirAll(filepath.Join(dir, parent), 0o700); err != nil {
@@ -207,45 +292,16 @@ func TestRenameBoundOpenFileWindowsLeasesBothNoReplaceParentChains(t *testing.T)
 	sourceName := filepath.Join("left", "deep", "source")
 	targetName := filepath.Join("right", "deep", "target")
 	source := createWindowsRootFile(t, root, sourceName, "new")
-	outside := t.TempDir()
-	ancestors := []string{
-		filepath.Join(dir, "left", "deep"),
-		filepath.Join(dir, "left"),
-		filepath.Join(dir, "right", "deep"),
-		filepath.Join(dir, "right"),
-	}
-	var moveErrors []error
-	windowsBeforeNativeRenameTestHook = func(_, _ string) error {
-		for _, ancestor := range ancestors {
-			destination := filepath.Join(outside, filepath.Base(ancestor))
-			moveErr := os.Rename(ancestor, destination)
-			moveErrors = append(moveErrors, moveErr)
-			if moveErr == nil {
-				return errors.Join(
-					errors.New("leased source or destination ancestor was movable"),
-					os.Rename(destination, ancestor),
-				)
-			}
-		}
-		return nil
-	}
-	t.Cleanup(func() { windowsBeforeNativeRenameTestHook = nil })
 
 	published, err := renameBoundOpenFile(root, source, nil, sourceName, targetName, false)
-	windowsBeforeNativeRenameTestHook = nil
-	if err != nil || !published {
-		t.Fatalf("cross-parent no-replace = published %v, %v", published, err)
+	if err == nil || published || !strings.Contains(err.Error(), "destination in the bound root") {
+		t.Fatalf("nested cross-parent no-replace = published %v, %v; want unpublished secure refusal", published, err)
 	}
-	if len(moveErrors) != len(ancestors) {
-		t.Fatalf("attempted %d ancestor moves, want %d", len(moveErrors), len(ancestors))
+	if got := readWindowsRootFile(t, root, sourceName); got != "new" {
+		t.Fatalf("source after refusal = %q, want new", got)
 	}
-	for i, moveErr := range moveErrors {
-		if moveErr == nil {
-			t.Fatalf("ancestor move %d unexpectedly succeeded", i+1)
-		}
-	}
-	if got := readWindowsRootFile(t, root, targetName); got != "new" {
-		t.Fatalf("target = %q, want new", got)
+	if _, err := root.Lstat(targetName); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("nested destination appeared after refusal: %v", err)
 	}
 }
 
@@ -308,6 +364,258 @@ func TestWindowsNamespaceLeaseFencesWriteCapableAncestorHandles(t *testing.T) {
 	}
 }
 
+func TestWindowsDestinationNamespaceLeaseSharesWritesAndFencesDelete(t *testing.T) {
+	root, dir := openWindowsTestRoot(t)
+	parent := filepath.Join(dir, "nested")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	writer, err := openWindowsDirectoryWriteHandle(parent)
+	if err != nil {
+		t.Skipf("this Windows filesystem does not permit a write-capable directory probe: %v", err)
+	}
+	lease, err := acquireWindowsDestinationNamespaceLease(
+		root,
+		filepath.Join("nested", "target"),
+		filepath.Join("nested", "source"),
+	)
+	if err != nil {
+		_ = windows.CloseHandle(writer)
+		t.Fatalf("acquiring destination lease alongside writer: %v", err)
+	}
+	defer lease.close()
+	if err := windows.CloseHandle(writer); err != nil {
+		t.Fatal(err)
+	}
+	writer, err = openWindowsDirectoryWriteHandle(parent)
+	if err != nil {
+		t.Fatalf("destination lease blocked a write-capable parent handle: %v", err)
+	}
+	if err := windows.CloseHandle(writer); err != nil {
+		t.Fatal(err)
+	}
+
+	moved := filepath.Join(dir, "moved")
+	if err := os.Rename(parent, moved); err == nil {
+		_ = os.Rename(moved, parent)
+		t.Fatal("destination parent was movable while its no-delete lease was active")
+	}
+}
+
+func TestWindowsNamespaceAnchorIsNonemptyDeleteLeasedAndExactCleaned(t *testing.T) {
+	root, _ := openWindowsTestRoot(t)
+	anchor, err := createWindowsNamespaceAnchor(root)
+	if err != nil {
+		t.Fatalf("creating namespace anchor: %v", err)
+	}
+	defer anchor.close()
+
+	if info, err := root.Lstat(anchor.name); err != nil || !info.Mode().IsRegular() || info.Size() != 0 {
+		t.Fatalf("namespace anchor = %#v, %v; want zero-byte regular file", info, err)
+	}
+	if err := root.Remove(anchor.name); err == nil {
+		t.Fatal("namespace anchor was removable while its no-delete lease was active")
+	}
+	if err := root.Rename(anchor.name, "moved-anchor"); err == nil {
+		t.Fatal("namespace anchor was movable while its no-delete lease was active")
+	}
+
+	name := anchor.name
+	if err := anchor.close(); err != nil {
+		t.Fatalf("cleaning namespace anchor by exact handle: %v", err)
+	}
+	if _, err := root.Lstat(name); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("namespace anchor remains after exact cleanup: %v", err)
+	}
+}
+
+func TestWindowsNamespaceAnchorBlocksDirectoryReparseMutation(t *testing.T) {
+	target := t.TempDir()
+	probeParent := t.TempDir()
+	probe := filepath.Join(probeParent, "empty")
+	if err := os.Mkdir(probe, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := setWindowsTestMountPoint(probe, target); err != nil {
+		if windowsReparseTestUnavailable(err) {
+			t.Skipf("this Windows environment cannot install a directory reparse point: %v", err)
+		}
+		t.Fatalf("calibrating directory reparse-point support: %v", err)
+	}
+	if err := deleteWindowsTestMountPoint(probe); err != nil {
+		t.Fatalf("cleaning directory reparse-point calibration: %v", err)
+	}
+	if err := os.Remove(probe); err != nil {
+		t.Fatalf("removing directory reparse-point calibration: %v", err)
+	}
+
+	root, dir := openWindowsTestRoot(t)
+	anchor, err := createWindowsNamespaceAnchor(root)
+	if err != nil {
+		t.Fatalf("creating namespace anchor: %v", err)
+	}
+	defer anchor.close()
+
+	setErr := setWindowsTestMountPoint(dir, target)
+	if setErr == nil {
+		cleanupErr := deleteWindowsTestMountPoint(dir)
+		t.Fatalf("namespace anchor allowed its directory to become a reparse point; cleanup: %v", cleanupErr)
+	}
+	if !errors.Is(setErr, windows.ERROR_DIR_NOT_EMPTY) {
+		t.Fatalf("setting a reparse point on the anchored directory = %v, want ERROR_DIR_NOT_EMPTY", setErr)
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		t.Fatalf("reopening anchored root after refused reparse mutation: %v", err)
+	}
+	defer directory.Close()
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(directory.Fd()), &info); err != nil {
+		t.Fatalf("inspecting anchored root after refused reparse mutation: %v", err)
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		t.Fatal("anchored root retained a reparse-point attribute after the refused mutation")
+	}
+}
+
+func setWindowsTestMountPoint(path, target string) (err error) {
+	buffer, err := windowsTestMountPointBuffer(target)
+	if err != nil {
+		return err
+	}
+	handle, err := openWindowsTestReparseHandle(path)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, windows.CloseHandle(handle)) }()
+	var returned uint32
+	return windows.DeviceIoControl(
+		handle,
+		windows.FSCTL_SET_REPARSE_POINT,
+		&buffer[0],
+		uint32(len(buffer)),
+		nil,
+		0,
+		&returned,
+		nil,
+	)
+}
+
+func deleteWindowsTestMountPoint(path string) (err error) {
+	handle, err := openWindowsTestReparseHandle(path)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, windows.CloseHandle(handle)) }()
+	buffer := make([]byte, 8)
+	binary.LittleEndian.PutUint32(buffer, windows.IO_REPARSE_TAG_MOUNT_POINT)
+	var returned uint32
+	return windows.DeviceIoControl(
+		handle,
+		windows.FSCTL_DELETE_REPARSE_POINT,
+		&buffer[0],
+		uint32(len(buffer)),
+		nil,
+		0,
+		&returned,
+		nil,
+	)
+}
+
+func openWindowsTestReparseHandle(path string) (windows.Handle, error) {
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return windows.InvalidHandle, err
+	}
+	return windows.CreateFile(
+		name,
+		windows.GENERIC_WRITE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS,
+		0,
+	)
+}
+
+func windowsTestMountPointBuffer(target string) ([]byte, error) {
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		return nil, err
+	}
+	substitute, err := windows.UTF16FromString(`\??\` + abs)
+	if err != nil {
+		return nil, err
+	}
+	printName, err := windows.UTF16FromString(abs)
+	if err != nil {
+		return nil, err
+	}
+	pathWords := append(substitute, printName...)
+	const mountPointFields = 8
+	dataLength := mountPointFields + len(pathWords)*2
+	if dataLength > int(^uint16(0)) {
+		return nil, errors.New("test mount-point target is too long")
+	}
+	buffer := make([]byte, 8+dataLength)
+	binary.LittleEndian.PutUint32(buffer[0:4], windows.IO_REPARSE_TAG_MOUNT_POINT)
+	binary.LittleEndian.PutUint16(buffer[4:6], uint16(dataLength))
+	binary.LittleEndian.PutUint16(buffer[8:10], 0)
+	binary.LittleEndian.PutUint16(buffer[10:12], uint16((len(substitute)-1)*2))
+	binary.LittleEndian.PutUint16(buffer[12:14], uint16(len(substitute)*2))
+	binary.LittleEndian.PutUint16(buffer[14:16], uint16((len(printName)-1)*2))
+	for i, word := range pathWords {
+		binary.LittleEndian.PutUint16(buffer[16+i*2:], word)
+	}
+	return buffer, nil
+}
+
+func windowsReparseTestUnavailable(err error) bool {
+	return errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD) ||
+		errors.Is(err, windows.ERROR_ACCESS_DENIED) ||
+		errors.Is(err, windows.ERROR_INVALID_FUNCTION) ||
+		errors.Is(err, windows.ERROR_NOT_SUPPORTED)
+}
+
+func TestWindowsNamespaceAnchorDeletesOnAbruptProcessExit(t *testing.T) {
+	_, dir := openWindowsTestRoot(t)
+	command := exec.Command(os.Args[0], "-test.run=^TestWindowsNamespaceAnchorCrashHelper$")
+	command.Env = append(os.Environ(),
+		"SWITCHBOARD_TEST_NAMESPACE_ANCHOR_CRASH=1",
+		"SWITCHBOARD_TEST_NAMESPACE_ANCHOR_DIR="+dir,
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("anchor crash helper: %v\n%s", err, output)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("namespace anchor survived abrupt process exit: %v", entries)
+	}
+}
+
+func TestWindowsNamespaceAnchorCrashHelper(t *testing.T) {
+	if os.Getenv("SWITCHBOARD_TEST_NAMESPACE_ANCHOR_CRASH") != "1" {
+		return
+	}
+	dir := os.Getenv("SWITCHBOARD_TEST_NAMESPACE_ANCHOR_DIR")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if _, err := createWindowsNamespaceAnchor(root); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(3)
+	}
+	// Deliberately bypass every defer and explicit close. Windows must retire
+	// the FILE_DELETE_ON_CLOSE anchor when the process tears down its handles.
+	os.Exit(0)
+}
+
 func TestRollbackBoundCreationWindowsNestedPath(t *testing.T) {
 	root, dir := openWindowsTestRoot(t)
 	if err := os.Mkdir(filepath.Join(dir, "nested"), 0o700); err != nil {
@@ -354,6 +662,49 @@ func TestRetireBoundOpenFileToWindowsNestedSource(t *testing.T) {
 	}
 	if _, err := sinkRoot.Lstat(retiredSinkName(name)); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("nested retired sink name remains: %v", err)
+	}
+}
+
+func TestRetireBoundOpenFileToWindowsAnchorsEmptySinkAtNativeSeam(t *testing.T) {
+	sourceRoot, _ := openWindowsTestRoot(t)
+	sinkRoot, _ := openWindowsTestRoot(t)
+	file := createWindowsRootFile(t, sourceRoot, "owned", "secret")
+	var sawAnchor bool
+	windowsBeforeNativeRenameTestHook = func(_, _ string) error {
+		directory, err := sinkRoot.Open(".")
+		if err != nil {
+			return err
+		}
+		entries, readErr := directory.ReadDir(-1)
+		closeErr := directory.Close()
+		if readErr != nil || closeErr != nil {
+			return errors.Join(readErr, closeErr)
+		}
+		if len(entries) != 1 || !strings.HasPrefix(entries[0].Name(), ".switchboard-quarantine-") {
+			return fmt.Errorf("retirement sink entries at native seam = %v; want one private anchor", entries)
+		}
+		if err := sinkRoot.Remove(entries[0].Name()); err == nil {
+			return errors.New("retirement sink anchor was removable at native rename seam")
+		}
+		sawAnchor = true
+		return nil
+	}
+	t.Cleanup(func() { windowsBeforeNativeRenameTestHook = nil })
+
+	if err := retireBoundOpenFileTo(sourceRoot, sinkRoot, "owned", file, true, nil, nil); err != nil {
+		t.Fatalf("retiring into anchored sink: %v", err)
+	}
+	windowsBeforeNativeRenameTestHook = nil
+	if !sawAnchor {
+		t.Fatal("native retirement seam did not observe the sink anchor")
+	}
+	directory, err := sinkRoot.Open(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.Close()
+	if entries, err := directory.ReadDir(-1); err != nil || len(entries) != 0 {
+		t.Fatalf("retirement sink after exact cleanup = %v, %v; want empty", entries, err)
 	}
 }
 
@@ -449,6 +800,59 @@ func TestRenameBoundOpenFileWindowsNoReplacePreservesSentinel(t *testing.T) {
 	}
 	if got := readWindowsRootFile(t, root, "source"); got != "new" {
 		t.Fatalf("source = %q", got)
+	}
+}
+
+func TestRenameBoundOpenFileWindowsReadOnlySourceUsesExactHandle(t *testing.T) {
+	root, dir := openWindowsTestRoot(t)
+	source := createWindowsRootFile(t, root, "source", "read only")
+	if err := os.Chmod(filepath.Join(dir, "source"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	source, err := root.Open("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+
+	lease, err := acquireWindowsDestinationNamespaceLease(root, "target", "source")
+	if err != nil {
+		t.Fatalf("leasing read-only source namespace: %v", err)
+	}
+	defer lease.close()
+	mutation, err := openBoundMutationHandleWindows(lease, "source", source)
+	if err != nil {
+		t.Fatalf("binding read-only source for rename: %v", err)
+	}
+	defer closeMutationHandleWindows(&mutation)
+	if mutation.explicitFlush {
+		t.Fatal("read-only source unexpectedly acquired a GENERIC_WRITE mutation handle")
+	}
+	if err := closeMutationHandleWindows(&mutation); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.close(); err != nil {
+		t.Fatal(err)
+	}
+	published, err := renameBoundOpenFile(root, source, nil, "source", "target", false)
+	if err != nil || !published {
+		t.Fatalf("read-only rename = published %v, %v", published, err)
+	}
+	if _, err := root.Lstat("source"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("read-only source remains after rename: %v", err)
+	}
+	info, err := root.Lstat("target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o222 != 0 {
+		t.Fatalf("renamed read-only mode = %o, want no write bits", info.Mode().Perm())
+	}
+	if got := readWindowsRootFile(t, root, "target"); got != "read only" {
+		t.Fatalf("renamed read-only content = %q", got)
 	}
 }
 
@@ -552,47 +956,49 @@ func TestRenameBoundOpenFileWindowsPhaseErrorsPreserveRecoverableState(t *testin
 	}
 }
 
-func TestRetireBoundOpenFileWindowsBeforeSeamPreservesReplacement(t *testing.T) {
+func TestRetireBoundOpenFileWindowsBeforeSeamLeasesSourceLink(t *testing.T) {
 	root, _ := openWindowsTestRoot(t)
 	owned := createWindowsRootFile(t, root, "owned", "secret")
+	var moveErr error
 
 	err := retireBoundOpenFile(root, "owned", owned, true, func() {
-		if err := root.Rename("owned", "moved"); err != nil {
-			t.Fatalf("move owned inode: %v", err)
-		}
-		createWindowsRootFile(t, root, "owned", "sentinel")
+		moveErr = root.Rename("owned", "moved")
 	}, nil)
 	if err != nil {
 		t.Fatalf("retire: %v", err)
 	}
-	if got := readWindowsRootFile(t, root, "owned"); got != "sentinel" {
-		t.Fatalf("replacement = %q", got)
+	if moveErr == nil {
+		t.Fatal("source link was movable immediately before retirement rename")
+	}
+	if _, err := root.Lstat("owned"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("retired source remains: %v", err)
 	}
 	if _, err := root.Lstat("moved"); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("selected inode remains at moved: %v", err)
+		t.Fatalf("attacker destination appeared: %v", err)
 	}
 }
 
-func TestRetireBoundOpenFileWindowsAfterSeamPreservesReplacement(t *testing.T) {
+func TestRetireBoundOpenFileWindowsAfterSeamLeasesQuarantineLink(t *testing.T) {
 	root, _ := openWindowsTestRoot(t)
 	owned := createWindowsRootFile(t, root, "owned", "secret")
 	var quarantine string
+	var moveErr error
 
 	err := retireBoundOpenFile(root, "owned", owned, true, nil, func(name string) {
 		quarantine = name
-		if err := root.Rename(name, "moved"); err != nil {
-			t.Fatalf("move quarantined inode: %v", err)
-		}
-		createWindowsRootFile(t, root, name, "sentinel")
+		moveErr = root.Rename(name, "moved")
 	})
-	if !errors.Is(err, ErrStale) {
-		t.Fatalf("retire error = %v, want ErrStale", err)
+	if err != nil {
+		t.Fatalf("retire: %v", err)
 	}
-	if got := readWindowsRootFile(t, root, quarantine); got != "sentinel" {
-		t.Fatalf("quarantine replacement = %q", got)
+	if moveErr == nil {
+		t.Fatal("quarantine link was movable before exact-handle disposition")
+	}
+	if _, err := root.Lstat(quarantine); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("quarantine remains after retirement: %v", err)
 	}
 	if _, err := root.Lstat("moved"); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("selected inode remains at moved: %v", err)
+		t.Fatalf("attacker destination appeared: %v", err)
 	}
 }
 
@@ -821,6 +1227,25 @@ func TestProbeWindowsRetirementPrimitivesLeavesNoArtifacts(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("capability probe left %d artifact(s): %v", len(entries), entries)
+	}
+}
+
+func TestDisposeCapabilityProbeOriginalWindowsPreservesReplacement(t *testing.T) {
+	root, _ := openWindowsTestRoot(t)
+	selected := createWindowsRootFile(t, root, "probe", "selected")
+	if err := root.Rename("probe", "moved"); err != nil {
+		t.Fatalf("moving selected probe link: %v", err)
+	}
+	createWindowsRootFile(t, root, "probe", "replacement")
+
+	if err := disposeCapabilityProbeOriginalWindows(windows.Handle(selected.Fd())); err != nil {
+		t.Fatalf("disposing selected probe by exact handle: %v", err)
+	}
+	if _, err := root.Lstat("moved"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("selected probe link remains: %v", err)
+	}
+	if got := readWindowsRootFile(t, root, "probe"); got != "replacement" {
+		t.Fatalf("replacement probe = %q, want replacement", got)
 	}
 }
 

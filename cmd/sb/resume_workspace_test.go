@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -12,6 +13,32 @@ import (
 	"github.com/switchboard-code/switchboard/internal/router"
 	"github.com/switchboard-code/switchboard/internal/session"
 )
+
+func requireSafeResumeLaunch(t *testing.T, resumeErr error, recordedWorkspace string) {
+	t.Helper()
+	const marker = "restart switchboard with -workspace "
+	message := resumeErr.Error()
+	start := strings.Index(message, marker)
+	if start < 0 {
+		t.Fatalf("workspace refusal does not explain the safe launch: %v", resumeErr)
+	}
+	argument := strings.TrimSuffix(message[start+len(marker):], " to resume it")
+	if argument == message[start+len(marker):] {
+		t.Fatalf("workspace refusal has an incomplete safe launch: %v", resumeErr)
+	}
+	path, err := strconv.Unquote(argument)
+	if err != nil {
+		t.Fatalf("workspace refusal has an invalid -workspace argument %q: %v", argument, err)
+	}
+	want, err := os.Stat(recordedWorkspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.Stat(path)
+	if err != nil || !os.SameFile(got, want) {
+		t.Fatalf("safe launch workspace = %q, want the recorded workspace %q: %v", path, recordedWorkspace, err)
+	}
+}
 
 func crossWorkspaceSession(t *testing.T, store *session.Store, workspace string) (id, path string, before []byte) {
 	t.Helper()
@@ -54,8 +81,8 @@ func TestStartupExplicitResumeRefusesAnotherWorkspaceBeforeRecovery(t *testing.T
 	); err == nil {
 		resumed.Close()
 		t.Fatal("startup adopted a transcript into another workspace's runtime")
-	} else if !strings.Contains(err.Error(), recordedWorkspace) || !strings.Contains(err.Error(), "-workspace") {
-		t.Fatalf("workspace refusal does not explain the safe launch: %v", err)
+	} else {
+		requireSafeResumeLaunch(t, err, recordedWorkspace)
 	}
 	after, err := os.ReadFile(recordedPath)
 	if err != nil {
@@ -80,9 +107,7 @@ func TestTUIExplicitResumeRefusesAnotherWorkspaceBeforeRecovery(t *testing.T) {
 	if !ok || msg.err == nil {
 		t.Fatalf("cross-workspace resume result = %#v", msg)
 	}
-	if !strings.Contains(msg.err.Error(), recordedWorkspace) || !strings.Contains(msg.err.Error(), "-workspace") {
-		t.Fatalf("workspace refusal does not explain the safe launch: %v", msg.err)
-	}
+	requireSafeResumeLaunch(t, msg.err, recordedWorkspace)
 	m.onSessionSwap(msg)
 	if m.app.loop.Session.ID() != sourceID {
 		t.Fatal("TUI changed sessions after the workspace refusal")

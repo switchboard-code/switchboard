@@ -12,6 +12,7 @@ import (
 
 func TestAgentsCommandListsDefinitionsAndNotes(t *testing.T) {
 	m := testModel(t)
+	m.app.workspace = t.TempDir()
 	m.app.agents = []delegate.Agent{
 		{Name: "reviewer", Description: "reviews a diff", Tier: "t2", Tools: []string{"read", "grep"}},
 		{Name: "scout", Description: "finds things", FromHome: true},

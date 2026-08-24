@@ -3,6 +3,7 @@
 package fileprivacy
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -138,6 +139,198 @@ func TestWindowsRootedPrivateLockUsesProtectedCurrentUserDACL(t *testing.T) {
 	}
 	if err := second.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWindowsSecureReopensExactFileAcrossPathSubstitution(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "limited-handle")
+	moved := filepath.Join(dir, "selected-handle")
+	created, err := Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	world, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;WD)")
+	if err != nil {
+		_ = created.Close()
+		t.Fatal(err)
+	}
+	dacl, _, err := world.DACL()
+	if err != nil {
+		_ = created.Close()
+		t.Fatal(err)
+	}
+	if err := windows.SetSecurityInfo(windows.Handle(created.Fd()), windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil); err != nil {
+		_ = created.Close()
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	limited, err := openWindowsFile(path,
+		windows.GENERIC_READ|windows.GENERIC_WRITE|windows.READ_CONTROL,
+		nil, windows.OPEN_EXISTING)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer limited.Close()
+	if err := os.Rename(path, moved); err != nil {
+		t.Fatalf("moving selected file before exact-handle repair: %v", err)
+	}
+	replacement, err := Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	if err := windows.SetSecurityInfo(windows.Handle(replacement.Fd()), windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := Secure(limited); err != nil {
+		t.Fatalf("securing through a handle without WRITE_DAC: %v", err)
+	}
+	if private, err := IsOwnerOnly(limited); err != nil || !private {
+		t.Fatalf("repaired owner-only=%v err=%v", private, err)
+	}
+	if private, err := IsOwnerOnly(replacement); err != nil || private {
+		t.Fatalf("replacement owner-only=%v err=%v; exact-handle repair touched the path replacement", private, err)
+	}
+}
+
+func TestWindowsSecureNormalizesLimitedOwnerOnlyACE(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "limited-owner-only")
+	created, err := Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := currentWindowsUserSID()
+	if err != nil {
+		_ = created.Close()
+		t.Fatal(err)
+	}
+	limited, err := windows.SecurityDescriptorFromString("O:" + current.String() +
+		"D:P(A;;FR;;;" + current.String() + ")")
+	if err != nil {
+		_ = created.Close()
+		t.Fatal(err)
+	}
+	dacl, _, err := limited.DACL()
+	if err != nil {
+		_ = created.Close()
+		t.Fatal(err)
+	}
+	if err := windows.SetSecurityInfo(windows.Handle(created.Fd()), windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil); err != nil {
+		_ = created.Close()
+		t.Fatal(err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	readOnly, err := openWindowsFile(path, windows.GENERIC_READ|windows.READ_CONTROL, nil, windows.OPEN_EXISTING)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnly.Close()
+	if err := Secure(readOnly); err != nil {
+		t.Fatalf("normalizing limited owner-only ACE: %v", err)
+	}
+	writable, err := openWindowsFile(path, windows.GENERIC_WRITE|windows.READ_CONTROL, nil, windows.OPEN_EXISTING)
+	if err != nil {
+		t.Fatalf("normalized DACL did not restore owner write access: %v", err)
+	}
+	_ = writable.Close()
+}
+
+func TestWindowsSecureDirectoryReopensExactHandleAcrossPathSubstitution(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "limited-directory")
+	moved := filepath.Join(dir, "selected-directory")
+	if err := EnsurePrivateDir(path); err != nil {
+		t.Fatal(err)
+	}
+	writable, err := openWindowsDirectory(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	world, err := windows.SecurityDescriptorFromString("D:P(A;OICI;FA;;;WD)")
+	if err != nil {
+		_ = writable.Close()
+		t.Fatal(err)
+	}
+	dacl, _, err := world.DACL()
+	if err != nil {
+		_ = writable.Close()
+		t.Fatal(err)
+	}
+	if err := windows.SetSecurityInfo(windows.Handle(writable.Fd()), windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil); err != nil {
+		_ = writable.Close()
+		t.Fatal(err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	limited, err := openWindowsDirectory(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer limited.Close()
+	if err := os.Rename(path, moved); err != nil {
+		t.Fatalf("moving selected directory before exact-handle repair: %v", err)
+	}
+	if err := EnsurePrivateDir(path); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := openWindowsDirectory(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	if err := windows.SetSecurityInfo(windows.Handle(replacement.Fd()), windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := SecureDirectory(limited); err != nil {
+		t.Fatalf("securing directory through a handle without WRITE_DAC: %v", err)
+	}
+	if private, err := DirectoryIsOwnerOnly(limited); err != nil || !private {
+		t.Fatalf("repaired directory owner-only=%v err=%v", private, err)
+	}
+	if private, err := DirectoryIsOwnerOnly(replacement); err != nil || private {
+		t.Fatalf("replacement directory owner-only=%v err=%v; exact-handle repair touched the path replacement", private, err)
+	}
+}
+
+func TestWindowsCreatePrivateDirInRootPublishesProtectedDACL(t *testing.T) {
+	parent := t.TempDir()
+	root, err := os.OpenRoot(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	directory, err := CreatePrivateDirInRoot(root, "private")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if private, err := DirectoryIsOwnerOnly(directory); err != nil || !private {
+		_ = directory.Close()
+		t.Fatalf("created directory owner-only=%v err=%v", private, err)
+	}
+	if err := directory.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreatePrivateDirInRoot(root, "private"); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("duplicate create = %v, want os.ErrExist", err)
 	}
 }
 

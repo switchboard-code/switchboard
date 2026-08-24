@@ -17,6 +17,8 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+var filePrivacyReOpenFile = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReOpenFile")
+
 // Open opens an existing regular single-link file without traversing a final
 // reparse point. Call IsOwnerOnly before trusting security-sensitive contents.
 func Open(path string) (*os.File, error) {
@@ -263,7 +265,44 @@ func openWindowsRootFile(root *os.Root, name string, access, disposition uint32,
 	return f, nil
 }
 
+// CreatePrivateDirInRoot creates one literal directory beneath root with the
+// protected current-user-only descriptor installed by the same NtCreateFile
+// operation that publishes the directory. This closes the inherited-DACL
+// window that a create-then-secure sequence would expose to another process.
+func CreatePrivateDirInRoot(root *os.Root, name string) (*os.File, error) {
+	if err := validateRootLeaf(root, name); err != nil {
+		return nil, err
+	}
+	descriptor, err := ownerOnlyWindowsDirectoryDescriptor()
+	if err != nil {
+		return nil, err
+	}
+	directory, err := openWindowsRootDirectory(root, name, windows.FILE_CREATE, descriptor)
+	if err != nil {
+		return nil, err
+	}
+	ownerOnly, checkErr := DirectoryIsOwnerOnly(directory)
+	linked, linkErr := root.Lstat(name)
+	opened, statErr := directory.Stat()
+	if checkErr != nil || statErr != nil || linkErr != nil || !ownerOnly ||
+		linked == nil || opened == nil || !linked.IsDir() || !opened.IsDir() || !os.SameFile(linked, opened) {
+		if checkErr == nil && statErr == nil && linkErr == nil && !ownerOnly {
+			checkErr = errors.New("Windows did not retain the current-user-only directory DACL at creation")
+		}
+		return nil, errors.Join(checkErr, statErr, linkErr,
+			errors.New("owner-private directory changed while it was created"), directory.Close())
+	}
+	return directory, nil
+}
+
 func openPrivateDirectoryInRoot(root *os.Root, name string) (*os.File, error) {
+	if err := validateRootLeaf(root, name); err != nil {
+		return nil, err
+	}
+	return openWindowsRootDirectory(root, name, windows.FILE_OPEN, nil)
+}
+
+func openWindowsRootDirectory(root *os.Root, name string, disposition uint32, descriptor *windows.SECURITY_DESCRIPTOR) (*os.File, error) {
 	directory, err := root.Open(".")
 	if err != nil {
 		return nil, err
@@ -274,9 +313,10 @@ func openPrivateDirectoryInRoot(root *os.Root, name string) (*os.File, error) {
 		return nil, err
 	}
 	attributes := &windows.OBJECT_ATTRIBUTES{
-		RootDirectory: windows.Handle(directory.Fd()),
-		ObjectName:    objectName,
-		Attributes:    windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
+		RootDirectory:      windows.Handle(directory.Fd()),
+		ObjectName:         objectName,
+		Attributes:         windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
+		SecurityDescriptor: descriptor,
 	}
 	attributes.Length = uint32(unsafe.Sizeof(*attributes))
 	var handle windows.Handle
@@ -289,12 +329,16 @@ func openPrivateDirectoryInRoot(root *os.Root, name string) (*os.File, error) {
 		nil,
 		windows.FILE_ATTRIBUTE_NORMAL,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		windows.FILE_OPEN,
+		disposition,
 		windows.FILE_DIRECTORY_FILE|windows.FILE_SYNCHRONOUS_IO_NONALERT|windows.FILE_OPEN_REPARSE_POINT,
 		0,
 		0,
 	)
 	runtime.KeepAlive(directory)
+	runtime.KeepAlive(descriptor)
+	if status, ok := err.(windows.NTStatus); ok && status == windows.STATUS_OBJECT_NAME_COLLISION {
+		return nil, &os.PathError{Op: "create owner-private directory", Path: name, Err: os.ErrExist}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -361,9 +405,9 @@ func EnsurePrivateDir(path string) error {
 	return nil
 }
 
-// SecureDirectory applies the same owner and ACL contract as
-// EnsurePrivateDir to an already-open directory handle with WRITE_DAC and
-// WRITE_OWNER access.
+// SecureDirectory applies the same owner and ACL contract as EnsurePrivateDir
+// to an already-open directory. When the caller's handle lacks ACL rights it
+// obtains them by reopening that exact object rather than resolving its path.
 func SecureDirectory(f *os.File) error {
 	owned, err := IsOwnedByCurrentTokenAuthority(f)
 	if err != nil {
@@ -371,6 +415,10 @@ func SecureDirectory(f *os.File) error {
 	}
 	if !owned {
 		return errors.New("owner-private directory is not owned by the current user")
+	}
+	exactOwner, err := IsCurrentUserOwner(f)
+	if err != nil {
+		return fmt.Errorf("checking exact owner-private directory owner: %w", err)
 	}
 	descriptor, err := ownerOnlyWindowsDirectoryDescriptor()
 	if err != nil {
@@ -384,10 +432,21 @@ func SecureDirectory(f *os.File) error {
 	if err != nil {
 		return err
 	}
-	if err := windows.SetSecurityInfo(windows.Handle(f.Fd()), windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		current, nil, dacl, nil); err != nil {
-		return err
+	mutation, err := reopenWindowsObjectForSecurity(f, true, !exactOwner)
+	if err != nil {
+		return fmt.Errorf("reopening owner-private directory for security repair: %w", err)
+	}
+	securityInformation := windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION)
+	var owner *windows.SID
+	if !exactOwner {
+		securityInformation |= windows.OWNER_SECURITY_INFORMATION
+		owner = current
+	}
+	setErr := windows.SetSecurityInfo(windows.Handle(mutation.Fd()), windows.SE_FILE_OBJECT,
+		securityInformation, owner, nil, dacl, nil)
+	closeErr := mutation.Close()
+	if setErr != nil || closeErr != nil {
+		return errors.Join(setErr, closeErr)
 	}
 	ok, err := DirectoryIsOwnerOnly(f)
 	if err != nil {
@@ -427,8 +486,9 @@ func openWindowsFile(path string, access uint32, attributes *windows.SecurityAtt
 	return f, nil
 }
 
-// Secure installs and verifies the protected current-user-only DACL through
-// an open handle that carries WRITE_DAC.
+// Secure installs and verifies the protected current-user-only DACL. When the
+// caller's handle lacks ACL rights it obtains them by reopening that exact
+// object rather than resolving its path.
 func Secure(f *os.File) error {
 	if err := verifyRegularSingleLink(f); err != nil {
 		return err
@@ -439,6 +499,10 @@ func Secure(f *os.File) error {
 	}
 	if !owned {
 		return errors.New("owner-private file is not owned by the current user")
+	}
+	exactOwner, err := IsCurrentUserOwner(f)
+	if err != nil {
+		return fmt.Errorf("checking exact owner-private file owner: %w", err)
 	}
 	descriptor, err := ownerOnlyWindowsDescriptor()
 	if err != nil {
@@ -452,10 +516,21 @@ func Secure(f *os.File) error {
 	if err != nil {
 		return err
 	}
-	if err := windows.SetSecurityInfo(windows.Handle(f.Fd()), windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		current, nil, dacl, nil); err != nil {
-		return fmt.Errorf("setting current-user-only file DACL: %w", err)
+	mutation, err := reopenWindowsObjectForSecurity(f, false, !exactOwner)
+	if err != nil {
+		return fmt.Errorf("reopening owner-private file for security repair: %w", err)
+	}
+	securityInformation := windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION)
+	var owner *windows.SID
+	if !exactOwner {
+		securityInformation |= windows.OWNER_SECURITY_INFORMATION
+		owner = current
+	}
+	setErr := windows.SetSecurityInfo(windows.Handle(mutation.Fd()), windows.SE_FILE_OBJECT,
+		securityInformation, owner, nil, dacl, nil)
+	closeErr := mutation.Close()
+	if setErr != nil || closeErr != nil {
+		return fmt.Errorf("setting current-user-only file DACL: %w", errors.Join(setErr, closeErr))
 	}
 	ownerOnly, err := IsOwnerOnly(f)
 	if err != nil {
@@ -465,6 +540,62 @@ func Secure(f *os.File) error {
 		return errors.New("Windows did not retain the current-user-only file DACL")
 	}
 	return nil
+}
+
+// reopenWindowsObjectForSecurity obtains the minimum ACL rights on the exact
+// object selected by f. ReOpenFile is identity-bound, so callers that received
+// an os.Root handle without WRITE_DAC can repair it without a pathname reopen
+// or a final-component substitution race.
+func reopenWindowsObjectForSecurity(f *os.File, directory, writeOwner bool) (*os.File, error) {
+	if f == nil {
+		return nil, errors.New("owner-private security repair has no object handle")
+	}
+	access := uint32(windows.READ_CONTROL | windows.WRITE_DAC | windows.FILE_READ_ATTRIBUTES)
+	if writeOwner {
+		access |= windows.WRITE_OWNER
+	}
+	flags := uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)
+	if directory {
+		flags |= windows.FILE_FLAG_BACKUP_SEMANTICS
+	}
+	result, _, callErr := filePrivacyReOpenFile.Call(
+		f.Fd(),
+		uintptr(access),
+		uintptr(uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)),
+		uintptr(flags),
+	)
+	runtime.KeepAlive(f)
+	handle := windows.Handle(result)
+	if handle == windows.InvalidHandle {
+		if callErr == nil || callErr == windows.ERROR_SUCCESS {
+			callErr = windows.ERROR_INVALID_HANDLE
+		}
+		return nil, callErr
+	}
+	mutation := os.NewFile(uintptr(handle), f.Name()+" (security repair)")
+	if mutation == nil {
+		_ = windows.CloseHandle(handle)
+		return nil, errors.New("converting owner-private security-repair handle")
+	}
+	originalInfo, originalErr := f.Stat()
+	mutationInfo, mutationErr := mutation.Stat()
+	if originalErr != nil || mutationErr != nil || originalInfo == nil || mutationInfo == nil ||
+		originalInfo.IsDir() != directory || mutationInfo.IsDir() != directory ||
+		!os.SameFile(originalInfo, mutationInfo) {
+		return nil, errors.Join(errors.New("security-repair reopen returned a different object"),
+			originalErr, mutationErr, mutation.Close())
+	}
+	if directory {
+		var info windows.ByHandleFileInformation
+		if err := windows.GetFileInformationByHandle(handle, &info); err != nil ||
+			info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 ||
+			info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return nil, errors.Join(errors.New("security-repair directory has the wrong object type"), err, mutation.Close())
+		}
+	} else if err := verifyRegularSingleLink(mutation); err != nil {
+		return nil, errors.Join(err, mutation.Close())
+	}
+	return mutation, nil
 }
 
 // SecureMode is Secure on Windows because NTFS does not expose portable Unix
