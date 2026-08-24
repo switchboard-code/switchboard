@@ -551,6 +551,16 @@ func reopenWindowsObjectWithSecurityAccess(f *os.File, directory, writeOwner boo
 		return nil, errors.New("owner-private security repair has no object handle")
 	}
 	access := uint32(windows.WRITE_DAC)
+	if directory {
+		// SetSecurityInfo implements inheritance for a directory DACL by
+		// reading the existing descriptor before it applies and propagates the
+		// new one. The access check for NtCreateFile itself only needs
+		// WRITE_DAC, so omitting READ_CONTROL produces a handle successfully
+		// and then makes the directory-only SetSecurityInfo call fail with
+		// ERROR_ACCESS_DENIED. Regular files keep their proven ReOpenFile mask
+		// below; the native exact-directory reopen must include both rights.
+		access |= windows.READ_CONTROL
+	}
 	if writeOwner {
 		access |= windows.WRITE_OWNER
 	}
@@ -559,11 +569,9 @@ func reopenWindowsObjectWithSecurityAccess(f *os.File, directory, writeOwner boo
 		if err := validateWindowsSecurityRepairDirectory(f); err != nil {
 			return nil, err
 		}
-		// The Win32 reopen used here previously combined WRITE_DAC with
-		// metadata rights, and that directory open was denied on a token whose
-		// owner authority could grant WRITE_DAC alone. NtCreateFile with an
-		// empty name and the selected directory as RootDirectory reopens that
-		// exact directory while requesting only the rights this mutation uses.
+		// ReOpenFile cannot consume an os.Root/NtCreateFile handle. NtCreateFile
+		// with an empty name and the selected directory as RootDirectory
+		// reopens that exact directory without another pathname traversal.
 		emptyName, err := windows.NewNTUnicodeString("")
 		if err != nil {
 			return nil, err
