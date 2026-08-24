@@ -10,7 +10,12 @@ import (
 	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 )
 
-const pluginStateLockTimeout = 2 * time.Second
+// A state mutation holds the lock across an owner-private atomic publication.
+// Windows security and durability calls are substantially slower under the
+// race detector, so a two-second process-wide contention budget could expire
+// while a healthy peer was still committing. Cancellation remains immediate;
+// this bound only governs callers without an earlier context deadline.
+const pluginStateLockTimeout = 10 * time.Second
 
 var pluginStateLockBeforeOpenTestHook func()
 var pluginStateLockAfterOpenTestHook func()
