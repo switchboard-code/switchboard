@@ -110,7 +110,7 @@ func setWindowsNativeMCPFileEveryoneDACL(t *testing.T, f *os.File) {
 	// instead of weakening the production lock handle's access mask.
 	result, _, callErr := windowsNativeMCPTestReOpenFile.Call(
 		f.Fd(),
-		uintptr(windows.WRITE_DAC),
+		uintptr(windows.WRITE_DAC|windows.READ_CONTROL|windows.FILE_READ_ATTRIBUTES),
 		uintptr(uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)),
 		uintptr(uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)),
 	)
