@@ -4,9 +4,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -14,8 +14,6 @@ import (
 
 	"github.com/switchboard-code/switchboard/internal/fileprivacy"
 )
-
-var windowsNativeMCPTestReOpenFile = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReOpenFile")
 
 func TestWindowsNativeMCPStateAndLockUseOwnerOnlyDACLs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), nativeMCPStateFileName)
@@ -103,43 +101,55 @@ func assertWindowsNativeMCPDirectoryOwnerOnly(t *testing.T, path string) {
 
 func setWindowsNativeMCPFileEveryoneDACL(t *testing.T, f *os.File) {
 	t.Helper()
-	// The lock can already exist because opening the deliberately unsafe state
-	// file acquires it before rejecting that state. OpenReadWriteOrCreate then
-	// returns its intentionally least-privileged existing-file handle, which
-	// has no WRITE_DAC. Reopen the exact selected file for the fixture mutation
-	// instead of weakening the production lock handle's access mask.
-	result, _, callErr := windowsNativeMCPTestReOpenFile.Call(
-		f.Fd(),
-		uintptr(windows.WRITE_DAC|windows.READ_CONTROL|windows.FILE_READ_ATTRIBUTES),
-		uintptr(uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)),
-		uintptr(uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)),
-	)
-	runtime.KeepAlive(f)
-	handle := windows.Handle(result)
-	if handle == windows.InvalidHandle {
-		if callErr == nil || callErr == windows.ERROR_SUCCESS {
-			callErr = windows.ERROR_INVALID_HANDLE
-		}
-		t.Fatal(callErr)
+	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;WD)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	setEveryone := func(target *os.File) error {
+		return windows.SetSecurityInfo(windows.Handle(target.Fd()), windows.SE_FILE_OBJECT,
+			windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+			nil, nil, dacl, nil)
+	}
+	if err := setEveryone(f); err == nil {
+		return
+	} else if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		t.Fatal(err)
+	}
+
+	// A freshly created state file carries WRITE_DAC and takes the direct path
+	// above. An existing lock is deliberately opened by production without
+	// WRITE_DAC. Reopen that fixture by name with ACL rights, then prove the new
+	// handle denotes the still-open file before changing anything. This keeps
+	// the production lock handle least-privileged without relying on ReOpenFile,
+	// which does not accept every handle origin on hosted Windows.
+	path, err := windows.UTF16PtrFromString(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := windows.CreateFile(path,
+		windows.WRITE_DAC|windows.READ_CONTROL|windows.FILE_READ_ATTRIBUTES,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		t.Fatal(err)
 	}
 	mutation := os.NewFile(uintptr(handle), f.Name()+" (test DACL mutation)")
 	if mutation == nil {
 		_ = windows.CloseHandle(handle)
 		t.Fatal("converting native MCP test DACL handle")
 	}
-	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;WD)")
-	if err != nil {
+	originalInfo, originalErr := f.Stat()
+	mutationInfo, mutationErr := mutation.Stat()
+	if originalErr != nil || mutationErr != nil || originalInfo == nil || mutationInfo == nil ||
+		originalInfo.IsDir() || mutationInfo.IsDir() || !os.SameFile(originalInfo, mutationInfo) {
 		_ = mutation.Close()
-		t.Fatal(err)
+		t.Fatalf("native MCP test DACL reopen selected a different file: original=%v reopened=%v", originalErr, mutationErr)
 	}
-	dacl, _, err := descriptor.DACL()
-	if err != nil {
-		_ = mutation.Close()
-		t.Fatal(err)
-	}
-	if err := windows.SetSecurityInfo(windows.Handle(mutation.Fd()), windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		nil, nil, dacl, nil); err != nil {
+	if err := setEveryone(mutation); err != nil {
 		_ = mutation.Close()
 		t.Fatal(err)
 	}
