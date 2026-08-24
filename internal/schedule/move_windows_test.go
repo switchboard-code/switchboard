@@ -19,7 +19,7 @@ func openWindowsMoveFixture(t *testing.T) (string, *os.Root, *ledgerImage, *os.R
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = root.Close() })
-	image, err := readLedger(root, FileName, path)
+	image, err := readMigrationLedger(root, FileName, path)
 	if err != nil {
 		t.Fatal(err)
 	}

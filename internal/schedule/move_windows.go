@@ -3,6 +3,7 @@
 package schedule
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"os"
@@ -11,8 +12,6 @@ import (
 
 	"golang.org/x/sys/windows"
 )
-
-var reopenScheduleFileWindows = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReOpenFile")
 
 // scheduleRenameInfo is FILE_RENAME_INFORMATION's legacy no-replace layout.
 // Some supported Windows kernels reject FileRenameInformationEx when its
@@ -36,16 +35,23 @@ func moveScheduleNoReplace(source, destination *os.Root, from, to string, opened
 	if source == nil || destination == nil || opened == nil {
 		return false, errors.New("schedule quarantine move requires live roots and an opened ledger")
 	}
-	mutation, err := reopenScheduleMutationWindows(opened)
-	if err != nil {
-		return false, fmt.Errorf("reopening schedule ledger for exact-handle quarantine: %w", err)
+	mutation := windows.Handle(opened.Fd())
+	if _, err := scheduleWindowsHandleID(mutation); err != nil {
+		return false, fmt.Errorf("validating exact schedule mutation handle: %w", err)
 	}
-	defer func() { resultErr = errors.Join(resultErr, windows.CloseHandle(mutation)) }()
-	destinationDir, err := destination.Open(".")
+	destinationDir, err := leaseScheduleDestinationWindows(destination)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("leasing exact schedule destination: %w", err)
 	}
-	defer func() { resultErr = errors.Join(resultErr, destinationDir.Close()) }()
+	defer func() { resultErr = errors.Join(resultErr, windows.CloseHandle(destinationDir)) }()
+	var anchor windows.Handle
+	if to == migrationQuarantineEntry {
+		anchor, err = createScheduleDestinationAnchorWindows(destinationDir)
+		if err != nil {
+			return false, fmt.Errorf("anchoring private schedule destination: %w", err)
+		}
+		defer func() { resultErr = errors.Join(resultErr, windows.CloseHandle(anchor)) }()
+	}
 
 	encoded, err := windows.UTF16FromString(to)
 	if err != nil {
@@ -62,7 +68,7 @@ func moveScheduleNoReplace(source, destination *os.Root, from, to string, opened
 	// inspect the otherwise length-delimited name as a terminated string.
 	buffer := make([]byte, bufferLength)
 	info := (*scheduleRenameInfo)(unsafe.Pointer(&buffer[0]))
-	info.RootDirectory = windows.Handle(destinationDir.Fd())
+	info.RootDirectory = destinationDir
 	info.FileNameLength = uint32(length)
 	copy(unsafe.Slice(&info.FileName[0], len(encoded)), encoded)
 	renameErr := windows.NtSetInformationFile(
@@ -73,10 +79,10 @@ func moveScheduleNoReplace(source, destination *os.Root, from, to string, opened
 		windows.FileRenameInformation,
 	)
 	runtime.KeepAlive(buffer)
+	runtime.KeepAlive(opened)
 	if status, ok := renameErr.(windows.NTStatus); ok {
 		renameErr = status.Errno()
 	}
-	runtime.KeepAlive(destinationDir)
 	if renameErr == nil {
 		if flushErr := windows.FlushFileBuffers(mutation); flushErr != nil {
 			return true, fmt.Errorf("flushing schedule quarantine rename: %w", flushErr)
@@ -97,32 +103,107 @@ func moveScheduleNoReplace(source, destination *os.Root, from, to string, opened
 	return true, errors.Join(renameErr, errors.New("schedule quarantine rename outcome is ambiguous"))
 }
 
-func reopenScheduleMutationWindows(file *os.File) (windows.Handle, error) {
-	result, _, callErr := reopenScheduleFileWindows.Call(
-		uintptr(file.Fd()),
-		uintptr(uint32(windows.GENERIC_WRITE|windows.FILE_READ_ATTRIBUTES|windows.DELETE)),
-		uintptr(uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)),
-		uintptr(uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_WRITE_THROUGH)),
-	)
-	runtime.KeepAlive(file)
-	handle := windows.Handle(result)
-	if handle == windows.InvalidHandle {
-		if callErr == nil || callErr == windows.ERROR_SUCCESS {
-			callErr = windows.ERROR_INVALID_HANDLE
-		}
-		return windows.InvalidHandle, callErr
+func leaseScheduleDestinationWindows(root *os.Root) (windows.Handle, error) {
+	base, err := root.Open(".")
+	if err != nil {
+		return windows.InvalidHandle, err
 	}
-	originalID, originalErr := scheduleWindowsHandleID(windows.Handle(file.Fd()))
-	reopenedID, reopenedErr := scheduleWindowsHandleID(handle)
-	if originalErr != nil || reopenedErr != nil || originalID != reopenedID {
+	defer base.Close()
+	objectName, err := windows.NewNTUnicodeString("")
+	if err != nil {
+		return windows.InvalidHandle, err
+	}
+	attributes := &windows.OBJECT_ATTRIBUTES{
+		RootDirectory: windows.Handle(base.Fd()),
+		ObjectName:    objectName,
+		Attributes:    windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
+	}
+	attributes.Length = uint32(unsafe.Sizeof(*attributes))
+	var handle windows.Handle
+	err = windows.NtCreateFile(
+		&handle,
+		windows.FILE_TRAVERSE|windows.FILE_READ_ATTRIBUTES|windows.SYNCHRONIZE,
+		attributes,
+		&windows.IO_STATUS_BLOCK{},
+		nil,
+		0,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		windows.FILE_OPEN,
+		windows.FILE_DIRECTORY_FILE|windows.FILE_SYNCHRONOUS_IO_NONALERT|windows.FILE_OPEN_REPARSE_POINT,
+		0,
+		0,
+	)
+	runtime.KeepAlive(base)
+	runtime.KeepAlive(objectName)
+	if status, ok := err.(windows.NTStatus); ok {
+		err = status.Errno()
+	}
+	if err != nil {
+		return windows.InvalidHandle, err
+	}
+	baseID, baseErr := scheduleWindowsHandleID(windows.Handle(base.Fd()))
+	leaseID, leaseErr := scheduleWindowsHandleID(handle)
+	var info windows.ByHandleFileInformation
+	infoErr := windows.GetFileInformationByHandle(handle, &info)
+	if baseErr != nil || leaseErr != nil || infoErr != nil || baseID != leaseID ||
+		info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 ||
+		info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		return windows.InvalidHandle, errors.Join(
-			originalErr,
-			reopenedErr,
-			errors.New("ReOpenFile returned a different schedule ledger identity"),
+			baseErr,
+			leaseErr,
+			infoErr,
+			errors.New("schedule destination lease did not retain the exact physical directory"),
 			windows.CloseHandle(handle),
 		)
 	}
 	return handle, nil
+}
+
+func createScheduleDestinationAnchorWindows(directory windows.Handle) (windows.Handle, error) {
+	for range 32 {
+		var random [16]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			return windows.InvalidHandle, err
+		}
+		name := fmt.Sprintf(".schedule-move-anchor-%x", random[:])
+		objectName, err := windows.NewNTUnicodeString(name)
+		if err != nil {
+			return windows.InvalidHandle, err
+		}
+		attributes := &windows.OBJECT_ATTRIBUTES{
+			RootDirectory: directory,
+			ObjectName:    objectName,
+			Attributes:    windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
+		}
+		attributes.Length = uint32(unsafe.Sizeof(*attributes))
+		var handle windows.Handle
+		err = windows.NtCreateFile(
+			&handle,
+			windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE|windows.DELETE,
+			attributes,
+			&windows.IO_STATUS_BLOCK{},
+			nil,
+			windows.FILE_ATTRIBUTE_HIDDEN,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+			windows.FILE_CREATE,
+			windows.FILE_NON_DIRECTORY_FILE|windows.FILE_SYNCHRONOUS_IO_NONALERT|
+				windows.FILE_OPEN_REPARSE_POINT|windows.FILE_DELETE_ON_CLOSE|windows.FILE_WRITE_THROUGH,
+			0,
+			0,
+		)
+		runtime.KeepAlive(objectName)
+		if status, ok := err.(windows.NTStatus); ok && status == windows.STATUS_OBJECT_NAME_COLLISION {
+			continue
+		}
+		if status, ok := err.(windows.NTStatus); ok {
+			err = status.Errno()
+		}
+		if err != nil {
+			return windows.InvalidHandle, err
+		}
+		return handle, nil
+	}
+	return windows.InvalidHandle, errors.New("could not allocate a private schedule destination anchor")
 }
 
 func scheduleWindowsHandleID(handle windows.Handle) (scheduleWindowsFileID, error) {

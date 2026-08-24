@@ -306,7 +306,7 @@ func OpenMigrating(dir string, historicalDirs []string, validate MigrationValida
 		if recoverErr := recoverMigrationArtifacts(&item, artifacts, canonical); recoverErr != nil {
 			return nil, recoverErr
 		}
-		image, readErr := readLedger(item.root, FileName, path)
+		image, readErr := readMigrationLedger(item.root, FileName, path)
 		if readErr != nil {
 			return nil, readErr
 		}
@@ -333,7 +333,7 @@ func OpenMigrating(dir string, historicalDirs []string, validate MigrationValida
 	canonicalSnapshot := ledgerSnapshot{}
 	if canonical != nil {
 		canonicalSnapshot = ledgerSnapshot{
-			existed: true, mode: canonical.info.Mode(), content: append([]byte(nil), canonical.raw...),
+			existed: true, mode: scheduleFileMode(canonical.info.Mode()), content: append([]byte(nil), canonical.raw...),
 		}
 	}
 	if canonical == nil && baseline != nil {
@@ -375,7 +375,7 @@ func OpenMigrating(dir string, historicalDirs []string, validate MigrationValida
 		if err := verifyLedgerImage(canonical, canonicalDirLock.root, FileName); err != nil {
 			return fmt.Errorf("%w: canonical schedule ledger changed before historical cleanup: %v", ErrMigrationConflict, err)
 		}
-		if canonical.info.Mode() != canonicalSnapshot.mode || !bytes.Equal(canonical.raw, canonicalSnapshot.content) ||
+		if scheduleFileMode(canonical.info.Mode()) != canonicalSnapshot.mode || !bytes.Equal(canonical.raw, canonicalSnapshot.content) ||
 			baseline == nil || !bytes.Equal(canonical.canonical, baseline.canonical) {
 			return fmt.Errorf("%w: canonical schedule ledger no longer matches the exact image selected for migration", ErrMigrationConflict)
 		}
@@ -413,7 +413,7 @@ func OpenMigrating(dir string, historicalDirs []string, validate MigrationValida
 }
 
 func bindScheduleDirectory(path string, expected os.FileInfo) (_ *os.Root, resultErr error) {
-	root, err := rootedfs.OpenRoot(path)
+	root, err := openScheduleRoot(path)
 	if err != nil {
 		return nil, err
 	}
@@ -495,6 +495,18 @@ func ledgerExists(root *os.Root, name, displayPath string) (bool, error) {
 }
 
 func readLedger(root *os.Root, name, displayPath string) (*ledgerImage, error) {
+	return readLedgerWith(root, name, displayPath, fileprivacy.OpenInRoot)
+}
+
+// readMigrationLedger acquires the platform's mutation-capable read handle at
+// the same namespace lookup that selects the image. Windows cannot safely add
+// DELETE access later with ReOpenFile because rooted files originate in
+// NtCreateFile, while ReOpenFile only supports CreateFile-origin handles.
+func readMigrationLedger(root *os.Root, name, displayPath string) (*ledgerImage, error) {
+	return readLedgerWith(root, name, displayPath, openScheduleRead)
+}
+
+func readLedgerWith(root *os.Root, name, displayPath string, open func(*os.Root, string) (*os.File, error)) (*ledgerImage, error) {
 	before, err := root.Lstat(name)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -508,7 +520,7 @@ func readLedger(root *os.Root, name, displayPath string) (*ledgerImage, error) {
 	if before.Size() > maxLedgerBytes {
 		return nil, fmt.Errorf("reading %s: schedule ledger is %d bytes (limit %d)", displayPath, before.Size(), maxLedgerBytes)
 	}
-	file, err := fileprivacy.OpenInRoot(root, name)
+	file, err := open(root, name)
 	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", displayPath, err)
 	}
@@ -966,7 +978,7 @@ func recoverMigrationArtifact(item *lockedDir, name string, canonical *ledgerIma
 		return fmt.Errorf("%w: schedule migration artifact %s contains unexpected entries and was retained", ErrMigrationConflict, filepath.Join(item.dir, name))
 	}
 	displayPath := filepath.Join(item.dir, name, migrationQuarantineEntry)
-	image, err := readLedger(quarantineRoot, migrationQuarantineEntry, displayPath)
+	image, err := readMigrationLedger(quarantineRoot, migrationQuarantineEntry, displayPath)
 	if err != nil {
 		restoreErr := restoreMigrationQuarantine(item.root, name, quarantineRoot, opened, FileName, &quarantineOpen)
 		if restoreErr == nil {
@@ -1099,7 +1111,7 @@ func writeLedgerFileBound(root *os.Root, directory string, expected os.FileInfo,
 	snapshot := ledgerSnapshot{}
 	if image != nil {
 		snapshot = ledgerSnapshot{
-			existed: true, mode: image.info.Mode(), content: append([]byte(nil), image.raw...),
+			existed: true, mode: scheduleFileMode(image.info.Mode()), content: append([]byte(nil), image.raw...),
 		}
 		image.close()
 	}

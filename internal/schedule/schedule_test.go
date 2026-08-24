@@ -17,6 +17,7 @@ func openTemp(t *testing.T) (*Store, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(s.Close)
 	return s, dir
 }
 

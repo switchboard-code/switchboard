@@ -226,5 +226,5 @@ func publishScheduleLedger(
 	if !published {
 		return expected, false, resultErr
 	}
-	return ledgerSnapshot{existed: true, mode: 0o600, content: append([]byte(nil), desired...)}, true, resultErr
+	return ledgerSnapshot{existed: true, mode: scheduleFileMode(0o600), content: append([]byte(nil), desired...)}, true, resultErr
 }
