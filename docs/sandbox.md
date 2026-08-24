@@ -64,7 +64,7 @@ removed, and the sections below say which.
 Both platforms implement the same promise. A confined command may:
 
 - read the system: `/usr`, `/opt`, `/etc`, and the rest of the filesystem
-  outside the home directory;
+  outside the account and ambient home directories;
 - read the workspace, the build caches, and per-user toolchain installs;
 - write inside the workspace, the temp directory, and those build caches;
 - execute other programs, allocate terminals, and fork;
@@ -73,8 +73,8 @@ Both platforms implement the same promise. A confined command may:
 
 It may not:
 
-- write anywhere else, including the home directory;
-- **read anything else under the home directory**, whether or not anyone
+- write anywhere else, including either home directory;
+- **read anything else under the account or ambient home directory**, whether or not anyone
   thought to name it;
 - reach the daemon that hands out credentials, or use the ssh agent;
 - open a direct non-loopback connection unless egress was granted for that
@@ -88,7 +88,7 @@ most worth understanding.
 Outside the home directory, reads are broad. System directories hold no user
 secrets, and an allowlist over them would break every compiler for nothing.
 
-Inside the home directory, reads are closed by default and opened only where a
+Inside home directories, reads are closed by default and opened only where a
 build needs them. Home is where credentials actually live, and enumerating what
 leaks there is a race nobody wins. A survey of one ordinary developer machine
 found 51 top-level entries in home. A hand-written deny list covered six of
@@ -98,14 +98,20 @@ installed application, `Documents`, and the credential directories of five
 separate CLI tools. Adding those six names would not have fixed it; the next
 tool installed would reopen the hole.
 
-So the home directory is denied wholesale and reopened for build caches,
+The security boundary comes from the current account database, not `$HOME`,
+which is ordinary process input and may point into a checkout. The canonical
+account home and any distinct canonical ambient `$HOME` are denied wholesale.
+They are reopened narrowly for build caches,
 per-user toolchain installs, and `.gitconfig`. Version managers keep the actual
 compiler under home, so denying `.rustup` or `.nvm` removes the tool rather than
 protecting anything. A few paths are then denied again because they sit inside
 something reopened: cargo keeps registry tokens beside its package cache, and
 the XDG data directory holds the Linux keyring beside legitimately shared files.
 
-The lists are `homeReadable` and `homeSecrets` in
+Every reopen rejects symlink ancestry. Known credential symlink targets from
+the account home are denied at their resolved locations after all reopens; an
+ambient `$HOME` can never inject host paths into the policy. The lists are
+`homeReadable` and `homeSecrets` in
 `internal/execution/homepolicy.go`.
 
 The cost is real: a tool that reads config from an unlisted place under home
@@ -127,8 +133,9 @@ rather than exit status, using a canary written into Switchboard's own state
 directory, because a hidden file can surface as an empty successful read rather
 than an error.
 
-Results cache in `~/.switchboard/sandbox-check.json`, keyed by a hash of the
-profile and by the host's OS build or kernel. Editing the confinement or
+Results cache in the canonical account home at
+`.switchboard/sandbox-check.json`, never beneath ambient `$HOME`, keyed by a
+hash of the profile and by the host's OS build or kernel. Editing the confinement or
 updating the system invalidates the cache, because neither should inherit an old
 pass. Any failed assertion refuses the whole profile rather than trusting the
 part that still works.
@@ -231,8 +238,8 @@ top, and empty mounts over what must not be readable.
 after the read-only root and the deny mounts must come after those. A deny
 placed before a bind covering the same path silently does nothing.
 
-**A tmpfs is writable, so closing home takes two steps.** `--tmpfs $HOME` hides
-everything under it, and then accepts writes into a filesystem that evaporates:
+**A tmpfs is writable, so closing home takes two steps.** A `--tmpfs` over each
+minimal account/ambient home cover hides everything under it, and then accepts writes into a filesystem that evaporates:
 the real home is untouched, but the command sees success and a later one finds
 nothing. `--remount-ro` turns that into the refusal it should have been, and it
 has to come after every mount placed inside home, or bubblewrap cannot create
@@ -280,17 +287,18 @@ place they could.
 are readable so their compilers work. A credential stashed inside one, beyond
 those in `homeSecrets`, is readable with it.
 
-**Cache directories are a persistence vector.** Granting writes to `~/.cargo`,
-`~/.npm`, and the rest is what makes a second build fast. It also lets a command
+**Cache directories are a persistence vector.** Granting writes to account-home
+`.cargo`, `.npm`, and the rest is what makes a second build fast. It also lets a command
 plant a config or a compiled artifact that a later, separately approved command
 executes. Confinement is per command; it is not a durable boundary between
 commands.
 
 The granted list holds what has actually been exercised under confinement, so
-Java and Gradle are not covered yet. On Linux those directories are created
-empty if absent, because they cannot be created from inside: the home directory
-is read-only by then, and a user who has never run a build would otherwise meet
-`mkdir ~/.cache: read-only file system` on their very first confined command.
+Java and Gradle are not covered yet. On Linux account-home caches are created
+component-by-component through a rooted, no-symlink directory capability.
+Caches under a distinct ambient `$HOME` are ephemeral tmpfs mounts instead:
+Switchboard never follows or mutates checkout-controlled cache paths before
+confinement starts.
 
 **The temp directory is writable,** because build tools are unusable without it.
 A confined command can write anywhere in it, including files another process may

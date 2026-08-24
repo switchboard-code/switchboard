@@ -14,14 +14,17 @@ import (
 
 var reopenScheduleFileWindows = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReOpenFile")
 
-// scheduleRenameInfo is the FileRenameInfoEx layout. A zero Flags value is an
-// atomic no-replace request. RootDirectory binds the destination to the
-// already-open private quarantine rather than resolving a mutable path.
+// scheduleRenameInfo is FILE_RENAME_INFORMATION's legacy no-replace layout.
+// Some supported Windows kernels reject FileRenameInformationEx when its
+// flags are zero; a false ReplaceIfExists is the native operation that states
+// the intended no-replace semantic directly. RootDirectory binds the
+// destination to the already-open private quarantine rather than resolving a
+// mutable path.
 type scheduleRenameInfo struct {
-	Flags          uint32
-	RootDirectory  windows.Handle
-	FileNameLength uint32
-	FileName       [1]uint16
+	ReplaceIfExists byte
+	RootDirectory   windows.Handle
+	FileNameLength  uint32
+	FileName        [1]uint16
 }
 
 type scheduleWindowsFileID struct {
@@ -50,17 +53,29 @@ func moveScheduleNoReplace(source, destination *os.Root, from, to string, opened
 	}
 	encoded = encoded[:len(encoded)-1]
 	var layout scheduleRenameInfo
-	offset := unsafe.Offsetof(layout.FileName)
 	length := uintptr(len(encoded)) * unsafe.Sizeof(uint16(0))
-	if offset+length > uintptr(^uint32(0)) {
+	bufferLength := unsafe.Sizeof(layout) + length
+	if bufferLength > uintptr(^uint32(0)) {
 		return false, errors.New("schedule quarantine name is too long")
 	}
-	buffer := make([]byte, offset+length)
+	// Keep a zero terminator after FileNameLength for filesystem filters that
+	// inspect the otherwise length-delimited name as a terminated string.
+	buffer := make([]byte, bufferLength)
 	info := (*scheduleRenameInfo)(unsafe.Pointer(&buffer[0]))
 	info.RootDirectory = windows.Handle(destinationDir.Fd())
 	info.FileNameLength = uint32(length)
 	copy(unsafe.Slice(&info.FileName[0], len(encoded)), encoded)
-	renameErr := windows.SetFileInformationByHandle(mutation, windows.FileRenameInfoEx, &buffer[0], uint32(len(buffer)))
+	renameErr := windows.NtSetInformationFile(
+		mutation,
+		&windows.IO_STATUS_BLOCK{},
+		&buffer[0],
+		uint32(len(buffer)),
+		windows.FileRenameInformation,
+	)
+	runtime.KeepAlive(buffer)
+	if status, ok := renameErr.(windows.NTStatus); ok {
+		renameErr = status.Errno()
+	}
 	runtime.KeepAlive(destinationDir)
 	if renameErr == nil {
 		if flushErr := windows.FlushFileBuffers(mutation); flushErr != nil {

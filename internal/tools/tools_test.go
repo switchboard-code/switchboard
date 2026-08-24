@@ -49,6 +49,44 @@ func newCheckpointRecorder(t *testing.T, workspace string) *checkpoint.Recorder 
 	return recorder
 }
 
+func TestRegistryDisplayResolvesWorkspaceAliasWithoutHidingEscapes(t *testing.T) {
+	workspace := t.TempDir()
+	existing := filepath.Join(workspace, "src", "existing.go")
+	writeFile(t, existing, "package src\n")
+	alias := filepath.Join(t.TempDir(), "workspace-alias")
+	if err := os.Symlink(workspace, alias); err != nil {
+		t.Skipf("workspace aliases are unavailable: %v", err)
+	}
+
+	registry, err := NewRegistry(alias, execution.Capability{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{
+		"logical existing suffix":   filepath.Join(alias, "src", "existing.go"),
+		"logical new suffix":        filepath.Join(alias, "src", "new.go"),
+		"canonical existing suffix": filepath.Join(registry.root, "src", "existing.go"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := registry.display(path); got != "src/"+filepath.Base(path) {
+				t.Fatalf("display(%q) = %q", path, got)
+			}
+		})
+	}
+	if got := registry.Branch(nil).display(filepath.Join(alias, "src", "branch-new.go")); got != "src/branch-new.go" {
+		t.Fatalf("branch lost launch-root display identity: %q", got)
+	}
+
+	outside := filepath.Join(t.TempDir(), "outside.go")
+	want, err := filepath.Rel(registry.root, outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := registry.display(outside); got != filepath.ToSlash(want) {
+		t.Fatalf("external display(%q) = %q, want unchanged relative escape %q", outside, got, filepath.ToSlash(want))
+	}
+}
+
 func run(t *testing.T, r *Registry, tool string, input any) Result {
 	t.Helper()
 	res, err := tryRun(r, tool, input)

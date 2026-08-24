@@ -24,6 +24,10 @@ func IsCurrentUserOwner(*os.File) (bool, error) {
 	return false, errors.New("current-user ownership checks are unavailable on this platform")
 }
 
+func IsOwnedByCurrentTokenAuthority(f *os.File) (bool, error) {
+	return IsCurrentUserOwner(f)
+}
+
 func Create(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {

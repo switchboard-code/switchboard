@@ -65,6 +65,21 @@ func TestWindowsLoadFileMigratesWorldReadableCurrentOwnedConfig(t *testing.T) {
 	assertConfigOwnerOnly(t, path)
 }
 
+func TestWindowsLoadFileMigratesOrdinaryTokenOwnedConfig(t *testing.T) {
+	// Create through the ordinary API, which assigns TOKEN_OWNER when no
+	// explicit descriptor is supplied. Elevated tokens commonly use an
+	// owner-capable group here even though TokenUser is the final authority.
+	path := write(t, configSecurityFixture)
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg.Tier("t1"); !ok {
+		t.Fatal("repaired ordinary Windows config did not parse")
+	}
+	assertConfigOwnerOnly(t, path)
+}
+
 func TestWindowsInheritedACLFixtureIsActuallyUnprotectedAndBroad(t *testing.T) {
 	path := write(t, configSecurityFixture)
 	if err := makeLegacyBroadConfigForTest(path); err != nil {

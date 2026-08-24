@@ -75,6 +75,13 @@ func IsCurrentUserOwner(f *os.File) (bool, error) {
 	return stat.Uid == uint32(unix.Geteuid()), nil
 }
 
+// IsOwnedByCurrentTokenAuthority is IsCurrentUserOwner on Unix. It exists so
+// callers can use the Windows pre-migration admission rule without weakening
+// the final owner-only check on other platforms.
+func IsOwnedByCurrentTokenAuthority(f *os.File) (bool, error) {
+	return IsCurrentUserOwner(f)
+}
+
 // Create creates path exclusively with mode 0600 and verifies the descriptor
 // before returning it to a caller that may write sensitive bytes.
 func Create(path string) (*os.File, error) {

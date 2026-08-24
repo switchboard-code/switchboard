@@ -115,7 +115,7 @@ func readConfigBytes(path string) (*secureConfigRead, bool, error) {
 	if err := verifyConfigIdentity(opened, path, before, parentBefore); err != nil {
 		return nil, false, err
 	}
-	owned, err := fileprivacy.IsCurrentUserOwner(opened)
+	owned, err := fileprivacy.IsOwnedByCurrentTokenAuthority(opened)
 	if err != nil {
 		return nil, false, fmt.Errorf("checking configuration owner %s: %w", path, err)
 	}
@@ -150,7 +150,7 @@ func readConfigBytes(path string) (*secureConfigRead, bool, error) {
 		if err := verifyConfigIdentity(writable, path, before, parentBefore); err != nil {
 			return nil, false, err
 		}
-		owned, err := fileprivacy.IsCurrentUserOwner(writable)
+		owned, err := fileprivacy.IsOwnedByCurrentTokenAuthority(writable)
 		if err != nil || !owned {
 			if err != nil {
 				return nil, false, fmt.Errorf("checking writable configuration owner %s: %w", path, err)

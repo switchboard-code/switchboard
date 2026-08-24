@@ -144,10 +144,20 @@ func assertBuildDidNotRun(t *testing.T, marker string) {
 	}
 }
 
+// reviewerCapableTestCapability keeps these cross-platform integration tests
+// on the policy path they are meant to exercise. The production Windows
+// boundary intentionally disables model review until descendant process
+// cleanup is enforceable; that boundary has its own explicit permission test.
+func reviewerCapableTestCapability() execution.Capability {
+	capability := execution.TestingVerifiedCapability()
+	capability.Platform = "linux"
+	return capability
+}
+
 func TestAutoHostDirectWorkspaceBuildNeverReachesReviewerOrRuns(t *testing.T) {
 	reviewer := &buildAllowReviewer{}
 	human := &autoAsker{approve: false}
-	loop, marker := autoBuildLoop(t, execution.NewDefaultController(execution.TestingVerifiedCapability()), reviewer, human)
+	loop, marker := autoBuildLoop(t, execution.NewDefaultController(reviewerCapableTestCapability()), reviewer, human)
 
 	result, err := runAutoBuild(loop)
 	if err != nil {
@@ -188,7 +198,7 @@ func TestAutoReviewerApprovalCannotCrossSandboxOrModeTransition(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			controller, err := execution.NewController(execution.TestingVerifiedCapability(), execution.SandboxOn)
+			controller, err := execution.NewController(reviewerCapableTestCapability(), execution.SandboxOn)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -312,13 +312,16 @@ func taskFor(repoRoot string, s spec) Task {
 				if err != nil {
 					return err
 				}
-				if !strings.Contains(string(body), b.old) {
+				replaced, matches := applyBreakage(string(body), b)
+				if matches == 0 {
 					// The corpus is pinned to this repository's source. When an
 					// edit no longer matches, the task is stale and saying so
 					// beats silently handing out a task that is already solved.
 					return fmt.Errorf("task %s is stale: %s no longer contains the text it breaks", s.id, b.file)
 				}
-				replaced := strings.Replace(string(body), b.old, b.new, 1)
+				if matches != 1 {
+					return fmt.Errorf("task %s is ambiguous: %s contains the text it breaks %d times", s.id, b.file, matches)
+				}
 				if err := os.WriteFile(path, []byte(replaced), 0o644); err != nil {
 					return err
 				}
@@ -388,6 +391,63 @@ func taskFor(repoRoot string, s spec) Task {
 			return true, "", nil
 		},
 	}
+}
+
+// applyBreakage preserves the checkout's line endings while keeping a corpus
+// mutation exact. Git may materialize tracked text as CRLF on Windows even
+// though the hand-written corpus is pinned in LF form. Treating those bytes as
+// stale would make the same evaluation corpus platform-dependent; normalizing
+// the whole file, however, would hide unrelated line-ending changes. Match
+// only the declared fragment in either tracked-text representation and write
+// the replacement in the representation that was actually found.
+func applyBreakage(body string, b breakage) (string, int) {
+	if b.old == "" {
+		return body, 0
+	}
+	type candidate struct {
+		old string
+		new string
+	}
+	candidates := []candidate{{old: b.old, new: b.new}}
+	if strings.Contains(b.old, "\n") && !strings.Contains(b.old, "\r\n") {
+		candidates = append(candidates, candidate{
+			old: strings.ReplaceAll(b.old, "\n", "\r\n"),
+			new: strings.ReplaceAll(b.new, "\n", "\r\n"),
+		})
+	}
+
+	matches := 0
+	matched := candidate{}
+	for _, variant := range candidates {
+		count := strings.Count(body, variant.old)
+		matches += count
+		if count > 0 {
+			matched = variant
+		}
+	}
+	if matches != 1 {
+		return body, matches
+	}
+	replacement := matched.new
+	if !strings.Contains(matched.old, "\n") && fragmentUsesCRLF(body, matched.old) {
+		replacement = strings.ReplaceAll(replacement, "\n", "\r\n")
+	}
+	return strings.Replace(body, matched.old, replacement, 1), matches
+}
+
+func fragmentUsesCRLF(body, fragment string) bool {
+	start := strings.Index(body, fragment)
+	if start < 0 {
+		return false
+	}
+	if next := strings.IndexByte(body[start+len(fragment):], '\n'); next >= 0 {
+		at := start + len(fragment) + next
+		return at > 0 && body[at-1] == '\r'
+	}
+	if previous := strings.LastIndexByte(body[:start], '\n'); previous >= 0 {
+		return previous > 0 && body[previous-1] == '\r'
+	}
+	return false
 }
 
 func verifierGoExecutable(environ []string, untrustedRoots ...string) (safeexec.Executable, error) {

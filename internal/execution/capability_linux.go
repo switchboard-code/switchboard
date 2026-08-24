@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/switchboard-code/switchboard/internal/rootedfs"
 	"golang.org/x/sys/unix"
 )
 
@@ -327,12 +328,13 @@ func wrapBubblewrap(executable string, p Policy, argv []string) ([]string, error
 	if err != nil {
 		return nil, err
 	}
-	home, err := os.UserHomeDir()
+	homes, err := protectedHomeDirectories()
 	if err != nil {
 		return nil, err
 	}
-	if resolved, err := filepath.EvalSymlinks(home); err == nil {
-		home = resolved
+	ambientHome, err := ambientHomeDir()
+	if err != nil {
+		return nil, err
 	}
 	tmp := os.TempDir()
 	if resolved, err := filepath.EvalSymlinks(tmp); err == nil {
@@ -346,48 +348,100 @@ func wrapBubblewrap(executable string, p Policy, argv []string) ([]string, error
 		"--proc", "/proc",
 	}
 
-	// An empty mount over the home directory closes it wholesale. Everything
-	// below reopens only what a build needs, so a credential file nobody
-	// thought to enumerate is denied by default rather than by luck.
-	out = append(out, "--tmpfs", home)
+	// Empty mounts close the account home and any distinct ambient home
+	// wholesale. An ancestor covers a nested home; avoiding a redundant nested
+	// tmpfs keeps the mountpoint stable. Everything below reopens only what a
+	// build needs, so a credential file nobody thought to enumerate is denied by
+	// default rather than by luck.
+	coveredHomes := minimalHomeCovers(homes)
+	for _, home := range coveredHomes {
+		out = append(out, "--tmpfs", home)
+	}
 
-	// Readable, but not writable: toolchains a version manager installed.
+	// Readable, but not writable: toolchains a version manager installed. Do
+	// this for both logical homes so a deliberately distinct functional HOME
+	// remains usable without exposing the rest of the account home.
 	caches := map[string]bool{}
 	for _, rel := range writableCaches {
-		caches[filepath.Join(home, rel)] = true
+		caches[filepath.Join(ambientHome, rel)] = true
 	}
-	for _, path := range readableHomePaths(home) {
-		if !caches[path] {
-			out = append(out, "--ro-bind", path, path)
+	for _, home := range homes {
+		for _, path := range readableHomePaths(home) {
+			if !caches[path] {
+				out = append(out, "--ro-bind", path, path)
+			}
 		}
+	}
+	for _, path := range p.readOnlyRoots {
+		out = append(out, "--ro-bind", path, path)
 	}
 
 	// Build caches, writable. The directory has to exist before it can be
 	// bound: --bind-try would skip a missing one, and the tool inside cannot
 	// create it either, so a user who has never run a build would meet
 	// "mkdir ~/.cache: read-only file system" on their first confined command.
-	for _, rel := range writableCaches {
-		dir := filepath.Join(home, rel)
-		os.MkdirAll(dir, 0o700)
-		out = append(out, "--bind-try", dir, dir)
+	//
+	// A distinct ambient HOME is untrusted input, however. Never touch or bind
+	// its host paths: a checkout can preplant go -> ~/.ssh and turn MkdirAll or
+	// --bind into an escape. Give it ephemeral cache mounts instead. The normal
+	// account home keeps persistent caches, created component by component
+	// through an os.Root so a symlink ancestry is refused.
+	accountHome := homes[0]
+	if ambientHome == accountHome {
+		cacheDirs, ephemeralCacheDirs, err := prepareWritableHomeCaches(accountHome)
+		if err != nil {
+			return nil, err
+		}
+		for _, dir := range cacheDirs {
+			out = append(out, "--bind", dir, dir)
+		}
+		for _, dir := range ephemeralCacheDirs {
+			out = append(out, "--tmpfs", dir)
+		}
+	} else {
+		for _, rel := range writableCaches {
+			dir := filepath.Join(ambientHome, rel)
+			if !directoryContains(workspace, dir) {
+				out = append(out, "--tmpfs", dir)
+			}
+		}
 	}
 
 	// The workspace usually sits inside home, so it comes after the tmpfs.
 	out = append(out, "--bind", workspace, workspace)
-	if tmp != "/" && !strings.HasPrefix(tmp, home+string(filepath.Separator)) {
+	tmpCoveredByHome := false
+	for _, home := range coveredHomes {
+		if directoryContains(home, tmp) {
+			tmpCoveredByHome = true
+			break
+		}
+	}
+	if tmp != "/" && !tmpCoveredByHome {
 		out = append(out, "--bind", tmp, tmp)
 	}
 
 	// Secrets that live inside a directory just reopened: cargo keeps registry
 	// tokens beside its package cache, and the XDG data directory holds the
 	// keyring beside legitimately shared files.
-	for _, path := range secretHomePaths(home) {
-		if info, err := os.Stat(path); err == nil && info.IsDir() {
-			out = append(out, "--tmpfs", path)
-		} else if err == nil {
-			out = append(out, "--ro-bind", os.DevNull, path)
+	for _, home := range homes {
+		for _, path := range secretHomePaths(home) {
+			if info, err := os.Stat(path); err == nil && info.IsDir() {
+				out = append(out, "--tmpfs", path)
+			} else if err == nil {
+				out = append(out, "--ro-bind", os.DevNull, path)
+			}
 		}
 	}
+	// A protected path in the account home may itself be a symlink into a
+	// different readable parent or an exact Go root reopened above. Hiding the
+	// lexical name is then insufficient: mask the canonical target after every
+	// reopen. Only account-authoritative links may add masks; ambient HOME is
+	// untrusted policy input.
+	resolvedSecretFlags, err := linuxResolvedSecretFlags(accountHome)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, resolvedSecretFlags...)
 
 	out = append(out, agentSocketFlags()...)
 	out = append(out, sessionBusFlags()...)
@@ -399,7 +453,14 @@ func wrapBubblewrap(executable string, p Policy, argv []string) ([]string, error
 	//
 	// It has to come after every mount placed inside home. Earlier, and
 	// bubblewrap cannot create the mountpoints for them.
-	out = append(out, "--remount-ro", home)
+	for _, home := range coveredHomes {
+		// An explicitly selected workspace is the one writable exception. A bind
+		// below an ancestor remains a distinct mount, so only equality needs to
+		// be skipped here.
+		if home != workspace {
+			out = append(out, "--remount-ro", home)
+		}
+	}
 
 	out = append(out,
 		"--unshare-user",
@@ -429,6 +490,69 @@ func wrapBubblewrap(executable string, p Policy, argv []string) ([]string, error
 	// profile that just passed verification.
 	out = append(out, "--")
 	return append(out, argv...), nil
+}
+
+func prepareWritableHomeCaches(home string) ([]string, []string, error) {
+	root, err := rootedfs.OpenRoot(home)
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening account home for confined caches: %w", err)
+	}
+	defer root.Close()
+
+	var persistent, ephemeral []string
+	for _, rel := range writableCaches {
+		path := filepath.Join(home, rel)
+		if !safeWritableHomeCache(home, rel) {
+			ephemeral = append(ephemeral, path)
+			continue
+		}
+		if err := mkdirRootedDirectories(root, rel); err != nil {
+			return nil, nil, fmt.Errorf("preparing confined build cache %q: %w", path, err)
+		}
+		persistent = append(persistent, path)
+	}
+	return persistent, ephemeral, nil
+}
+
+func mkdirRootedDirectories(root *os.Root, rel string) error {
+	parts := strings.Split(filepath.Clean(rel), string(filepath.Separator))
+	for i := range parts {
+		prefix := filepath.Join(parts[:i+1]...)
+		info, err := root.Lstat(prefix)
+		if errors.Is(err, os.ErrNotExist) {
+			if err := root.Mkdir(prefix, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+				return err
+			}
+			info, err = root.Lstat(prefix)
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("path component %q is not a real directory", prefix)
+		}
+	}
+	return nil
+}
+
+func linuxResolvedSecretFlags(accountHome string) ([]string, error) {
+	targets, err := resolvedSymlinkedProtectedTargets(accountHome)
+	if err != nil {
+		return nil, err
+	}
+	var flags []string
+	for _, target := range targets {
+		info, err := os.Stat(target)
+		if err != nil {
+			return nil, fmt.Errorf("inspecting resolved protected account path %q: %w", target, err)
+		}
+		if info.IsDir() {
+			flags = append(flags, "--tmpfs", target)
+		} else {
+			flags = append(flags, "--ro-bind", os.DevNull, target)
+		}
+	}
+	return flags, nil
 }
 
 // agentSocketFlags neutralizes the ssh-agent socket. Binding /dev/null over it

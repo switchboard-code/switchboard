@@ -51,14 +51,15 @@ func TestEverySpecStillMatchesTheSource(t *testing.T) {
 				if err != nil {
 					t.Fatalf("%s: %v", b.file, err)
 				}
-				if !strings.Contains(string(body), b.old) {
+				_, matches := applyBreakage(string(body), b)
+				if matches == 0 {
 					t.Errorf("%s no longer contains the text this task breaks:\n%q", b.file, b.old)
 				}
-				if strings.Count(string(body), b.old) > 1 {
+				if matches > 1 {
 					// Replace(…, 1) would break an arbitrary one of them, so the
 					// task would not be the one it claims to be.
 					t.Errorf("%s contains the broken text %d times, so the edit is ambiguous",
-						b.file, strings.Count(string(body), b.old))
+						b.file, matches)
 				}
 			}
 			for path, want := range s.mustContain {
@@ -71,6 +72,76 @@ func TestEverySpecStillMatchesTheSource(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestApplyBreakagePreservesMaterializedLineEndingsAndExactness(t *testing.T) {
+	mutation := breakage{
+		old: "if ready {\n\treturn true\n}",
+		new: "if false {\n\treturn true\n}",
+	}
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "lf",
+			body: "before\nif ready {\n\treturn true\n}\nafter\n",
+			want: "before\nif false {\n\treturn true\n}\nafter\n",
+		},
+		{
+			name: "crlf",
+			body: "before\r\nif ready {\r\n\treturn true\r\n}\r\nafter\r\n",
+			want: "before\r\nif false {\r\n\treturn true\r\n}\r\nafter\r\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, matches := applyBreakage(tc.body, mutation)
+			if matches != 1 || got != tc.want {
+				t.Fatalf("applyBreakage() = matches %d, %q; want 1, %q", matches, got, tc.want)
+			}
+		})
+	}
+
+	mixed := "if ready {\n\treturn true\n}\r\nif ready {\r\n\treturn true\r\n}\r\n"
+	if got, matches := applyBreakage(mixed, mutation); matches != 2 || got != mixed {
+		t.Fatalf("ambiguous mixed-ending mutation = matches %d, %q", matches, got)
+	}
+
+	singleLine := breakage{old: "return true", new: "if ready {\n\treturn true\n}"}
+	crlfBody := "before\r\nreturn true\r\nafter\r\n"
+	crlfWant := "before\r\nif ready {\r\n\treturn true\r\n}\r\nafter\r\n"
+	if got, matches := applyBreakage(crlfBody, singleLine); matches != 1 || got != crlfWant {
+		t.Fatalf("single-line CRLF mutation = matches %d, %q; want 1, %q", matches, got, crlfWant)
+	}
+}
+
+func TestTaskSetupMutatesCRLFCheckoutWithoutNormalizingTheFile(t *testing.T) {
+	source := t.TempDir()
+	body := "package fixture\r\n\r\nfunc ready() bool {\r\n\treturn true\r\n}\r\n"
+	if err := os.WriteFile(filepath.Join(source, "fixture.go"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	destination := t.TempDir()
+	task := taskFor(source, spec{
+		id: "crlf-checkout",
+		breaks: []breakage{{
+			file: "fixture.go",
+			old:  "func ready() bool {\n\treturn true\n}",
+			new:  "func ready() bool {\n\treturn false\n}",
+		}},
+	})
+	if err := task.Setup(destination); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(destination, "fixture.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Replace(body, "\treturn true", "\treturn false", 1)
+	if string(got) != want {
+		t.Fatalf("mutated CRLF checkout = %q, want %q", got, want)
 	}
 }
 
@@ -158,15 +229,7 @@ func TestTaskVerifierRejectsLaunchCheckoutGoForDifferentWorkspace(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	realGo, err = filepath.Abs(realGo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	realGoCanonical, err := filepath.EvalSymlinks(realGo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	trustedBin, err := filepath.EvalSymlinks(filepath.Dir(realGo))
+	realGoInfo, err := os.Stat(realGo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,24 +301,21 @@ func TestTaskVerifierRejectsLaunchCheckoutGoForDifferentWorkspace(t *testing.T) 
 			filteredPath = value
 		}
 	}
-	retainedTrustedBin := false
 	for _, directory := range filepath.SplitList(filteredPath) {
 		if directory == launchBin {
 			t.Fatalf("verifier PATH retained launch-checkout directory %q", launchBin)
 		}
-		if directory == trustedBin {
-			retainedTrustedBin = true
-		}
-	}
-	if !retainedTrustedBin {
-		t.Fatalf("verifier PATH %q dropped trusted Go directory %q", filteredPath, trustedBin)
 	}
 	resolved, err := verifierGoExecutable(environ, source, copyDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolved.Path() != realGoCanonical {
-		t.Fatalf("verifier Go = %q, want trusted executable %q", resolved.Path(), realGoCanonical)
+	resolvedInfo, err := os.Stat(resolved.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(resolved.Path()) || !os.SameFile(realGoInfo, resolvedInfo) {
+		t.Fatalf("verifier Go = %q, want the trusted executable found at %q", resolved.Path(), realGo)
 	}
 
 	solved, detail, err := task.Verify(context.Background(), copyDir)

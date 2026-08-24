@@ -83,16 +83,26 @@
 ;; ---------------------------------------------------------------------------
 
 (deny file-read* (subpath (param "DENY_SSH")))
+(deny file-write* (subpath (param "DENY_SSH")))
 (deny file-read* (subpath (param "DENY_AWS")))
+(deny file-write* (subpath (param "DENY_AWS")))
 (deny file-read* (subpath (param "DENY_GCLOUD")))
+(deny file-write* (subpath (param "DENY_GCLOUD")))
 (deny file-read* (subpath (param "DENY_KUBE")))
+(deny file-write* (subpath (param "DENY_KUBE")))
 (deny file-read* (subpath (param "DENY_DOCKER")))
+(deny file-write* (subpath (param "DENY_DOCKER")))
 (deny file-read* (subpath (param "DENY_GNUPG")))
+(deny file-write* (subpath (param "DENY_GNUPG")))
 (deny file-read* (subpath (param "DENY_KEYCHAINS")))
+(deny file-write* (subpath (param "DENY_KEYCHAINS")))
 (deny file-read* (subpath (param "DENY_KEYCHAINS_SYS")))
+(deny file-write* (subpath (param "DENY_KEYCHAINS_SYS")))
 (deny file-read* (subpath (param "DENY_CONFIG_SSH")))
+(deny file-write* (subpath (param "DENY_CONFIG_SSH")))
 
 ; Switchboard's own session logs hold prompts, diffs, and file contents from
 ; every workspace on this machine. A command run for one project has no
 ; business reading another project's transcript.
 (deny file-read* (subpath (param "DENY_SWITCHBOARD")))
+(deny file-write* (subpath (param "DENY_SWITCHBOARD")))

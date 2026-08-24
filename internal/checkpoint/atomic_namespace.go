@@ -14,7 +14,7 @@ type AtomicNamespaceOutcome struct {
 // ValidateAtomicNamespaceRoot proves that the platform can provide the exact
 // bound, no-replace namespace operations used by the helpers below. On
 // Windows this performs (and then caches by directory identity) the NTFS and
-// FileRenameInfoEx/FileDispositionInfoEx capability probes; unsupported
+// FileRenameInformation/FileDispositionInfoEx capability probes; unsupported
 // filesystems fail closed. Unix implementations need no separate preflight.
 func ValidateAtomicNamespaceRoot(root *os.Root) error {
 	return ensureRetirementCompatible(root, nil)

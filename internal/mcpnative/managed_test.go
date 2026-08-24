@@ -15,7 +15,7 @@ func TestClaudeManagedMCPIsExclusiveServerSource(t *testing.T) {
 	mustMkdir(t, workspace)
 	mustWrite(t, filepath.Join(home, ".claude.json"), `{
   "mcpServers":{"user":{"command":"user-server"}},
-  "projects":{"`+workspace+`":{"disabledMcpServers":["managed"]}}
+  "projects":{`+quotedJSONString(workspace)+`:{"disabledMcpServers":["managed"]}}
 }`)
 	mustWrite(t, filepath.Join(workspace, ".mcp.json"), `{
   "mcpServers":{"project":{"command":"project-server"}}

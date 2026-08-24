@@ -95,6 +95,9 @@ func runHelperServer() {
 			reply(*req.ID, `{"resultType":"complete","tools":[{"name":"env","description":"reports selected environment variables","inputSchema":{"type":"object"}}]}`)
 		case "tools/call":
 			cwd, _ := os.Getwd()
+			cwdInfo, cwdErr := os.Stat(cwd)
+			expectedCWDInfo, expectedCWDErr := os.Stat(os.Getenv("SB_EXPECT_CWD"))
+			cwdMatch := cwdErr == nil && expectedCWDErr == nil && os.SameFile(cwdInfo, expectedCWDInfo)
 			seen := fmt.Sprintf("anthropic=%q sb=%q token=%q secret=%q password=%q credential=%q sshsock=%q databaseurl=%q regranted=%q auth=%q sessionid=%q cookie=%q harmless=%q safe=%q extra=%q forwarded=%q override=%q tmpsecret=%q cwd=%q cwdmatch=%t",
 				os.Getenv("ANTHROPIC_API_KEY"), os.Getenv("SB_OLLAMA_API_KEY"),
 				os.Getenv("INHERITED_MODEL_TOKEN"), os.Getenv("mIxEd_SeCrEt"),
@@ -102,8 +105,7 @@ func runHelperServer() {
 				os.Getenv("SSH_AUTH_SOCK"), os.Getenv("DATABASE_URL"),
 				os.Getenv("MODEL_TOKEN"), os.Getenv("AUTH"), os.Getenv("SESSION_ID"), os.Getenv("COOKIE"), os.Getenv("HARMLESS_VALUE"),
 				os.Getenv("SAFE_VISIBLE"), os.Getenv("SB_TEST_EXTRA"),
-				os.Getenv("FORWARDED_TOKEN"), os.Getenv("STATIC_OVERRIDE"), os.Getenv("TMP_SECRET"), cwd,
-				cwd == os.Getenv("SB_EXPECT_CWD"))
+				os.Getenv("FORWARDED_TOKEN"), os.Getenv("STATIC_OVERRIDE"), os.Getenv("TMP_SECRET"), cwd, cwdMatch)
 			body, _ := json.Marshal(seen)
 			reply(*req.ID, fmt.Sprintf(`{"resultType":"complete","content":[{"type":"text","text":%s}]}`, body))
 		}

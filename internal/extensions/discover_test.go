@@ -27,7 +27,8 @@ func TestDiscoverGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(got) != strings.TrimSpace(string(want)) {
+	wantText := strings.ReplaceAll(string(want), "\r\n", "\n")
+	if strings.TrimSpace(got) != strings.TrimSpace(wantText) {
 		t.Fatalf("discovery snapshot differs (-want +got):\n--- want\n%s\n--- got\n%s", want, got)
 	}
 

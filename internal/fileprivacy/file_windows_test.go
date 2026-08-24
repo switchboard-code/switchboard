@@ -129,9 +129,102 @@ func TestWindowsRootedPrivateLockUsesProtectedCurrentUserDACL(t *testing.T) {
 	if err != nil || created {
 		t.Fatalf("second rooted open created=%v err=%v", created, err)
 	}
+	// Existing rooted files must retain the ACL rights promised to callers
+	// that revalidate them before use. The old open mask omitted both rights
+	// and made this Secure call fail with ERROR_ACCESS_DENIED.
+	if err := Secure(second); err != nil {
+		_ = second.Close()
+		t.Fatalf("securing reopened rooted lock: %v", err)
+	}
 	if err := second.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestWindowsTokenDefaultOwnerIsRepairAuthorityButNotFinalOwner(t *testing.T) {
+	current, err := currentWindowsUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultOwner := differentWindowsOwnerSID(t, current)
+	unrelated := differentWindowsOwnerSID(t, current, defaultOwner)
+
+	descriptor, err := windows.SecurityDescriptorFromString("O:" + defaultOwner.String() +
+		"D:P(A;;FA;;;" + current.String() + ")")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owned, err := windowsDescriptorIsCurrentTokenAuthorityOwner(descriptor, current, defaultOwner); err != nil || !owned {
+		t.Fatalf("token-default owner admitted=%v err=%v", owned, err)
+	}
+	if ownerOnly, err := windowsDescriptorIsOwnerOnly(descriptor, current, false); err != nil || ownerOnly {
+		t.Fatalf("token-default owner final owner-only=%v err=%v", ownerOnly, err)
+	}
+
+	foreign, err := windows.SecurityDescriptorFromString("O:" + unrelated.String() +
+		"D:P(A;;FA;;;" + current.String() + ")")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owned, err := windowsDescriptorIsCurrentTokenAuthorityOwner(foreign, current, defaultOwner); err != nil || owned {
+		t.Fatalf("unrelated owner admitted=%v err=%v", owned, err)
+	}
+}
+
+func TestWindowsSecureNormalizesOrdinaryCreationToExactUserOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ordinary")
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err = OpenWritable(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if admitted, err := IsOwnedByCurrentTokenAuthority(f); err != nil || !admitted {
+		t.Fatalf("ordinary Windows owner admitted=%v err=%v", admitted, err)
+	}
+	if err := Secure(f); err != nil {
+		t.Fatal(err)
+	}
+	if exact, err := IsCurrentUserOwner(f); err != nil || !exact {
+		t.Fatalf("repaired exact user owner=%v err=%v", exact, err)
+	}
+	if private, err := IsOwnerOnly(f); err != nil || !private {
+		t.Fatalf("repaired protected owner-only=%v err=%v", private, err)
+	}
+}
+
+func differentWindowsOwnerSID(t *testing.T, excluded ...*windows.SID) *windows.SID {
+	t.Helper()
+	for _, kind := range []windows.WELL_KNOWN_SID_TYPE{
+		windows.WinWorldSid,
+		windows.WinLocalSystemSid,
+		windows.WinBuiltinUsersSid,
+		windows.WinBuiltinGuestsSid,
+	} {
+		candidate, err := windows.CreateWellKnownSid(kind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		different := true
+		for _, sid := range excluded {
+			if candidate.Equals(sid) {
+				different = false
+				break
+			}
+		}
+		if different {
+			return candidate
+		}
+	}
+	t.Fatal("could not find a distinct well-known Windows SID")
+	return nil
 }
 
 func TestWindowsEnsurePrivateDirInRootUsesProtectedCurrentUserDACL(t *testing.T) {

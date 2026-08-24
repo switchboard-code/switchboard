@@ -29,13 +29,34 @@ type Journal struct {
 }
 
 func NewJournal(path string) (*Journal, error) {
-	// Append, so resuming a killed run adds to the record rather than replacing
-	// what survived it.
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	// Windows does not grant a handle opened with O_APPEND the write authority
+	// SetEndOfFile needs, so a killed final record must be repaired through a
+	// non-append handle. Reopen for kernel append afterwards: every completed
+	// result still lands after what survived rather than replacing it.
+	repair, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	if err := repairJournalTail(f); err != nil {
+	if err := repairJournalTail(repair); err != nil {
+		_ = repair.Close()
+		return nil, err
+	}
+	repairedInfo, err := repair.Stat()
+	if err != nil {
+		_ = repair.Close()
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		_ = repair.Close()
+		return nil, err
+	}
+	appendInfo, statErr := f.Stat()
+	if statErr != nil || !os.SameFile(repairedInfo, appendInfo) {
+		return nil, errors.Join(statErr, f.Close(), repair.Close(),
+			fmt.Errorf("journal changed while binding its append handle"))
+	}
+	if err := repair.Close(); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
@@ -67,7 +88,7 @@ func repairJournalTail(f *os.File) error {
 			return err
 		}
 	case json.Valid(tail):
-		if _, err := f.Write([]byte{'\n'}); err != nil {
+		if _, err := f.WriteAt([]byte{'\n'}, info.Size()); err != nil {
 			return err
 		}
 	default:

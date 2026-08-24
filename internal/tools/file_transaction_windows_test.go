@@ -55,3 +55,51 @@ func TestWindowsTransactionalEditPreservesReadOnlyState(t *testing.T) {
 		t.Fatalf("read-only mode=%o, want 444", got)
 	}
 }
+
+func TestWindowsCaseAliasesShareReadAndCheckpointIdentity(t *testing.T) {
+	r, root := newRegistry(t)
+	path := filepath.Join(root, "MixedCase.txt")
+	writeFile(t, path, "before")
+	alias := filepath.Join(root, "mixedcase.txt")
+	aliasInfo, err := os.Lstat(alias)
+	if os.IsNotExist(err) {
+		t.Skip("temporary volume is case-sensitive")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedInfo, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(aliasInfo, storedInfo) {
+		t.Skip("case-only spelling names a distinct file")
+	}
+
+	if result := run(t, r, "read", map[string]any{"path": "MixedCase.txt"}); result.IsError {
+		t.Fatalf("read failed: %s", result.Content)
+	}
+	recorder := newCheckpointRecorder(t, root)
+	r.SetCheckpoints(recorder)
+	recorder.Begin("case aliases")
+	for _, update := range []struct {
+		path    string
+		content string
+	}{
+		{path: "mixedcase.txt", content: "first"},
+		{path: "MIXEDCASE.txt", content: "second"},
+	} {
+		if result := run(t, r, "write", map[string]any{"path": update.path, "content": update.content}); result.IsError {
+			t.Fatalf("write through %q failed: %s", update.path, result.Content)
+		}
+	}
+	if turns := recorder.Turns(); len(turns) != 1 || turns[0].Files != 1 || turns[0].Partial {
+		t.Fatalf("case aliases split checkpoint identity: %+v", turns)
+	}
+	if restored, _, _, failed, _, err := recorder.Undo(); err != nil || len(failed) != 0 || len(restored) != 1 {
+		t.Fatalf("undo restored=%v failed=%v err=%v", restored, failed, err)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "before" {
+		t.Fatalf("undo content=%q err=%v, want original pre-image", got, err)
+	}
+}

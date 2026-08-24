@@ -55,12 +55,45 @@ func IsCurrentUserOwner(f *os.File) (bool, error) {
 	return windowsDescriptorIsCurrentUserOwner(descriptor, current)
 }
 
+// IsOwnedByCurrentTokenAuthority reports whether f is owned either by the
+// process user or by the process token's default owner. Windows assigns the
+// latter to objects created without an explicit security descriptor; for an
+// elevated token it can be an owner-capable group rather than TokenUser.
+//
+// This predicate is only an admission gate for descriptor-bound migration.
+// Secure and SecureDirectory always rewrite the owner to TokenUser, and their
+// final verification continues to require that exact user SID plus the
+// protected one-user DACL.
+func IsOwnedByCurrentTokenAuthority(f *os.File) (bool, error) {
+	descriptor, err := windows.GetSecurityInfo(windows.Handle(f.Fd()), windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION)
+	if err != nil {
+		return false, err
+	}
+	current, defaultOwner, err := currentWindowsAuthoritySIDs()
+	if err != nil {
+		return false, err
+	}
+	return windowsDescriptorIsCurrentTokenAuthorityOwner(descriptor, current, defaultOwner)
+}
+
 func windowsDescriptorIsCurrentUserOwner(descriptor *windows.SECURITY_DESCRIPTOR, current *windows.SID) (bool, error) {
 	owner, _, err := descriptor.Owner()
 	if err != nil {
 		return false, err
 	}
 	return owner != nil && owner.IsValid() && owner.Equals(current), nil
+}
+
+func windowsDescriptorIsCurrentTokenAuthorityOwner(descriptor *windows.SECURITY_DESCRIPTOR, current, defaultOwner *windows.SID) (bool, error) {
+	owner, _, err := descriptor.Owner()
+	if err != nil {
+		return false, err
+	}
+	if owner == nil || !owner.IsValid() {
+		return false, nil
+	}
+	return owner.Equals(current) || owner.Equals(defaultOwner), nil
 }
 
 // Create applies a protected one-user DACL as part of CREATE_NEW, before any
@@ -161,7 +194,8 @@ func OpenReadWriteOrCreateInRoot(root *os.Root, name string) (*os.File, bool, er
 		return nil, false, err
 	}
 	f, err = openWindowsRootFile(root, name,
-		windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE|windows.READ_CONTROL,
+		windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE|windows.READ_CONTROL|
+			windows.WRITE_DAC|windows.WRITE_OWNER,
 		windows.FILE_OPEN, nil)
 	if err != nil {
 		return nil, false, err
@@ -293,7 +327,7 @@ func EnsurePrivateDir(path string) error {
 		return err
 	}
 	defer f.Close()
-	owned, err := IsCurrentUserOwner(f)
+	owned, err := IsOwnedByCurrentTokenAuthority(f)
 	if err != nil {
 		return fmt.Errorf("checking owner-private directory owner: %w", err)
 	}
@@ -331,7 +365,7 @@ func EnsurePrivateDir(path string) error {
 // EnsurePrivateDir to an already-open directory handle with WRITE_DAC and
 // WRITE_OWNER access.
 func SecureDirectory(f *os.File) error {
-	owned, err := IsCurrentUserOwner(f)
+	owned, err := IsOwnedByCurrentTokenAuthority(f)
 	if err != nil {
 		return fmt.Errorf("checking owner-private directory owner: %w", err)
 	}
@@ -399,7 +433,7 @@ func Secure(f *os.File) error {
 	if err := verifyRegularSingleLink(f); err != nil {
 		return err
 	}
-	owned, err := IsCurrentUserOwner(f)
+	owned, err := IsOwnedByCurrentTokenAuthority(f)
 	if err != nil {
 		return fmt.Errorf("checking owner-private file owner: %w", err)
 	}
@@ -557,6 +591,47 @@ func currentWindowsUserSID() (*windows.SID, error) {
 		return nil, errors.New("current Windows user has no valid SID")
 	}
 	return user.User.Sid.Copy()
+}
+
+type windowsTokenOwner struct {
+	Owner *windows.SID
+}
+
+func currentWindowsAuthoritySIDs() (*windows.SID, *windows.SID, error) {
+	token := windows.GetCurrentProcessToken()
+	user, err := token.GetTokenUser()
+	if err != nil {
+		return nil, nil, err
+	}
+	if user == nil || user.User.Sid == nil || !user.User.Sid.IsValid() {
+		return nil, nil, errors.New("current Windows user has no valid SID")
+	}
+
+	var size uint32
+	err = windows.GetTokenInformation(token, windows.TokenOwner, nil, 0, &size)
+	if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) || size < uint32(unsafe.Sizeof(windowsTokenOwner{})) {
+		if err == nil {
+			err = errors.New("current Windows token has no default owner")
+		}
+		return nil, nil, err
+	}
+	buffer := make([]byte, size)
+	if err := windows.GetTokenInformation(token, windows.TokenOwner, &buffer[0], size, &size); err != nil {
+		return nil, nil, err
+	}
+	defaultOwner := (*windowsTokenOwner)(unsafe.Pointer(&buffer[0])).Owner
+	if defaultOwner == nil || !defaultOwner.IsValid() {
+		return nil, nil, errors.New("current Windows token has no valid default-owner SID")
+	}
+	currentCopy, err := user.User.Sid.Copy()
+	if err != nil {
+		return nil, nil, err
+	}
+	defaultCopy, err := defaultOwner.Copy()
+	if err != nil {
+		return nil, nil, err
+	}
+	return currentCopy, defaultCopy, nil
 }
 
 func ownerOnlyWindowsDescriptor() (*windows.SECURITY_DESCRIPTOR, error) {

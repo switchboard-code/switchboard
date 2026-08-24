@@ -85,9 +85,10 @@ func Run(ctx context.Context, c Command) (Result, error) {
 	if c.Shell {
 		name, args = shellCommand(c.Argv[0])
 	}
+	policy, trustedEnv := bindGoToolchain(c)
 
 	if c.Confine != nil {
-		wrapped, err := c.Confine.apply(c.Policy, append([]string{name}, args...))
+		wrapped, err := c.Confine.apply(policy, append([]string{name}, args...))
 		if err != nil {
 			// Failing closed is the whole point. A sandbox that quietly falls
 			// back to running the command is worse than no sandbox, because the
@@ -110,6 +111,7 @@ func Run(ctx context.Context, c Command) (Result, error) {
 		envNetwork = NetworkLoopback
 	}
 	cmd.Env = commandEnv(envNetwork, c.ExtraEnv)
+	cmd.Env = append(cmd.Env, trustedEnv...)
 	if len(c.Stdin) > 0 {
 		cmd.Stdin = bytes.NewReader(c.Stdin)
 	}
@@ -290,7 +292,7 @@ func childLoaderInjection(key string) bool {
 		"LUA_PATH", "LUA_CPATH", "TCLLIBPATH", "TCL_LIBRARY", "TK_LIBRARY",
 		"PHPRC", "PHP_INI_SCAN_DIR", "VLC_PLUGIN_PATH",
 		"OPENSSL_CONF", "OPENSSL_CONF_INCLUDE", "OPENSSL_MODULES", "OPENSSL_ENGINES",
-		"NODE_OPTIONS", "NODE_PATH",
+		"NODE_OPTIONS", "NODE_PATH", "GOROOT",
 		"PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE",
 		"PERL5LIB", "PERL5OPT", "RUBYLIB", "RUBYOPT",
 		"GEM_HOME", "GEM_PATH",

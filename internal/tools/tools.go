@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -74,8 +75,17 @@ type ParallelBatchTool interface {
 
 // Registry holds the tool suite for one workspace.
 type Registry struct {
-	root       string
-	rootInfo   os.FileInfo
+	root     string
+	rootInfo os.FileInfo
+
+	// displayRoot retains the launch spelling (notably a Windows 8.3 path),
+	// while displayPath remembers case-only caller spellings by canonical path.
+	// Both are presentation-only: root remains the authority and every state,
+	// checkpoint, and filesystem key uses resolve's canonical result.
+	displayRoot string
+	displayMu   sync.RWMutex
+	displayPath map[string]string
+
 	capability execution.Capability
 	execution  *execution.Controller
 	versions   *fileVersions
@@ -190,15 +200,17 @@ func NewRegistryWithExecution(workspace string, controller *execution.Controller
 	}
 
 	r := &Registry{
-		root:       root,
-		rootInfo:   rootInfo,
-		capability: controller.Capability(),
-		execution:  controller,
-		versions:   newFileVersions(),
-		background: execution.NewBackgroundSet(),
-		images:     &toolImages{},
-		todos:      &todoState{},
-		tools:      map[string]Tool{},
+		root:        root,
+		displayRoot: filepath.Clean(abs),
+		rootInfo:    rootInfo,
+		displayPath: map[string]string{},
+		capability:  controller.Capability(),
+		execution:   controller,
+		versions:    newFileVersions(),
+		background:  execution.NewBackgroundSet(),
+		images:      &toolImages{},
+		todos:       &todoState{},
+		tools:       map[string]Tool{},
 	}
 	r.add(&readTool{r})
 	r.add(&writeTool{r})
@@ -440,6 +452,7 @@ func (r *Registry) resolve(p string) (string, error) {
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("%w: %s", errOutsideWorkspace, p)
 	}
+	r.rememberCaseOnlyDisplay(resolved, filepath.Clean(p))
 	return resolved, nil
 }
 
@@ -466,8 +479,49 @@ func resolveExistingPrefix(p string) (string, error) {
 
 // display renders a path relative to the workspace for prompts and messages.
 func (r *Registry) display(abs string) string {
-	if rel, err := filepath.Rel(r.root, abs); err == nil {
+	clean := filepath.Clean(abs)
+	r.displayMu.RLock()
+	remembered, ok := r.displayPath[clean]
+	r.displayMu.RUnlock()
+	if ok {
+		return remembered
+	}
+	rel, relErr := filepath.Rel(r.root, abs)
+	if relErr == nil && pathIsWithinRoot(rel) {
+		return filepath.ToSlash(rel)
+	}
+	// EvalSymlinks may canonicalize the launch spelling (including a Windows
+	// 8.3 name) stored in root. Keep that exact logical root for presentation so
+	// language-server paths using the launch spelling remain workspace-relative.
+	// This fallback is lexical: rendering an untrusted external path must not
+	// probe a UNC share, automount, or any other filesystem authority.
+	if r.displayRoot != "" {
+		if displayRel, err := filepath.Rel(r.displayRoot, abs); err == nil && pathIsWithinRoot(displayRel) {
+			return filepath.ToSlash(displayRel)
+		}
+	}
+	if relErr == nil {
 		return filepath.ToSlash(rel)
 	}
 	return filepath.ToSlash(abs)
+}
+
+func (r *Registry) rememberCaseOnlyDisplay(resolved, requested string) {
+	if runtime.GOOS != "windows" || resolved == requested || !strings.EqualFold(resolved, requested) {
+		return
+	}
+	rel, err := filepath.Rel(r.root, requested)
+	if err != nil || !pathIsWithinRoot(rel) {
+		return
+	}
+	r.displayMu.Lock()
+	if r.displayPath == nil {
+		r.displayPath = map[string]string{}
+	}
+	r.displayPath[filepath.Clean(resolved)] = filepath.ToSlash(rel)
+	r.displayMu.Unlock()
+}
+
+func pathIsWithinRoot(rel string) bool {
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

@@ -369,14 +369,19 @@ func TestBoundStandalonePublicationAndRecoveryRefuseRetargetedJournal(t *testing
 		t.Fatal(err)
 	}
 	defer journalRoot.Close()
-	if err := os.Rename(journalDir, movedJournal); err != nil {
+	retargetPrevented, err := attemptOpenDirectoryRetarget(journalRoot, journalDir, movedJournal)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(journalDir, 0o700); err != nil {
-		t.Fatal(err)
+	if !retargetPrevented {
+		if err := os.Mkdir(journalDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 	sentinel := filepath.Join(journalDir, "replacement-sentinel")
-	write(t, sentinel, "outside")
+	if !retargetPrevented {
+		write(t, sentinel, "outside")
+	}
 	path := filepath.Join(workspace, "state.json")
 
 	published, err := PublishStandaloneFileCASBound(
@@ -384,6 +389,22 @@ func TestBoundStandalonePublicationAndRecoveryRefuseRetargetedJournal(t *testing
 		path, workspaceRoot, filepath.Base(path),
 		false, 0, nil, 0o600, []byte("state"), 1024, nil, nil,
 	)
+	if retargetPrevented {
+		if err != nil || !published {
+			t.Fatalf("bound publication after Windows retarget refusal = published %v, %v", published, err)
+		}
+		if got := readBack(t, path); got != "state" {
+			t.Fatalf("published state after Windows retarget refusal = %q", got)
+		}
+		if _, err := os.Lstat(movedJournal); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("refused Windows journal retarget created a destination: %v", err)
+		}
+		if err := RecoverFilePublicationCleanupBound(journalDir, workspace, journalRoot, workspaceRoot); err != nil {
+			t.Fatalf("bound recovery after Windows retarget refusal: %v", err)
+		}
+		assertNoPublicationArtifacts(t, workspace, journalDir)
+		return
+	}
 	if published || !errors.Is(err, ErrStale) {
 		t.Fatalf("bound publication = published %v, %v", published, err)
 	}
@@ -420,13 +441,14 @@ func TestBoundStandalonePublicationRetainsJournalCapabilityAfterPathRetarget(t *
 	defer journalRoot.Close()
 	sentinel := filepath.Join(journalDir, "replacement-sentinel")
 	var hookErr error
+	var retargetPrevented bool
 	standaloneFilePublicationAfterConfigTestHook = func() {
 		standaloneFilePublicationAfterConfigTestHook = nil
-		hookErr = os.Rename(journalDir, movedJournal)
-		if hookErr == nil {
+		retargetPrevented, hookErr = attemptOpenDirectoryRetarget(journalRoot, journalDir, movedJournal)
+		if hookErr == nil && !retargetPrevented {
 			hookErr = os.Mkdir(journalDir, 0o700)
 		}
-		if hookErr == nil {
+		if hookErr == nil && !retargetPrevented {
 			write(t, sentinel, "outside")
 		}
 	}
@@ -439,6 +461,22 @@ func TestBoundStandalonePublicationRetainsJournalCapabilityAfterPathRetarget(t *
 	)
 	if hookErr != nil {
 		t.Fatal(hookErr)
+	}
+	if retargetPrevented {
+		if err != nil || !published {
+			t.Fatalf("bound publication after Windows seam retarget refusal = published %v, %v", published, err)
+		}
+		if got := readBack(t, path); got != "state" {
+			t.Fatalf("published state after Windows seam retarget refusal = %q", got)
+		}
+		if _, err := os.Lstat(movedJournal); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("refused Windows seam retarget created a destination: %v", err)
+		}
+		if _, err := os.Lstat(sentinel); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("refused Windows seam retarget installed a replacement sentinel: %v", err)
+		}
+		assertNoPublicationArtifacts(t, workspace, journalDir)
+		return
 	}
 	if err != nil || !published {
 		t.Fatalf("bound publication after retarget = published %v, %v", published, err)
@@ -617,10 +655,16 @@ func TestPublishFileCASLateParentMoveNeverFollowsReplacement(t *testing.T) {
 	}
 	recorder.Begin("parent move")
 	recorder.RecordState(path, true, 0o644, []byte("before"))
+	var retargetPrevented bool
 	boundAfterNamespaceTestHook = func() error {
 		boundAfterNamespaceTestHook = nil
-		if renameErr := os.Rename(parentPath, movedParent); renameErr != nil {
+		var renameErr error
+		retargetPrevented, renameErr = attemptOpenDirectoryRetarget(parent, parentPath, movedParent)
+		if renameErr != nil {
 			return renameErr
+		}
+		if retargetPrevented {
+			return nil
 		}
 		return os.Symlink(outside, parentPath)
 	}
@@ -631,6 +675,26 @@ func TestPublishFileCASLateParentMoveNeverFollowsReplacement(t *testing.T) {
 		nil,
 	)
 	boundAfterNamespaceTestHook = nil
+	if retargetPrevented {
+		if err != nil || !published {
+			t.Fatalf("PublishFileCAS() after Windows parent-retarget refusal = published %v, %v", published, err)
+		}
+		recorder.Commit(path, true, 0o644, sha256.Sum256([]byte("agent")))
+		if got := readBack(t, path); got != "agent" {
+			t.Fatalf("target after Windows parent-retarget refusal = %q, want agent", got)
+		}
+		if got := readBack(t, outsidePath); got != "outside" {
+			t.Fatalf("outside target after Windows parent-retarget refusal = %q, want outside", got)
+		}
+		if _, err := os.Lstat(movedParent); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("refused Windows parent retarget created a destination: %v", err)
+		}
+		if hasPublicationTempLedger(t, journalDir) {
+			t.Fatal("Windows parent-retarget refusal retained unnecessary recovery evidence")
+		}
+		assertNoPublicationArtifacts(t, workspace, journalDir)
+		return
+	}
 	if !published || !errors.Is(err, ErrStale) {
 		t.Fatalf("PublishFileCAS() = published %v, %v; want published recovery-required namespace result", published, err)
 	}
@@ -683,10 +747,16 @@ func TestPublishFileCASRollsBackCreationAfterLateParentMove(t *testing.T) {
 	}
 	recorder.Begin("create parent move")
 	recorder.RecordState(path, false, 0, nil)
+	var retargetPrevented bool
 	boundAfterNamespaceTestHook = func() error {
 		boundAfterNamespaceTestHook = nil
-		if renameErr := os.Rename(parentPath, movedParent); renameErr != nil {
+		var renameErr error
+		retargetPrevented, renameErr = attemptOpenDirectoryRetarget(parent, parentPath, movedParent)
+		if renameErr != nil {
 			return renameErr
+		}
+		if retargetPrevented {
+			return nil
 		}
 		return os.Symlink(outside, parentPath)
 	}
@@ -696,6 +766,26 @@ func TestPublishFileCASRollsBackCreationAfterLateParentMove(t *testing.T) {
 		false, 0, nil, 0o644, []byte("agent"), nil,
 	)
 	boundAfterNamespaceTestHook = nil
+	if retargetPrevented {
+		if err != nil || !published {
+			t.Fatalf("PublishFileCAS() creation after Windows parent-retarget refusal = published %v, %v", published, err)
+		}
+		recorder.Commit(path, true, 0o644, sha256.Sum256([]byte("agent")))
+		if got := readBack(t, path); got != "agent" {
+			t.Fatalf("created target after Windows parent-retarget refusal = %q, want agent", got)
+		}
+		if got := readBack(t, outsidePath); got != "outside" {
+			t.Fatalf("outside target after Windows parent-retarget refusal = %q, want outside", got)
+		}
+		if _, err := os.Lstat(movedParent); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("refused Windows creation-parent retarget created a destination: %v", err)
+		}
+		if hasPublicationTempLedger(t, journalDir) {
+			t.Fatal("Windows creation-parent retarget refusal retained unnecessary recovery evidence")
+		}
+		assertNoPublicationArtifacts(t, workspace, journalDir)
+		return
+	}
 	if !published || !errors.Is(err, ErrStale) {
 		t.Fatalf("PublishFileCAS() = published %v, %v; want published recovery-required creation", published, err)
 	}
@@ -748,10 +838,16 @@ func TestPublishFileCASParentRollbackFailureRetainsRecoveryEvidence(t *testing.T
 	}
 	recorder.Begin("failed parent rollback")
 	recorder.RecordState(path, true, 0o644, []byte("before"))
+	var retargetPrevented bool
 	boundAfterNamespaceTestHook = func() error {
 		boundAfterNamespaceTestHook = nil
-		if renameErr := os.Rename(parentPath, movedParent); renameErr != nil {
+		var renameErr error
+		retargetPrevented, renameErr = attemptOpenDirectoryRetarget(parent, parentPath, movedParent)
+		if renameErr != nil {
 			return renameErr
+		}
+		if retargetPrevented {
+			return nil
 		}
 		return os.Symlink(outside, parentPath)
 	}
@@ -767,6 +863,26 @@ func TestPublishFileCASParentRollbackFailureRetainsRecoveryEvidence(t *testing.T
 	)
 	boundAfterNamespaceTestHook = nil
 	boundRollbackTestHook = nil
+	if retargetPrevented {
+		if err != nil || !published {
+			t.Fatalf("PublishFileCAS() after Windows rollback-retarget refusal = published %v, %v", published, err)
+		}
+		recorder.Commit(path, true, 0o644, sha256.Sum256([]byte("agent")))
+		if got := readBack(t, path); got != "agent" {
+			t.Fatalf("target after Windows rollback-retarget refusal = %q, want agent", got)
+		}
+		if got := readBack(t, outsidePath); got != "outside" {
+			t.Fatalf("outside target after Windows rollback-retarget refusal = %q, want outside", got)
+		}
+		if _, err := os.Lstat(movedParent); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("refused Windows rollback-parent retarget created a destination: %v", err)
+		}
+		if hasPublicationTempLedger(t, journalDir) {
+			t.Fatal("Windows rollback-parent retarget refusal retained unnecessary recovery evidence")
+		}
+		assertNoPublicationArtifacts(t, workspace, journalDir)
+		return
+	}
 	if !published || !errors.Is(err, injected) || !errors.Is(err, ErrStale) ||
 		!strings.Contains(err.Error(), "rolling back stale checkpoint publication") {
 		t.Fatalf("PublishFileCAS() = published %v, %v; want published rollback failure before stale cause", published, err)

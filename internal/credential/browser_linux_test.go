@@ -77,7 +77,7 @@ func TestBrowserDropsWorkspaceDesktopHandlerAuthority(t *testing.T) {
 	name := "switchboard-test-xdg-open"
 	// This is the relevant xdg-open dispatch seam: a readable .desktop file
 	// under XDG_DATA_HOME selects executable handler authority.
-	writeExecutable(t, filepath.Join(external, name), "#!/bin/sh\n[ -n \"$XDG_DATA_HOME\" ] && [ -r \"$XDG_DATA_HOME/applications/switchboard-test.desktop\" ] && /usr/bin/touch '"+marker+"'\n")
+	writeExecutable(t, filepath.Join(external, name), "#!/bin/sh\nif [ -n \"$XDG_DATA_HOME\" ] && [ -r \"$XDG_DATA_HOME/applications/switchboard-test.desktop\" ]; then /usr/bin/touch '"+marker+"'; fi\nexit 0\n")
 	t.Chdir(workspace)
 	t.Setenv("PATH", external)
 	t.Setenv("HOME", workspace)

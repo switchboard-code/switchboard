@@ -128,8 +128,9 @@ func (s *BackgroundSet) Start(ctx context.Context, c Command) (BackgroundStatus,
 	if c.Shell {
 		name, args = shellCommand(c.Argv[0])
 	}
+	policy, trustedEnv := bindGoToolchain(c)
 	if c.Confine != nil {
-		wrapped, err := c.Confine.apply(c.Policy, append([]string{name}, args...))
+		wrapped, err := c.Confine.apply(policy, append([]string{name}, args...))
 		if err != nil {
 			// The same refusal Run makes, for the same reason: a sandbox that
 			// quietly fell back to running the command would leave the UI
@@ -148,6 +149,7 @@ func (s *BackgroundSet) Start(ctx context.Context, c Command) (BackgroundStatus,
 		envNetwork = NetworkLoopback
 	}
 	cmd.Env = commandEnv(envNetwork, c.ExtraEnv)
+	cmd.Env = append(cmd.Env, trustedEnv...)
 	out := newCapture(c.MaxOutput)
 	cmd.Stdout = out
 	cmd.Stderr = out

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 )
@@ -77,13 +78,25 @@ func CurrentWorkspaceAuthorityRoots() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolving launch workspace authority: %w", err)
 	}
+	accountHome := ""
+	if current, currentErr := user.Current(); currentErr == nil {
+		// os.UserHomeDir reads HOME on Unix. HOME is child-process input, not
+		// evidence that the launch directory is the user's actual home: a
+		// checkout can set it to itself before Switchboard starts. The account
+		// database is the authority for the narrow home-directory exception.
+		accountHome = current.HomeDir
+	}
+	return currentWorkspaceAuthorityRoots(cwd, accountHome)
+}
+
+func currentWorkspaceAuthorityRoots(cwd, accountHome string) ([]string, error) {
 	canonical, err := canonicalPath(cwd)
 	if err != nil {
 		return nil, fmt.Errorf("canonicalizing launch workspace authority: %w", err)
 	}
 	includePath := filepath.Dir(canonical) != canonical
-	if home, homeErr := os.UserHomeDir(); homeErr == nil && strings.TrimSpace(home) != "" {
-		if canonicalHome, homeCanonicalErr := canonicalPath(home); homeCanonicalErr == nil && samePath(canonical, canonicalHome) {
+	if strings.TrimSpace(accountHome) != "" {
+		if canonicalHome, homeCanonicalErr := canonicalPath(accountHome); homeCanonicalErr == nil && samePath(canonical, canonicalHome) {
 			includePath = false
 		}
 	}

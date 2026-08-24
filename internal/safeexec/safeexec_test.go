@@ -91,11 +91,6 @@ func TestWorkspaceAndCurrentAuthorityRootsRejectsLaunchCheckoutForDifferentTarge
 
 func TestCurrentAuthorityPreservesHomeLaunchUserInstall(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
-	if runtime.GOOS == "windows" {
-		t.Setenv("USERPROFILE", home)
-	}
-	t.Chdir(home)
 	bin := filepath.Join(home, ".local", "bin")
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
@@ -108,7 +103,9 @@ func TestCurrentAuthorityPreservesHomeLaunchUserInstall(t *testing.T) {
 	if err := os.WriteFile(path, []byte("user install"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	roots, err := WorkspaceAndCurrentAuthorityRoots(t.TempDir())
+	// Exercise the home exception with an explicit account-database value.
+	// Production deliberately does not derive this value from mutable HOME.
+	roots, err := currentWorkspaceAuthorityRoots(home, home)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,6 +119,32 @@ func TestCurrentAuthorityPreservesHomeLaunchUserInstall(t *testing.T) {
 	}
 	if resolved.Path() != want {
 		t.Fatalf("resolved path = %q, want %q", resolved.Path(), want)
+	}
+}
+
+func TestCurrentAuthorityDoesNotTrustForgedHome(t *testing.T) {
+	workspace := t.TempDir()
+	t.Chdir(workspace)
+	t.Setenv("HOME", workspace)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", workspace)
+		t.Setenv("HOMEDRIVE", filepath.VolumeName(workspace))
+		t.Setenv("HOMEPATH", strings.TrimPrefix(workspace, filepath.VolumeName(workspace)))
+	}
+
+	roots, err := CurrentWorkspaceAuthorityRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(workspace, "forged-home-helper")
+	if runtime.GOOS == "windows" {
+		path += ".exe"
+	}
+	if err := os.WriteFile(path, []byte("workspace authority"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolvePathOutside(path, roots...); !errors.Is(err, ErrUntrustedPath) {
+		t.Fatalf("forged-home executable error = %v, want ErrUntrustedPath", err)
 	}
 }
 

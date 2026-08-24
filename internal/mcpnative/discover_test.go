@@ -141,16 +141,73 @@ enabled = false
 	if err != nil {
 		t.Fatal(err)
 	}
-	normalized := strings.ReplaceAll(string(got), filepath.Clean(realWorkspace), "$WORKSPACE")
-	normalized = strings.ReplaceAll(normalized, filepath.Clean(workspace), "$WORKSPACE")
-	normalized = strings.ReplaceAll(normalized, filepath.Clean(realRoot), "$ROOT")
+	normalizeDiscoveryGolden(&result,
+		goldenPathReplacement{from: realWorkspace, to: "$WORKSPACE"},
+		goldenPathReplacement{from: workspace, to: "$WORKSPACE"},
+		goldenPathReplacement{from: realRoot, to: "$ROOT"},
+		goldenPathReplacement{from: root, to: "$ROOT"},
+	)
+	got, err = json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized := string(got)
 	want, err := os.ReadFile(filepath.Join("testdata", "discovery.golden.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if normalized != strings.TrimSpace(string(want)) {
+	wantText := strings.ReplaceAll(string(want), "\r\n", "\n")
+	if normalized != strings.TrimSpace(wantText) {
 		t.Fatalf("discovery golden mismatch\n--- got ---\n%s\n--- want ---\n%s", normalized, want)
 	}
+}
+
+type goldenPathReplacement struct {
+	from string
+	to   string
+}
+
+func normalizeDiscoveryGolden(result *Result, replacements ...goldenPathReplacement) {
+	normalize := func(value string) string {
+		original := value
+		for _, replacement := range replacements {
+			if replacement.from == "" {
+				continue
+			}
+			clean := filepath.Clean(replacement.from)
+			value = strings.ReplaceAll(value, clean, replacement.to)
+			value = strings.ReplaceAll(value, filepath.ToSlash(clean), replacement.to)
+		}
+		if value != original || strings.Contains(value, "$ROOT") || strings.Contains(value, "$WORKSPACE") {
+			return strings.ReplaceAll(value, `\`, "/")
+		}
+		return value
+	}
+	for i := range result.Servers {
+		server := &result.Servers[i]
+		server.Provenance.Path = normalize(server.Provenance.Path)
+		server.Provenance.RealPath = normalize(server.Provenance.RealPath)
+		server.Provenance.ConfigKey = normalize(server.Provenance.ConfigKey)
+		server.Provenance.PluginRoot = normalize(server.Provenance.PluginRoot)
+		for j := range server.Provenance.ContributingLayers {
+			layer := &server.Provenance.ContributingLayers[j]
+			layer.Path = normalize(layer.Path)
+			layer.RealPath = normalize(layer.RealPath)
+		}
+		server.TrustRoot = normalize(server.TrustRoot)
+	}
+	for i := range result.Diagnostics {
+		result.Diagnostics[i].Path = normalize(result.Diagnostics[i].Path)
+		result.Diagnostics[i].Message = normalize(result.Diagnostics[i].Message)
+	}
+	for i := range result.Quarantines {
+		result.Quarantines[i].Path = normalize(result.Quarantines[i].Path)
+	}
+}
+
+func quotedJSONString(value string) string {
+	raw, _ := json.Marshal(value)
+	return string(raw)
 }
 
 func TestSensitiveValueHasNoRenderingThatShowsItsValue(t *testing.T) {

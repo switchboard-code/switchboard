@@ -20,13 +20,12 @@ import (
 // or another session rooted at the same workspace to interleave a stale check
 // and publication.
 //
-// The map key is deliberately case-folded on every platform. A resolved path
-// retains the caller's spelling, and case-insensitive filesystems accept two
-// spellings for the same leaf; keying the lease by that spelling would let two
-// registries publish concurrently. Folding everywhere is conservative on a
-// case-sensitive volume (case-distinct files serialize) but does not merge
-// their contents or change which path is validated, opened, checkpointed, or
-// rendered to the user.
+// The map key is deliberately case-folded on every platform. Case-insensitive
+// filesystems accept two spellings for the same leaf; keying the lease by a
+// caller's presentation spelling would let two registries publish
+// concurrently. Folding everywhere is conservative on a case-sensitive
+// volume (case-distinct files serialize) but does not merge their contents or
+// change which path is validated, opened, checkpointed, or rendered.
 var pathLocks = struct {
 	sync.Mutex
 	locks map[string]*pathLock

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"unsafe"
 )
 
 func openWindowsMoveFixture(t *testing.T) (string, *os.Root, *ledgerImage, *os.Root) {
@@ -74,5 +75,24 @@ func TestMoveScheduleNoReplaceWindowsMovesExactOpenedImage(t *testing.T) {
 	}
 	if err := verifyLedgerImage(image, quarantine, migrationQuarantineEntry); err != nil {
 		t.Fatalf("quarantine does not hold exact opened image: %v", err)
+	}
+}
+
+func TestScheduleRenameInfoWindowsLayout(t *testing.T) {
+	wantRootOffset := uintptr(4)
+	wantNameOffset := uintptr(12)
+	if unsafe.Sizeof(uintptr(0)) == 8 {
+		wantRootOffset = 8
+		wantNameOffset = 20
+	}
+	var info scheduleRenameInfo
+	if got := unsafe.Offsetof(info.ReplaceIfExists); got != 0 {
+		t.Fatalf("FILE_RENAME_INFORMATION ReplaceIfExists offset = %d, want 0", got)
+	}
+	if got := unsafe.Offsetof(info.RootDirectory); got != wantRootOffset {
+		t.Fatalf("FILE_RENAME_INFORMATION RootDirectory offset = %d, want %d", got, wantRootOffset)
+	}
+	if got := unsafe.Offsetof(info.FileName); got != wantNameOffset {
+		t.Fatalf("FILE_RENAME_INFORMATION FileName offset = %d, want %d", got, wantNameOffset)
 	}
 }

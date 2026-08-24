@@ -16,8 +16,20 @@ var (
 		Mechanism:        execution.MechanismSeatbelt,
 		MechanismPresent: true,
 	}
-	verifiedSandbox = execution.TestingVerifiedCapability()
+	verifiedSandbox = reviewerCapableSandbox()
 )
+
+// reviewerCapableSandbox is a platform-stable fixture for the generic policy
+// tests. TestingVerifiedCapability deliberately reports the build host, but a
+// real Windows host keeps auto execution with the human until descendant
+// process cleanup is enforceable. Tests of that boundary use an explicit
+// Windows capability below; the rest need to exercise the reviewer path on
+// every CI operating system.
+func reviewerCapableSandbox() execution.Capability {
+	capability := execution.TestingVerifiedCapability()
+	capability.Platform = "linux"
+	return capability
+}
 
 func read() Request  { return Request{Tool: "read", Effect: EffectRead, Path: "main.go"} }
 func write() Request { return Request{Tool: "edit", Effect: EffectWrite, Path: "main.go"} }

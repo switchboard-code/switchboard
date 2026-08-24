@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -210,9 +211,24 @@ func TestDurableUndoRecoveryRevalidatesRootAfterPublicationCallback(t *testing.T
 	fixture := newDurableUndoFixture(t)
 	releaseDurableUndoFixture(t, fixture)
 	moved := fixture.workspace + ".during-publication"
+	boundBefore, err := os.Stat(fixture.workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retargetPrevented := false
 	recovery, err := RecoverDurableUndo(fixture.journalDir, fixture.workspace, func(string, string) (bool, error) {
-		if err := os.Rename(fixture.workspace, moved); err != nil {
-			return false, err
+		if renameErr := os.Rename(fixture.workspace, moved); renameErr != nil {
+			if !openDirectoryRetargetPrevented(renameErr) {
+				return false, renameErr
+			}
+			boundAfter, statErr := os.Stat(fixture.workspace)
+			_, movedErr := os.Lstat(moved)
+			if statErr != nil || !errors.Is(movedErr, fs.ErrNotExist) || !os.SameFile(boundBefore, boundAfter) {
+				return false, errors.Join(statErr, movedErr,
+					errors.New("Windows retry-workspace retarget refusal did not retain the bound identity"))
+			}
+			retargetPrevented = true
+			return true, nil
 		}
 		if err := os.Mkdir(fixture.workspace, 0o755); err != nil {
 			return false, err
@@ -220,6 +236,18 @@ func TestDurableUndoRecoveryRevalidatesRootAfterPublicationCallback(t *testing.T
 		write(t, fixture.target, "replacement workspace")
 		return true, nil
 	})
+	if retargetPrevented {
+		if err != nil || !recovery.Found || !recovery.Published {
+			t.Fatalf("Windows retry-workspace retarget refusal recovery = %+v, %v", recovery, err)
+		}
+		if got := readBack(t, fixture.target); got != "after" {
+			t.Fatalf("Windows retry-workspace retarget refusal changed target to %q", got)
+		}
+		if _, statErr := os.Lstat(filepath.Join(fixture.journalDir, durableUndoJournalName)); !errors.Is(statErr, fs.ErrNotExist) {
+			t.Fatalf("published retry journal remains after Windows retarget refusal: %v", statErr)
+		}
+		return
+	}
 	if !errors.Is(err, ErrStale) {
 		t.Fatalf("post-callback workspace swap error = %v, want ErrStale", err)
 	}

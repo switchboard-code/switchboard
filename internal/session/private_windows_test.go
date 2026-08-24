@@ -119,6 +119,14 @@ func TestWindowsNewStoreRepairsLegacyBroadArtifactDACLs(t *testing.T) {
 	assertWindowsPrivateSessionFile(t, journal)
 }
 
+func TestWindowsNewStoreNormalizesOrdinaryTokenOwnedRoot(t *testing.T) {
+	root := t.TempDir()
+	if _, err := NewStore(root); err != nil {
+		t.Fatal(err)
+	}
+	assertWindowsPrivateSessionDirectory(t, root)
+}
+
 func TestWindowsSessionPrivacyMigrationInventoryIsBounded(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	if err := ensurePrivateSessionDirectory(root); err != nil {

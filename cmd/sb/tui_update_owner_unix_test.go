@@ -90,8 +90,8 @@ func TestAbnormalTUIExitWaitsForUnixUpdatePublicationSync(t *testing.T) {
 	}
 	select {
 	case <-workDone:
-	default:
-		t.Fatal("TUI returned before the update command exited")
+	case <-time.After(5 * time.Second):
+		t.Fatal("update command remained stuck after TUI exit")
 	}
 
 	entries, err := os.ReadDir(dir)

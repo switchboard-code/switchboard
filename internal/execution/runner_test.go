@@ -298,7 +298,7 @@ func TestScrubbedChildEnvironmentDropsLoaderInjection(t *testing.T) {
 		"PHP_INI_SCAN_DIR": "/workspace/php.d", "VLC_PLUGIN_PATH": "/workspace/vlc",
 		"OPENSSL_CONF": "/workspace/openssl.cnf", "OPENSSL_CONF_INCLUDE": "/workspace/openssl.d",
 		"OPENSSL_MODULES": "/workspace/openssl-modules", "OPENSSL_ENGINES": "/workspace/openssl-engines",
-		"NODE_OPTIONS": "--require=/workspace/evil.js", "NODE_PATH": "/workspace/node",
+		"NODE_OPTIONS": "--require=/workspace/evil.js", "NODE_PATH": "/workspace/node", "GOROOT": "/workspace/go",
 		"PYTHONPATH": "/workspace/python", "PYTHONHOME": "/workspace/python-home", "PYTHONSTARTUP": "/workspace/startup.py",
 		"PYTHONUSERBASE": "/workspace/python-user-base",
 		"PERL5OPT":       "-M/workspace/evil.pm", "PERL5LIB": "/workspace/perl",
@@ -327,7 +327,7 @@ func TestScrubbedChildEnvironmentDropsLoaderInjection(t *testing.T) {
 		"LUA_PATH", "LUA_CPATH", "TCLLIBPATH", "TCL_LIBRARY", "TK_LIBRARY",
 		"PHPRC", "PHP_INI_SCAN_DIR", "VLC_PLUGIN_PATH",
 		"OPENSSL_CONF", "OPENSSL_CONF_INCLUDE", "OPENSSL_MODULES", "OPENSSL_ENGINES",
-		"NODE_OPTIONS", "NODE_PATH", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE",
+		"NODE_OPTIONS", "NODE_PATH", "GOROOT", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE",
 		"PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB",
 		"GEM_HOME", "GEM_PATH",
 		"JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS", "CLASSPATH",
@@ -337,6 +337,98 @@ func TestScrubbedChildEnvironmentDropsLoaderInjection(t *testing.T) {
 			t.Fatalf("scrubbed child environment retained %s", key)
 		}
 	}
+}
+
+func TestRunBindsGOROOTFromSelectedGoExecutable(t *testing.T) {
+	root := fakeGoToolchain(t, t.TempDir())
+	workspace := t.TempDir()
+	t.Setenv("PATH", filepath.Join(root, "bin"))
+	t.Setenv("GOROOT", filepath.Join(workspace, "attacker-controlled-go"))
+
+	res, err := Run(context.Background(), Command{
+		Argv:   []string{"go"},
+		Dir:    workspace,
+		Policy: Policy{Workspace: workspace},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(res.Output); got != root {
+		t.Fatalf("bound GOROOT = %q, want selected toolchain root %q", got, root)
+	}
+}
+
+func TestRunDoesNotBindWorkspaceGoOrAmbientGOROOT(t *testing.T) {
+	workspace := t.TempDir()
+	root := fakeGoToolchain(t, filepath.Join(workspace, "toolchain"))
+	t.Setenv("PATH", filepath.Join(root, "bin"))
+	t.Setenv("GOROOT", filepath.Join(workspace, "attacker-controlled-go"))
+
+	res, err := Run(context.Background(), Command{
+		Argv:   []string{"go"},
+		Dir:    workspace,
+		Policy: Policy{Workspace: workspace},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(res.Output); got != "unset" {
+		t.Fatalf("workspace Go observed GOROOT %q, want ambient value removed and no binding", got)
+	}
+}
+
+func TestGoToolchainUnderHomeGetsOneExactReadOnlyBinding(t *testing.T) {
+	home, err := accountHomeDir()
+	if err != nil {
+		t.Skipf("home directory unavailable: %v", err)
+	}
+	dir, err := os.MkdirTemp(home, ".switchboard-goroot-test-")
+	if err != nil {
+		t.Skipf("cannot create toolchain fixture under home: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	root := fakeGoToolchain(t, dir)
+	workspace := t.TempDir()
+	t.Setenv("HOME", workspace)
+	t.Setenv("PATH", filepath.Join(root, "bin"))
+
+	policy, environ := bindGoToolchain(Command{
+		Argv:   []string{"go"},
+		Dir:    workspace,
+		Policy: Policy{Workspace: workspace},
+	})
+	if len(environ) != 1 || environ[0] != "GOROOT="+root {
+		t.Fatalf("trusted environment = %q, want exact selected GOROOT", environ)
+	}
+	if len(policy.readOnlyRoots) != 1 || policy.readOnlyRoots[0] != root {
+		t.Fatalf("read-only roots = %q, want only %q", policy.readOnlyRoots, root)
+	}
+}
+
+func fakeGoToolchain(t *testing.T, root string) string {
+	t.Helper()
+	for _, directory := range []string{
+		filepath.Join(root, "bin"),
+		filepath.Join(root, "src", "runtime"),
+		filepath.Join(root, "pkg", "tool", runtime.GOOS+"_"+runtime.GOARCH),
+	} {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	goPath := filepath.Join(root, "bin", "go")
+	if err := os.WriteFile(goPath, []byte("#!/bin/sh\nprintf '%s\\n' \"${GOROOT:-unset}\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	compile := filepath.Join(root, "pkg", "tool", runtime.GOOS+"_"+runtime.GOARCH, "compile")
+	if err := os.WriteFile(compile, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
 }
 
 func TestCommandOutputUsesTheFixedChildEnvironment(t *testing.T) {

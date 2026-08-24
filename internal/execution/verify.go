@@ -77,7 +77,7 @@ func newSelfTestEnv() (*selfTestEnv, func(), error) {
 		return nil, nil, err
 	}
 
-	home, err := os.UserHomeDir()
+	home, err := accountHomeDir()
 	if err != nil {
 		cleanup()
 		return nil, nil, err
@@ -207,7 +207,7 @@ func cachedVerification(profileKey, hostKey string, run func() (bool, string)) (
 }
 
 func checkCachePath() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := accountHomeDir()
 	if err != nil {
 		return "", err
 	}

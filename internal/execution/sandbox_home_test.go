@@ -3,6 +3,7 @@
 package execution
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,5 +87,54 @@ func TestAllowlistedHomePathsStillWork(t *testing.T) {
 	}
 	if res := runConfined(t, ws, NetworkLoopback, []string{"/bin/cat", probe}, false); res.ExitCode != 0 {
 		t.Errorf("the workspace is unreadable from inside the sandbox: %s", res.Output)
+	}
+}
+
+func TestNestedCredentialSymlinkIsNotReopened(t *testing.T) {
+	home, err := accountHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cargo := filepath.Join(home, ".cargo")
+	createdCargo := false
+	if info, err := os.Lstat(cargo); errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(cargo, 0o700); err != nil {
+			t.Skipf("cannot stage .cargo under account home: %v", err)
+		}
+		createdCargo = true
+	} else if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		t.Skipf("account .cargo is not a real directory: %v", err)
+	}
+	if createdCargo {
+		t.Cleanup(func() { _ = os.Remove(cargo) })
+	}
+
+	var credential string
+	for _, name := range []string{"credentials", "credentials.toml"} {
+		candidate := filepath.Join(cargo, name)
+		if _, err := os.Lstat(candidate); errors.Is(err, os.ErrNotExist) {
+			credential = candidate
+			break
+		}
+	}
+	if credential == "" {
+		t.Skip("both cargo credential paths already exist; refusing to replace user state")
+	}
+	outside := filepath.Join(t.TempDir(), "outside-credential")
+	if err := os.WriteFile(outside, []byte(canaryToken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, credential); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(credential) })
+
+	// Use the account home as the functional home too. This exercises the
+	// persistent-cache path where .cargo would otherwise be reopened wholesale.
+	t.Setenv("HOME", home)
+	workspace := workspaceFor(t)
+	res := runConfined(t, workspace, NetworkLoopback, []string{"/bin/cat", credential}, false)
+	if res.ExitCode == 0 || strings.Contains(res.Output, canaryToken) {
+		t.Fatalf("nested credential symlink escaped the home deny: exit=%d output=%q", res.ExitCode, res.Output)
 	}
 }

@@ -241,7 +241,7 @@ func securePrivateSessionWindowsObject(f *os.File, directory bool) error {
 	if err := verifyPrivateSessionWindowsKind(f, directory); err != nil {
 		return err
 	}
-	owned, err := privateSessionWindowsObjectIsCurrentUserOwner(f)
+	owned, err := fileprivacy.IsOwnedByCurrentTokenAuthority(f)
 	if err != nil {
 		return fmt.Errorf("checking private session object owner: %w", err)
 	}

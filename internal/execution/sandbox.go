@@ -20,6 +20,12 @@ const (
 type Policy struct {
 	Workspace string
 	Network   NetworkAccess
+
+	// readOnlyRoots are exact, identity-derived toolchain roots that sit below
+	// a home directory the sandbox otherwise hides. They are populated only by
+	// this package after resolving the executable outside workspace authority;
+	// callers cannot widen the sandbox with an environment variable.
+	readOnlyRoots []string
 }
 
 // Confinement wraps a command so the operating system confines it.

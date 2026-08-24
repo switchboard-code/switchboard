@@ -56,7 +56,7 @@ func TestLoadTurnReviewRepresentsTextFileStates(t *testing.T) {
 			after:  checkpoint.FileState{Existed: true, Mode: 0o644, Content: []byte("new\n")},
 			kind:   turnReviewCreated,
 			renderWant: []string{
-				"new file mode 100644", "--- /dev/null", "+++ b/file.txt", "+new",
+				"new file mode " + turnReviewModeString(testRecordedMode(0o644)), "--- /dev/null", "+++ b/file.txt", "+new",
 			},
 		},
 		{
@@ -74,7 +74,7 @@ func TestLoadTurnReviewRepresentsTextFileStates(t *testing.T) {
 			after:  checkpoint.FileState{},
 			kind:   turnReviewDeleted,
 			renderWant: []string{
-				"deleted file mode 100600", "--- a/file.txt", "+++ /dev/null", "-gone",
+				"deleted file mode " + turnReviewModeString(testRecordedMode(0o600)), "--- a/file.txt", "+++ /dev/null", "-gone",
 			},
 		},
 		{
@@ -83,7 +83,7 @@ func TestLoadTurnReviewRepresentsTextFileStates(t *testing.T) {
 			after:  checkpoint.FileState{Existed: true, Mode: 0o644, Content: []byte{}},
 			kind:   turnReviewCreated,
 			renderWant: []string{
-				"new file mode 100644", "empty file created",
+				"new file mode " + turnReviewModeString(testRecordedMode(0o644)), "empty file created",
 			},
 		},
 		{
@@ -127,6 +127,19 @@ func TestLoadTurnReviewRepresentsTextFileStates(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testRecordedMode(mode fs.FileMode) fs.FileMode {
+	if runtime.GOOS == "windows" {
+		if mode == 0 {
+			return 0
+		}
+		if mode.Perm()&0o222 == 0 {
+			return 0o444
+		}
+		return 0o666
+	}
+	return mode & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky)
 }
 
 func TestLoadTurnReviewRepresentsModeOnlyChange(t *testing.T) {

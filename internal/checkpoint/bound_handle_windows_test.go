@@ -776,14 +776,22 @@ func TestRetireBoundOpenFileToWindowsPreservesOccupiedSink(t *testing.T) {
 	}
 }
 
-func TestFileRenameInfoWindowsLayout(t *testing.T) {
+func TestFileRenameInformationWindowsLayout(t *testing.T) {
+	wantRootOffset := uintptr(4)
 	wantOffset := uintptr(12)
 	if unsafe.Sizeof(uintptr(0)) == 8 {
+		wantRootOffset = 8
 		wantOffset = 20
 	}
 	var info fileRenameInfoWindows
+	if got := unsafe.Offsetof(info.ReplaceIfExists); got != 0 {
+		t.Fatalf("FILE_RENAME_INFORMATION ReplaceIfExists offset = %d, want 0", got)
+	}
+	if got := unsafe.Offsetof(info.RootDirectory); got != wantRootOffset {
+		t.Fatalf("FILE_RENAME_INFORMATION RootDirectory offset = %d, want %d", got, wantRootOffset)
+	}
 	if got := unsafe.Offsetof(info.FileName); got != wantOffset {
-		t.Fatalf("FILE_RENAME_INFO FileName offset = %d, want %d", got, wantOffset)
+		t.Fatalf("FILE_RENAME_INFORMATION FileName offset = %d, want %d", got, wantOffset)
 	}
 }
 

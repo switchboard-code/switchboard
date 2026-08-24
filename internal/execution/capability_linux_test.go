@@ -7,6 +7,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func testBubblewrapFixture(t *testing.T) (bubblewrapExecutable, string, string) {
@@ -252,4 +255,158 @@ func TestBubblewrapEndsOptionsBeforeModelArgv(t *testing.T) {
 	if !slices.Equal(wrapperArgv[commandAt:], modelArgv) {
 		t.Fatalf("model argv changed: got %q, want %q", wrapperArgv[commandAt:], modelArgv)
 	}
+}
+
+func TestBubblewrapReopensOnlyBoundToolchainRoot(t *testing.T) {
+	bwrap, root, _ := testBubblewrapFixture(t)
+	toolchain := filepath.Join(root, "toolchain")
+	if err := os.Mkdir(toolchain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wrapperArgv, err := bwrap.wrap(Policy{
+		Workspace:     root,
+		Network:       NetworkLoopback,
+		readOnlyRoots: []string{toolchain},
+	}, []string{"/bin/true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"--ro-bind", toolchain, toolchain}
+	if !containsArgvSequence(wrapperArgv, want) {
+		t.Fatalf("wrapper argv omitted bound toolchain root %q: %q", toolchain, wrapperArgv)
+	}
+}
+
+func TestBubblewrapProtectsAccountHomeWhenHOMEIsWorkspace(t *testing.T) {
+	account, err := accountHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	workspace, err = filepath.EvalSymlinks(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sensitive, err := os.MkdirTemp(account, ".switchboard-home-alias-target-")
+	if err != nil {
+		t.Skipf("cannot stage account-home alias target: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sensitive) })
+	readAlias := filepath.Join(workspace, ".asdf")
+	writeAlias := filepath.Join(workspace, "go")
+	if err := os.Symlink(sensitive, readAlias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(sensitive, writeAlias); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", workspace)
+
+	argv, err := wrapBubblewrap("/usr/bin/bwrap", Policy{
+		Workspace: workspace,
+		Network:   NetworkLoopback,
+	}, []string{"/bin/true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsArgvSequence(argv, []string{"--tmpfs", account}) {
+		t.Fatalf("wrapper did not hide canonical account home %q: %q", account, argv)
+	}
+	if !containsArgvSequence(argv, []string{"--tmpfs", workspace}) {
+		t.Fatalf("wrapper did not close distinct ambient home %q: %q", workspace, argv)
+	}
+	if !containsArgvSequence(argv, []string{"--bind", workspace, workspace}) {
+		t.Fatalf("wrapper did not reopen the selected workspace %q: %q", workspace, argv)
+	}
+	if containsArgvSequence(argv, []string{"--remount-ro", workspace}) {
+		t.Fatalf("wrapper made the selected workspace read-only: %q", argv)
+	}
+	if containsArgvSequence(argv, []string{"--ro-bind", readAlias, readAlias}) {
+		t.Fatalf("wrapper reopened checkout symlink alias %q into the account home: %q", readAlias, argv)
+	}
+	if containsArgvSequence(argv, []string{"--bind", filepath.Join(workspace, "go", "pkg", "mod"), filepath.Join(workspace, "go", "pkg", "mod")}) {
+		t.Fatalf("wrapper persisted a writable cache through checkout symlink %q: %q", writeAlias, argv)
+	}
+	if _, err := os.Stat(filepath.Join(sensitive, "pkg")); !os.IsNotExist(err) {
+		t.Fatalf("constructing the wrapper mutated symlink target: %v", err)
+	}
+}
+
+func TestPreparingWritableCachesRejectsReplacementFIFOWithoutBlocking(t *testing.T) {
+	parent := t.TempDir()
+	home := filepath.Join(parent, "home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(home, home+"-moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(home, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := prepareWritableHomeCaches(home)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("replacement FIFO was accepted as a cache root")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("opening a replacement FIFO as a cache root blocked")
+	}
+}
+
+func TestResolvedCredentialTargetIsMaskedAfterExactReopen(t *testing.T) {
+	home := t.TempDir()
+	credentialDir := filepath.Join(home, ".cargo")
+	goRoot := filepath.Join(home, ".asdf", "go")
+	if err := os.MkdirAll(credentialDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(goRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(goRoot, "credential")
+	if err := os.WriteFile(target, []byte(canaryToken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(credentialDir, "credentials")); err != nil {
+		t.Fatal(err)
+	}
+
+	flags, err := linuxResolvedSecretFlags(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"--ro-bind", os.DevNull, target}
+	if !containsArgvSequence(flags, want) {
+		t.Fatalf("resolved target flags %q omit final mask %q", flags, want)
+	}
+
+	argv := append([]string{"--ro-bind", goRoot, goRoot}, flags...)
+	reopenAt, maskAt := -1, -1
+	for i := range argv {
+		if i+2 < len(argv) && slices.Equal(argv[i:i+3], []string{"--ro-bind", goRoot, goRoot}) {
+			reopenAt = i
+		}
+		if i+2 < len(argv) && slices.Equal(argv[i:i+3], want) {
+			maskAt = i
+		}
+	}
+	if reopenAt < 0 || maskAt <= reopenAt {
+		t.Fatalf("credential mask must follow exact root reopen: argv=%q", argv)
+	}
+}
+
+func containsArgvSequence(argv, want []string) bool {
+	for i := 0; i+len(want) <= len(argv); i++ {
+		if slices.Equal(argv[i:i+len(want)], want) {
+			return true
+		}
+	}
+	return false
 }

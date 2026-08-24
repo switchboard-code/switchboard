@@ -18,14 +18,17 @@ import (
 
 var reOpenFileWindows = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReOpenFile")
 
-// fileRenameInfoWindows is FILE_RENAME_INFO's FileRenameInfoEx layout. The
-// first union member is a DWORD for the Ex information class. Go supplies the
-// architecture-specific padding before RootDirectory.
+// fileRenameInfoWindows is FILE_RENAME_INFORMATION's legacy no-replace
+// layout. Go supplies the architecture-specific padding between the BOOLEAN
+// and RootDirectory. The extended information class is deliberately not used:
+// some supported Windows kernels reject FileRenameInformationEx when its flags
+// are zero, while zero flags are exactly the legacy no-replace operation this
+// package needs.
 type fileRenameInfoWindows struct {
-	Flags          uint32
-	RootDirectory  windows.Handle
-	FileNameLength uint32
-	FileName       [1]uint16
+	ReplaceIfExists byte
+	RootDirectory   windows.Handle
+	FileNameLength  uint32
+	FileName        [1]uint16
 }
 
 type fileDispositionInfoExWindows struct {
@@ -304,28 +307,29 @@ func probeWindowsRetirementPrimitives(root *os.Root) (err error) {
 	}
 	defer func() { err = errors.Join(err, directory.Close()) }()
 
-	// A zero Flags field in FileRenameInfoEx is a no-replace request. First
-	// prove that an occupied exact destination is retained, then prove that the
-	// same call succeeds and flushes when its destination is absent.
+	// A false ReplaceIfExists field in FileRenameInformation is a no-replace
+	// request. First prove that an occupied exact destination is retained, then
+	// prove that the same call succeeds and flushes when its destination is
+	// absent.
 	published, collisionErr := renameMutationHandleWindows(
 		root, root, source.opened, source.mutation, windows.Handle(directory.Fd()), source.name, occupied.name,
 	)
 	if published || collisionErr == nil {
 		return errors.Join(collisionErr,
-			errors.New("FileRenameInfoEx did not refuse an occupied no-replace destination"))
+			errors.New("FileRenameInformation did not refuse an occupied no-replace destination"))
 	}
 	if err := requireBoundNameWindows(root, source.name, source.opened); err != nil {
-		return fmt.Errorf("FileRenameInfoEx changed its source on a no-replace collision: %w", err)
+		return fmt.Errorf("FileRenameInformation changed its source on a no-replace collision: %w", err)
 	}
 	if err := requireBoundNameWindows(root, occupied.name, occupied.opened); err != nil {
-		return fmt.Errorf("FileRenameInfoEx replaced an occupied no-replace destination: %w", err)
+		return fmt.Errorf("FileRenameInformation replaced an occupied no-replace destination: %w", err)
 	}
 
 	published, renameErr := renameMutationHandleWindows(
 		root, root, source.opened, source.mutation, windows.Handle(directory.Fd()), source.name, destination,
 	)
 	if !published || renameErr != nil {
-		return errors.Join(renameErr, errors.New("FileRenameInfoEx no-replace probe failed"))
+		return errors.Join(renameErr, errors.New("FileRenameInformation no-replace probe failed"))
 	}
 	source.name = destination
 	if err := flushMutationHandleWindows(source.mutation, "Windows retirement capability rename"); err != nil {
@@ -333,7 +337,7 @@ func probeWindowsRetirementPrimitives(root *os.Root) (err error) {
 	}
 	runtime.KeepAlive(directory)
 	if err := requireBoundNameWindows(root, destination, source.opened); err != nil {
-		return fmt.Errorf("FileRenameInfoEx published an unexpected inode: %w", err)
+		return fmt.Errorf("FileRenameInformation published an unexpected inode: %w", err)
 	}
 
 	if err := disposeMutationHandleWindows(source.opened, &source.mutation, false); err != nil {
@@ -971,12 +975,15 @@ func renameMutationHandleWindows(sourceRoot, destinationRoot *os.Root, opened *o
 	}
 	encoded = encoded[:len(encoded)-1]
 	var layout fileRenameInfoWindows
-	offset := unsafe.Offsetof(layout.FileName)
 	length := uintptr(len(encoded)) * unsafe.Sizeof(uint16(0))
-	if offset+length > uintptr(^uint32(0)) {
+	bufferLength := unsafe.Sizeof(layout) + length
+	if bufferLength > uintptr(^uint32(0)) {
 		return false, errors.New("checkpoint rename destination is too long")
 	}
-	buffer := make([]byte, offset+length)
+	// FileNameLength excludes the terminator. Keep one in the allocation even
+	// though the NT contract does not require it: filesystem filters in the
+	// rename stack have historically inspected FileName as a terminated string.
+	buffer := make([]byte, bufferLength)
 	info := (*fileRenameInfoWindows)(unsafe.Pointer(&buffer[0]))
 	info.RootDirectory = directory
 	info.FileNameLength = uint32(length)
@@ -986,7 +993,17 @@ func renameMutationHandleWindows(sourceRoot, destinationRoot *os.Root, opened *o
 			return false, hookErr
 		}
 	}
-	renameErr := windows.SetFileInformationByHandle(file, windows.FileRenameInfoEx, &buffer[0], uint32(len(buffer)))
+	renameErr := windows.NtSetInformationFile(
+		file,
+		&windows.IO_STATUS_BLOCK{},
+		&buffer[0],
+		uint32(len(buffer)),
+		windows.FileRenameInformation,
+	)
+	runtime.KeepAlive(buffer)
+	if status, ok := renameErr.(windows.NTStatus); ok {
+		renameErr = status.Errno()
+	}
 	if renameErr == nil {
 		return true, nil
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -532,7 +533,7 @@ func TestOpenInWorkspaceRefusesAnotherWorkspacesSessionWithoutMutation(t *testin
 	if opened, err := store.OpenInWorkspace(id, selectedWorkspace); err == nil {
 		opened.Close()
 		t.Fatal("OpenInWorkspace adopted a transcript into the wrong tool workspace")
-	} else if !strings.Contains(err.Error(), recordedWorkspace) || !strings.Contains(err.Error(), "-workspace") {
+	} else if !strings.Contains(err.Error(), strconv.Quote(recordedWorkspace)) || !strings.Contains(err.Error(), "-workspace") {
 		t.Fatalf("workspace refusal does not explain how to resume safely: %v", err)
 	}
 	after, err := os.ReadFile(path)

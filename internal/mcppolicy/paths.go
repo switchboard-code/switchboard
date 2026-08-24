@@ -70,9 +70,9 @@ func ResolvePaths(options Options) (Paths, error) {
 	case "darwin":
 		result.CodexRequirements = "/etc/codex/requirements.toml"
 		claudeSystem := "/Library/Application Support/ClaudeCode"
-		result.ClaudeManagedSettings = filepath.Join(claudeSystem, "managed-settings.json")
-		result.ClaudeManagedDropIns = filepath.Join(claudeSystem, "managed-settings.d")
-		result.ClaudeManagedMCP = filepath.Join(claudeSystem, "managed-mcp.json")
+		result.ClaudeManagedSettings = joinPlatform(goos, claudeSystem, "managed-settings.json")
+		result.ClaudeManagedDropIns = joinPlatform(goos, claudeSystem, "managed-settings.d")
+		result.ClaudeManagedMCP = joinPlatform(goos, claudeSystem, "managed-mcp.json")
 		name := strings.TrimSpace(options.UserName)
 		if name == "" {
 			if current, currentErr := user.Current(); currentErr == nil {
@@ -84,17 +84,17 @@ func ResolvePaths(options Options) (Paths, error) {
 	default:
 		result.CodexRequirements = "/etc/codex/requirements.toml"
 		claudeSystem := "/etc/claude-code"
-		result.ClaudeManagedSettings = filepath.Join(claudeSystem, "managed-settings.json")
-		result.ClaudeManagedDropIns = filepath.Join(claudeSystem, "managed-settings.d")
-		result.ClaudeManagedMCP = filepath.Join(claudeSystem, "managed-mcp.json")
+		result.ClaudeManagedSettings = joinPlatform(goos, claudeSystem, "managed-settings.json")
+		result.ClaudeManagedDropIns = joinPlatform(goos, claudeSystem, "managed-settings.d")
+		result.ClaudeManagedMCP = joinPlatform(goos, claudeSystem, "managed-mcp.json")
 	}
 	return result, nil
 }
 
 func managedPreferencePaths(userName, domain string) []string {
-	paths := []string{filepath.Join("/Library/Managed Preferences", domain+".plist")}
+	paths := []string{path.Join("/Library/Managed Preferences", domain+".plist")}
 	if userName != "" && !strings.ContainsAny(userName, `/\\`) {
-		paths = append([]string{filepath.Join("/Library/Managed Preferences", userName, domain+".plist")}, paths...)
+		paths = append([]string{path.Join("/Library/Managed Preferences", userName, domain+".plist")}, paths...)
 	}
 	return paths
 }
@@ -123,6 +123,17 @@ func absoluteCleanPlatform(goos, value string) (string, error) {
 		}
 		return strings.ReplaceAll(path.Clean(converted), "/", `\`), nil
 	}
+	// ResolvePaths describes the requested target platform, which may differ
+	// from the host running discovery or its tests. POSIX targets therefore use
+	// path rather than filepath so a Windows host cannot rewrite /home into a
+	// drive-qualified path or introduce backslashes into Linux/macOS policy
+	// surfaces.
+	if goos != "" {
+		if !path.IsAbs(value) {
+			return "", fmt.Errorf("path is not absolute")
+		}
+		return path.Clean(value), nil
+	}
 	abs, err := filepath.Abs(value)
 	if err != nil {
 		return "", fmt.Errorf("path cannot be made absolute")
@@ -131,8 +142,11 @@ func absoluteCleanPlatform(goos, value string) (string, error) {
 }
 
 func joinPlatform(goos string, elements ...string) string {
-	if goos != "windows" {
+	if goos == "" {
 		return filepath.Join(elements...)
+	}
+	if goos != "windows" {
+		return path.Join(elements...)
 	}
 	if len(elements) == 0 {
 		return ""

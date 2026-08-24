@@ -52,18 +52,46 @@ func TestResolveGoldenAndDeterministic(t *testing.T) {
 		t.Fatalf("disabled Codex catalog inventory was marked native-enabled: %#v", off)
 	}
 
+	normalizeNativeGoldenResult(&result, root)
 	raw, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		t.Fatal(err)
 	}
-	actual := strings.ReplaceAll(string(raw), filepath.ToSlash(root), "$ROOT") + "\n"
+	actual := string(raw) + "\n"
 	goldenPath := filepath.Join("testdata", "resolve.golden.json")
 	expected, err := os.ReadFile(goldenPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if actual != string(expected) {
+	expectedText := strings.ReplaceAll(string(expected), "\r\n", "\n")
+	if actual != expectedText {
 		t.Fatalf("golden mismatch (-want +got):\nwant:\n%s\ngot:\n%s", expected, actual)
+	}
+}
+
+func normalizeNativeGoldenResult(result *Result, root string) {
+	normalize := func(value string) string {
+		replaced := strings.ReplaceAll(value, filepath.Clean(root), "$ROOT")
+		replaced = strings.ReplaceAll(replaced, filepath.ToSlash(filepath.Clean(root)), "$ROOT")
+		if replaced != value || strings.Contains(replaced, "$ROOT") {
+			return strings.ReplaceAll(replaced, `\`, "/")
+		}
+		return value
+	}
+	for i := range result.Candidates {
+		candidate := &result.Candidates[i]
+		candidate.Candidate.Root = normalize(candidate.Candidate.Root)
+		candidate.Provenance.EnablementPath = normalize(candidate.Provenance.EnablementPath)
+		candidate.Provenance.RegistryPath = normalize(candidate.Provenance.RegistryPath)
+		candidate.Provenance.MarketplacePath = normalize(candidate.Provenance.MarketplacePath)
+		candidate.Provenance.ProjectPath = normalize(candidate.Provenance.ProjectPath)
+	}
+	for i := range result.Diagnostics {
+		result.Diagnostics[i].Path = normalize(result.Diagnostics[i].Path)
+		result.Diagnostics[i].Message = normalize(result.Diagnostics[i].Message)
+	}
+	for i := range result.ManagedPluginConstraints {
+		result.ManagedPluginConstraints[i].Path = normalize(result.ManagedPluginConstraints[i].Path)
 	}
 }
 
@@ -940,7 +968,6 @@ func buildGoldenFixture(t *testing.T) (string, Options) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root = filepath.ToSlash(root)
 	userRoot := filepath.Join(root, "codex-user")
 	workspace := filepath.Join(root, "workspace")
 	otherProject := filepath.Join(root, "other-project")

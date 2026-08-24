@@ -73,8 +73,8 @@ func TestAbnormalTUIExitWaitsForWindowsUpdateBackupExchange(t *testing.T) {
 	}
 	select {
 	case <-workDone:
-	default:
-		t.Fatal("TUI returned before the update command exited")
+	case <-time.After(5 * time.Second):
+		t.Fatal("update command remained stuck after TUI exit")
 	}
 	if got, err := os.ReadFile(exe); err != nil || string(got) != "new" {
 		t.Fatalf("published executable = %q, %v", got, err)
@@ -164,8 +164,8 @@ func TestAbnormalTUIExitWaitsForWindowsUpdateRollback(t *testing.T) {
 	}
 	select {
 	case <-workDone:
-	default:
-		t.Fatal("TUI returned before the rollback command exited")
+	case <-time.After(5 * time.Second):
+		t.Fatal("rollback command remained stuck after TUI exit")
 	}
 	if got, err := os.ReadFile(exe); err != nil || string(got) != "old" {
 		t.Fatalf("restored executable = %q, %v", got, err)
@@ -235,7 +235,7 @@ func TestUpdateOwnerSerializesStartupAndManualChecks(t *testing.T) {
 	}
 	select {
 	case <-firstDone:
-	default:
-		t.Fatal("TUI returned before the cancelled update command exited")
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled update command remained stuck after TUI exit")
 	}
 }

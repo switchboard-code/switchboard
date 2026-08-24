@@ -265,7 +265,7 @@ func TestClaudeProjectDenialsApplyAfterPrecedence(t *testing.T) {
 	mustWrite(t, filepath.Join(home, ".claude.json"), `{
   "mcpServers": {"all-denied":{"command":"user"}},
   "projects": {
-    "`+workspace+`": {
+    `+quotedJSONString(workspace)+`: {
       "disabledMcpServers":["all-denied"],
       "disabledMcpjsonServers":["project-denied"],
       "enabledMcpjsonServers":["do-not-import"]
@@ -302,7 +302,7 @@ func TestClaudeRegularDisableDoesNotDisableProjectMCPJSON(t *testing.T) {
 }`)
 	mustWrite(t, filepath.Join(home, ".claude.json"), `{
   "mcpServers": {"same-name":{"command":"user"}},
-  "projects": {"`+workspace+`":{"disabledMcpServers":["same-name"]}}
+  "projects": {`+quotedJSONString(workspace)+`:{"disabledMcpServers":["same-name"]}}
 }`)
 	result := Discover(Options{HomeDir: home, Workspace: workspace})
 	server := serverNamed(t, result, "claude:same-name")

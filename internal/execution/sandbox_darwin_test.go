@@ -159,6 +159,101 @@ func TestSeatbeltSeparatesPolicyOptionsFromTargetArgv(t *testing.T) {
 	t.Fatalf("sandbox-exec argv has no end-of-options separator: %#v", wrapped)
 }
 
+func TestSeatbeltReopensOnlyBoundToolchainRoot(t *testing.T) {
+	ws := workspaceFor(t)
+	root := filepath.Join(ws, "outside-home-fixture")
+	profile, err := profileText(Policy{
+		Workspace:     ws,
+		Network:       NetworkLoopback,
+		readOnlyRoots: []string{root},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "(allow file-read* (subpath " + seatbeltString(root) + "))"
+	if !strings.Contains(profile, want) {
+		t.Fatalf("profile omitted bound toolchain root %q", root)
+	}
+}
+
+func TestSeatbeltProtectsAccountHomeWhenHOMEIsWorkspace(t *testing.T) {
+	account, err := accountHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := workspaceFor(t)
+	t.Setenv("HOME", workspace)
+
+	profile, err := profileText(Policy{Workspace: workspace, Network: NetworkLoopback})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"(deny file-read* (subpath " + seatbeltString(account) + "))",
+		"(deny file-read* (subpath " + seatbeltString(workspace) + "))",
+		"(allow file-read* (subpath " + seatbeltString(workspace) + "))",
+	} {
+		if !strings.Contains(profile, want) {
+			t.Fatalf("profile omitted %q:\n%s", want, profile)
+		}
+	}
+	params, err := profileParams(Policy{Workspace: workspace, Network: NetworkLoopback})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := params["DENY_SWITCHBOARD"], filepath.Join(account, ".switchboard"); got != want {
+		t.Fatalf("static credential deny followed HOME: got %q, want %q", got, want)
+	}
+	if got := params["CACHE_XDG"]; got != workspace {
+		t.Fatalf("untrusted ambient cache widened the profile: got %q, want inert workspace root %q", got, workspace)
+	}
+}
+
+func TestForgedHOMECannotExposeAccountHome(t *testing.T) {
+	account, err := accountHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	canary, err := os.CreateTemp(account, ".switchboard-account-home-canary-")
+	if err != nil {
+		t.Skipf("cannot stage an account-home canary: %v", err)
+	}
+	canaryPath := canary.Name()
+	defer os.Remove(canaryPath)
+	if _, err := canary.WriteString(canaryToken); err != nil {
+		canary.Close()
+		t.Fatal(err)
+	}
+	if err := canary.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	workspace := workspaceFor(t)
+	alias := filepath.Join(workspace, ".asdf")
+	if err := os.Symlink(account, alias); err != nil {
+		t.Fatal(err)
+	}
+	writeAlias := filepath.Join(workspace, "go")
+	if err := os.Symlink(account, writeAlias); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", workspace)
+	res := runConfined(t, workspace, NetworkLoopback, []string{"/bin/cat", filepath.Join(alias, filepath.Base(canaryPath))}, false)
+	if res.ExitCode == 0 || strings.Contains(res.Output, canaryToken) {
+		t.Fatalf("forged HOME exposed account-home canary: exit=%d output=%q", res.ExitCode, res.Output)
+	}
+	marker := filepath.Join(account, "switchboard-cache-alias-write")
+	_ = os.Remove(marker)
+	res = runConfined(t, workspace, NetworkLoopback, []string{"/bin/sh", "-c", "echo escaped > " + shellQuote(filepath.Join(writeAlias, filepath.Base(marker)))}, false)
+	if res.ExitCode == 0 {
+		t.Fatalf("forged HOME cache alias reported a successful account-home write: %q", res.Output)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		_ = os.Remove(marker)
+		t.Fatalf("forged HOME cache alias mutated account home: %v", err)
+	}
+}
+
 // A fixture server on an ephemeral loopback port is the most common thing a
 // test suite does. Binding one needs network-inbound as well as network-bind,
 // which is not obvious: network-bind alone fails as though the kernel refused.

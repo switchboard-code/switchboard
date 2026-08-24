@@ -32,7 +32,12 @@ func detectPlatform() Capability {
 	}
 	c.MechanismPresent = true
 
-	verified, detail := cachedVerification(darwinProfileKey(), darwinHostKey(), darwinSelfTest)
+	profileKey, err := darwinProfileKey()
+	if err != nil {
+		c.Detail = fmt.Sprintf("could not construct the Seatbelt profile: %v", err)
+		return c
+	}
+	verified, detail := cachedVerification(profileKey, darwinHostKey(), darwinSelfTest)
 	c.Detail = detail
 	if verified {
 		c.confinement = &Confinement{mechanism: MechanismSeatbelt, wrap: wrapSeatbelt}
@@ -50,8 +55,12 @@ func wrapSeatbelt(p Policy, argv []string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	profile, err := profileText(p)
+	if err != nil {
+		return nil, err
+	}
 
-	out := []string{sandboxExec, "-p", profileText(p)}
+	out := []string{sandboxExec, "-p", profile}
 	keys := make([]string, 0, len(params))
 	for k := range params {
 		keys = append(keys, k)
@@ -74,34 +83,54 @@ func wrapSeatbelt(p Policy, argv []string) ([]string, error) {
 // Everything here is emitted after the static profile, and later rules win, so
 // this section closes the home directory rather than opening anything the base
 // profile denied.
-func profileText(p Policy) string {
+func profileText(p Policy) (string, error) {
 	var b strings.Builder
 	b.WriteString(seatbeltProfile)
 
-	if home, err := os.UserHomeDir(); err == nil {
-		if resolved, err := filepath.EvalSymlinks(home); err == nil {
-			home = resolved
-		}
-		b.WriteString("\n;; Home is denied wholesale, then reopened where a toolchain needs it.\n")
-		fmt.Fprintf(&b, "(deny file-read* (subpath %s))\n", seatbeltString(home))
+	homes, err := protectedHomeDirectories()
+	if err != nil {
+		return "", err
+	}
+	workspace, err := filepath.EvalSymlinks(p.Workspace)
+	if err != nil {
+		return "", fmt.Errorf("resolving workspace %s: %w", p.Workspace, err)
+	}
 
-		// The workspace is usually inside home, so it has to come back first.
-		if ws, err := filepath.EvalSymlinks(p.Workspace); err == nil {
-			fmt.Fprintf(&b, "(allow file-read* (subpath %s))\n", seatbeltString(ws))
-		}
+	b.WriteString("\n;; Account and ambient homes are denied wholesale, then narrowly reopened.\n")
+	for _, home := range homes {
+		fmt.Fprintf(&b, "(deny file-read* (subpath %s))\n", seatbeltString(home))
+	}
+
+	// The workspace is usually inside home, so it has to come back first.
+	fmt.Fprintf(&b, "(allow file-read* (subpath %s))\n", seatbeltString(workspace))
+	for _, path := range p.readOnlyRoots {
+		fmt.Fprintf(&b, "(allow file-read* (subpath %s))\n", seatbeltString(path))
+	}
+	for _, home := range homes {
 		for _, path := range readableHomePaths(home) {
 			fmt.Fprintf(&b, "(allow file-read* (subpath %s))\n", seatbeltString(path))
 		}
-		// Denied last, because some of them sit inside the paths just opened.
+	}
+	// Denied last, because some of them sit inside the paths just opened.
+	for _, home := range homes {
 		for _, path := range secretHomePaths(home) {
 			fmt.Fprintf(&b, "(deny file-read* (subpath %s))\n", seatbeltString(path))
+			fmt.Fprintf(&b, "(deny file-write* (subpath %s))\n", seatbeltString(path))
 		}
+	}
+	resolvedTargets, err := resolvedSymlinkedProtectedTargets(homes[0])
+	if err != nil {
+		return "", err
+	}
+	for _, path := range resolvedTargets {
+		fmt.Fprintf(&b, "(deny file-read* (subpath %s))\n", seatbeltString(path))
+		fmt.Fprintf(&b, "(deny file-write* (subpath %s))\n", seatbeltString(path))
 	}
 
 	if p.Network == NetworkFull {
 		b.WriteString("\n; Egress granted explicitly for this command.\n(allow network*)\n")
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 // seatbeltString renders a path as a profile string literal.
@@ -127,16 +156,13 @@ func seatbeltString(s string) string {
 }
 
 func profileParams(p Policy) (map[string]string, error) {
-	home, err := os.UserHomeDir()
+	accountHome, err := accountHomeDir()
 	if err != nil {
 		return nil, err
 	}
-	// Resolving the home directory once covers every path built from it. Every
-	// parameter must be fully resolved, because Seatbelt resolves a path before
-	// matching and a rule naming an unresolved symlink never fires.
-	home, err = filepath.EvalSymlinks(home)
+	ambientHome, err := ambientHomeDir()
 	if err != nil {
-		return nil, fmt.Errorf("resolving home directory: %w", err)
+		return nil, err
 	}
 
 	workspace, err := filepath.EvalSymlinks(p.Workspace)
@@ -148,39 +174,57 @@ func profileParams(p Policy) (map[string]string, error) {
 		return nil, fmt.Errorf("resolving temp directory: %w", err)
 	}
 
-	under := func(rest ...string) string {
-		return filepath.Join(append([]string{home}, rest...)...)
+	underAccount := func(rest ...string) string {
+		return filepath.Join(append([]string{accountHome}, rest...)...)
+	}
+	cachePath := func(rest ...string) string {
+		// A distinct HOME is ambient input and may be a checkout containing
+		// symlink aliases into the account home. Do not turn those aliases into
+		// Seatbelt write grants. The workspace is already writable, so using its
+		// canonical root as an inert parameter adds no authority.
+		if ambientHome != accountHome {
+			return workspace
+		}
+		rel := filepath.Join(rest...)
+		if path, ok := safeHomeDescendant(accountHome, rel, true); ok && safeWritableHomeCache(accountHome, rel) {
+			return path
+		}
+		return workspace
 	}
 
 	return map[string]string{
 		"WORKSPACE": workspace,
 		"TMPDIR":    tmp,
 
-		"CACHE_GO_BUILD": under("Library", "Caches", "go-build"),
-		"CACHE_GO_MOD":   under("go", "pkg", "mod"),
-		"CACHE_NPM":      under(".npm"),
-		"CACHE_CARGO":    under(".cargo"),
-		"CACHE_XDG":      under(".cache"),
-		"CACHE_LIBRARY":  under("Library", "Caches"),
+		"CACHE_GO_BUILD": cachePath("Library", "Caches", "go-build"),
+		"CACHE_GO_MOD":   cachePath("go", "pkg", "mod"),
+		"CACHE_NPM":      cachePath(".npm"),
+		"CACHE_CARGO":    cachePath(".cargo"),
+		"CACHE_XDG":      cachePath(".cache"),
+		"CACHE_LIBRARY":  cachePath("Library", "Caches"),
 
-		"DENY_SSH":           under(".ssh"),
-		"DENY_AWS":           under(".aws"),
-		"DENY_GCLOUD":        under(".config", "gcloud"),
-		"DENY_KUBE":          under(".kube"),
-		"DENY_DOCKER":        under(".docker"),
-		"DENY_GNUPG":         under(".gnupg"),
-		"DENY_KEYCHAINS":     under("Library", "Keychains"),
+		"DENY_SSH":           underAccount(".ssh"),
+		"DENY_AWS":           underAccount(".aws"),
+		"DENY_GCLOUD":        underAccount(".config", "gcloud"),
+		"DENY_KUBE":          underAccount(".kube"),
+		"DENY_DOCKER":        underAccount(".docker"),
+		"DENY_GNUPG":         underAccount(".gnupg"),
+		"DENY_KEYCHAINS":     underAccount("Library", "Keychains"),
 		"DENY_KEYCHAINS_SYS": "/Library/Keychains",
-		"DENY_CONFIG_SSH":    under(".config", "ssh"),
-		"DENY_SWITCHBOARD":   under(".switchboard"),
+		"DENY_CONFIG_SSH":    underAccount(".config", "ssh"),
+		"DENY_SWITCHBOARD":   underAccount(".switchboard"),
 	}, nil
 }
 
 // darwinProfileKey covers the effective profile, not just the embedded file.
 // The generated section depends on which toolchain directories exist, so a
 // cached pass must not survive the user installing one.
-func darwinProfileKey() string {
-	return shortHash(profileText(Policy{Workspace: os.TempDir(), Network: NetworkLoopback}))
+func darwinProfileKey() (string, error) {
+	profile, err := profileText(Policy{Workspace: os.TempDir(), Network: NetworkLoopback})
+	if err != nil {
+		return "", err
+	}
+	return shortHash(profile), nil
 }
 
 // darwinHostKey pins the verdict to this OS build. What the kernel enforces for

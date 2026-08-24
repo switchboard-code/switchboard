@@ -139,6 +139,117 @@ func TestConfinedCommandCannotReadCredentials(t *testing.T) {
 	}
 }
 
+func TestForgedHOMECannotExposeAccountHome(t *testing.T) {
+	account, err := accountHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	canary, err := os.CreateTemp(account, ".switchboard-account-home-canary-")
+	if err != nil {
+		t.Skipf("cannot stage an account-home canary: %v", err)
+	}
+	canaryPath := canary.Name()
+	defer os.Remove(canaryPath)
+	if _, err := canary.WriteString(canaryToken); err != nil {
+		canary.Close()
+		t.Fatal(err)
+	}
+	if err := canary.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	workspace := workspaceFor(t)
+	alias := filepath.Join(workspace, ".asdf")
+	if err := os.Symlink(account, alias); err != nil {
+		t.Fatal(err)
+	}
+	writeAlias := filepath.Join(workspace, "go")
+	if err := os.Symlink(account, writeAlias); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", workspace)
+	res := runConfined(t, workspace, NetworkLoopback, []string{"/bin/cat", filepath.Join(alias, filepath.Base(canaryPath))}, false)
+	if res.ExitCode == 0 || strings.Contains(res.Output, canaryToken) {
+		t.Fatalf("forged HOME exposed account-home canary: exit=%d output=%q", res.ExitCode, res.Output)
+	}
+	marker := filepath.Join(account, "switchboard-cache-alias-write")
+	_ = os.Remove(marker)
+	res = runConfined(t, workspace, NetworkLoopback, []string{"/bin/sh", "-c", "echo escaped > " + shellQuote(filepath.Join(writeAlias, filepath.Base(marker)))}, false)
+	if res.ExitCode == 0 {
+		t.Fatalf("forged HOME cache alias reported a successful account-home write: %q", res.Output)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		_ = os.Remove(marker)
+		t.Fatalf("forged HOME cache alias mutated account home: %v", err)
+	}
+}
+
+func TestExactGoRootCannotReopenResolvedCredentialTarget(t *testing.T) {
+	account, err := accountHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolchainDir, err := os.MkdirTemp(account, ".switchboard-goroot-secret-")
+	if err != nil {
+		t.Skipf("cannot stage an account-home Go root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(toolchainDir) })
+	root := fakeGoToolchain(t, toolchainDir)
+	secret := filepath.Join(root, "credential")
+	if err := os.WriteFile(secret, []byte(canaryToken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	goPath := filepath.Join(root, "bin", "go")
+	if err := os.WriteFile(goPath, []byte("#!/bin/sh\ncat \"$GOROOT/credential\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cargo := filepath.Join(account, ".cargo")
+	createdCargo := false
+	if info, err := os.Lstat(cargo); os.IsNotExist(err) {
+		if err := os.Mkdir(cargo, 0o700); err != nil {
+			t.Skipf("cannot stage .cargo: %v", err)
+		}
+		createdCargo = true
+	} else if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		t.Skipf("account .cargo is not a real directory: %v", err)
+	}
+	if createdCargo {
+		t.Cleanup(func() { _ = os.Remove(cargo) })
+	}
+	var credential string
+	for _, name := range []string{"credentials", "credentials.toml"} {
+		candidate := filepath.Join(cargo, name)
+		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
+			credential = candidate
+			break
+		}
+	}
+	if credential == "" {
+		t.Skip("both cargo credential paths already exist; refusing to replace user state")
+	}
+	if err := os.Symlink(secret, credential); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(credential) })
+
+	t.Setenv("HOME", account)
+	workspace := workspaceFor(t)
+	res, err := Run(context.Background(), Command{
+		Argv:    []string{goPath},
+		Dir:     workspace,
+		Timeout: 30 * time.Second,
+		Confine: confined(t),
+		Policy:  Policy{Workspace: workspace, Network: NetworkLoopback},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(res.Output, canaryToken) {
+		t.Fatalf("exact Go-root reopen exposed resolved credential target: %q", res.Output)
+	}
+}
+
 // The policy mapping is checked without touching the network, so it holds on a
 // host with no egress and no HTTP client. An assertion that needs the internet
 // to detect a missing flag is an assertion that quietly stops running.

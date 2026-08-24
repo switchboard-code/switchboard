@@ -24,7 +24,7 @@ func TestGlobBasenamePatternMatchesAnywhere(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("glob failed: %s", res.Content)
 	}
-	for _, want := range []string{"main.go", filepath.Join("internal", "deep", "x.go")} {
+	for _, want := range []string{"main.go", "internal/deep/x.go"} {
 		if !strings.Contains(res.Content, want) {
 			t.Errorf("missing %s in %q", want, res.Content)
 		}
@@ -44,7 +44,7 @@ func TestGlobPathPatternWithDoublestar(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("glob failed: %s", res.Content)
 	}
-	if !strings.Contains(res.Content, filepath.Join("internal", "pkg", "b_test.go")) {
+	if !strings.Contains(res.Content, "internal/pkg/b_test.go") {
 		t.Errorf("doublestar missed nested test file: %q", res.Content)
 	}
 	// A path pattern is anchored: the root-level test file is outside internal/.
