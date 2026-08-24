@@ -342,7 +342,7 @@ func TestOpenMigratingInPlaceChangeIsNotDeleted(t *testing.T) {
 	}
 	migrationCleanupTestHook = func(boundary migrationCleanupBoundary, source, _ string) error {
 		if boundary == migrationBeforeQuarantine {
-			return os.WriteFile(source, replacementBytes, 0o600)
+			return overwriteMigrationFileInPlace(source, replacementBytes)
 		}
 		return nil
 	}
@@ -559,7 +559,15 @@ func TestOpenMigratingCleanupCannotFollowDirectoryReplacement(t *testing.T) {
 		if boundary != migrationBeforeQuarantine {
 			return nil
 		}
-		if err := os.Rename(historicalDir, movedDir); err != nil {
+		parentRoot, err := os.OpenRoot(parent)
+		if err != nil {
+			return err
+		}
+		if err := parentRoot.Rename(filepath.Base(historicalDir), filepath.Base(movedDir)); err != nil {
+			_ = parentRoot.Close()
+			return err
+		}
+		if err := parentRoot.Close(); err != nil {
 			return err
 		}
 		if err := os.Mkdir(historicalDir, 0o700); err != nil {
@@ -580,6 +588,28 @@ func TestOpenMigratingCleanupCannotFollowDirectoryReplacement(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(movedDir, FileName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("bound historical ledger survived completed migration: %v", err)
 	}
+}
+
+// overwriteMigrationFileInPlace deliberately keeps the file identity selected
+// by the migration reader. Root.OpenFile uses the platform's root-relative
+// opener; on Windows that includes FILE_SHARE_DELETE, unlike os.WriteFile's
+// path opener, so the fixture can model an ignoring writer while the exact
+// mutation handle is live.
+func overwriteMigrationFileInPlace(path string, content []byte) (resultErr error) {
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, root.Close()) }()
+	file, err := root.OpenFile(filepath.Base(path), os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, file.Close()) }()
+	if _, err := file.Write(content); err != nil {
+		return err
+	}
+	return file.Sync()
 }
 
 func TestOpenMigratingLiveProofRefusesMissingOrRetargetedAlias(t *testing.T) {
