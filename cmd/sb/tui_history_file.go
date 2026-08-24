@@ -357,6 +357,24 @@ func rewriteHistoryLocked(path string, prompts []string, expected historySnapsho
 		}
 	}
 	if exchangeErr != nil {
+		// Windows exchanges by exact open handle. If an uncooperative writer
+		// replaces the target after our final comparison, that implementation
+		// can refuse before its first namespace mutation (unlike renameat2 on
+		// Unix, which may exchange the two path occupants and then require the
+		// rollback below). No publication means the owned stage and transaction
+		// record are no longer recovery evidence: retire both now so a harmless
+		// losing race cannot wedge prompt history until the next process start.
+		if !result.Published {
+			if scrubErr := retireHistoryBoundFileTo(parent, tmpName, txn.RetiredStage, tmp); scrubErr != nil {
+				return errors.Join(errHistoryRecoveryRequired, exchangeErr,
+					fmt.Errorf("scrubbing unpublished prompt history stage: %w", scrubErr))
+			}
+			tmpRetired = true
+			if retireErr := retireHistoryBoundFile(parent, recordName, record, nil); retireErr != nil {
+				return errors.Join(errHistoryRecoveryRequired, exchangeErr,
+					fmt.Errorf("retiring unpublished prompt history transaction: %w", retireErr))
+			}
+		}
 		return fmt.Errorf("atomically exchanging prompt history: %w", exchangeErr)
 	}
 	if err := errors.Join(

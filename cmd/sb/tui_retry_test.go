@@ -323,7 +323,11 @@ func TestRetryForksOffTheLastTurnAndReplaysItsPrompt(t *testing.T) {
 	if !ok || msg.err != nil {
 		t.Fatalf("retry did not produce a swap: %+v", msg)
 	}
-	defer msg.sess.CloseDiscardingStaged()
+	t.Cleanup(func() {
+		if err := cleanupDroppedOperationResult(msg); err != nil {
+			t.Errorf("discarding unadopted retry: %v", err)
+		}
+	})
 	defer m.finishOperation(msg.operation, false)
 	if retrySourceLabelled(t, sourcePath) {
 		t.Fatal("staging a retry labelled the source before adoption")
@@ -486,7 +490,11 @@ func TestRetryOfTheOnlyTurnStartsFresh(t *testing.T) {
 	if !ok || msg.err != nil {
 		t.Fatalf("first-turn retry failed: %+v", msg)
 	}
-	defer msg.sess.CloseDiscardingStaged()
+	t.Cleanup(func() {
+		if err := cleanupDroppedOperationResult(msg); err != nil {
+			t.Errorf("discarding unadopted retry: %v", err)
+		}
+	})
 	defer m.finishOperation(msg.operation, false)
 	if !msg.fresh || len(msg.sess.State().Messages) != 0 {
 		t.Fatalf("dropping the only turn should start fresh: fresh=%v messages=%d", msg.fresh, len(msg.sess.State().Messages))

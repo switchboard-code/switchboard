@@ -167,7 +167,11 @@ func TestRetryReplaysTheExactRecordedOpeningAndCapsuleOnce(t *testing.T) {
 	if !ok || swap.err != nil {
 		t.Fatalf("retry swap = %#v", swap)
 	}
-	defer swap.sess.CloseDiscardingStaged()
+	t.Cleanup(func() {
+		if err := cleanupDroppedOperationResult(swap); err != nil {
+			t.Errorf("discarding unadopted retry: %v", err)
+		}
+	})
 	start, ok := swap.andThen().(retryStartMsg)
 	if !ok {
 		t.Fatalf("retry continuation = %#v", swap.andThen())

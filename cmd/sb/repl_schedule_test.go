@@ -20,6 +20,7 @@ func TestREPLScheduleCommands(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(s.Close)
 	r.schedules = s
 
 	r.command(context.Background(), "/every 30m run the tests")
@@ -76,6 +77,7 @@ func TestREPLFiresDueSchedulesAsTurns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(s.Close)
 	r.schedules = s
 
 	r.fireDueSchedules(context.Background())
@@ -99,6 +101,7 @@ func TestREPLScheduleRefusesKeyShapedPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(s.Close)
 	r.schedules = s
 
 	r.command(context.Background(), "/every 30m deploy with "+testGitHubToken)

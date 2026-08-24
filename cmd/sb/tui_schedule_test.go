@@ -35,6 +35,7 @@ func installSchedules(t *testing.T, m *tuiModel, seeded ...schedule.Entry) *sche
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(s.Close)
 	m.app.schedules = s
 	return s
 }
