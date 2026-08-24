@@ -323,18 +323,22 @@ func TestAcquireWindowsNamespaceLeaseRejectsReparseDirectory(t *testing.T) {
 }
 
 func TestWindowsNamespaceLeaseEmptyNameOpensAndDeleteLeasesExactRoot(t *testing.T) {
-	root, _ := openWindowsTestRoot(t)
+	root, dir := openWindowsTestRoot(t)
 	rootFile, err := root.Open(".")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rootFile.Close()
 	openDelete := func() (windows.Handle, error) {
-		return reopenWindowsTestDirectoryDeleteHandle(windows.Handle(rootFile.Fd()))
+		return openWindowsTestDirectoryDeleteHandle(dir)
 	}
 	probe, err := openDelete()
 	if err != nil {
 		t.Fatalf("calibrating exact root DELETE access: %v", err)
+	}
+	if err := requireSameWindowsHandle(windows.Handle(rootFile.Fd()), probe); err != nil {
+		_ = windows.CloseHandle(probe)
+		t.Fatalf("DELETE calibration opened a different directory: %v", err)
 	}
 	if err := windows.CloseHandle(probe); err != nil {
 		t.Fatal(err)
@@ -1444,36 +1448,18 @@ func openWindowsDirectoryWriteHandle(path string) (windows.Handle, error) {
 	)
 }
 
-func reopenWindowsTestDirectoryDeleteHandle(handle windows.Handle) (windows.Handle, error) {
-	objectName, err := windows.NewNTUnicodeString("")
+func openWindowsTestDirectoryDeleteHandle(path string) (windows.Handle, error) {
+	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return windows.InvalidHandle, err
 	}
-	attributes := &windows.OBJECT_ATTRIBUTES{
-		RootDirectory: handle,
-		ObjectName:    objectName,
-		Attributes:    windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
-	}
-	attributes.Length = uint32(unsafe.Sizeof(*attributes))
-	var opened windows.Handle
-	err = windows.NtCreateFile(
-		&opened,
+	return windows.CreateFile(
+		name,
 		windows.DELETE|windows.SYNCHRONIZE,
-		attributes,
-		&windows.IO_STATUS_BLOCK{},
-		nil,
-		0,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		windows.FILE_OPEN,
-		windows.FILE_DIRECTORY_FILE|windows.FILE_SYNCHRONOUS_IO_NONALERT|windows.FILE_OPEN_REPARSE_POINT,
-		0,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT,
 		0,
 	)
-	if status, ok := err.(windows.NTStatus); ok {
-		err = status.Errno()
-	}
-	if err != nil {
-		return windows.InvalidHandle, err
-	}
-	return opened, nil
 }

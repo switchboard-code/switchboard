@@ -220,6 +220,13 @@ func (r *Recorder) ensureRestoreCleanup(journalDir, workspace string) error {
 }
 
 func (r *Recorder) restoreWithLedger(path string, state *fileState, hooks restoreHooks) restoreOutcome {
+	// Namespace resolution may canonicalize aliases (notably an 8.3 Windows
+	// prefix), but diagnostics are part of the caller contract. Keep the path
+	// spelling whose capture is being consumed while all I/O continues through
+	// the canonical, descriptor-bound target below.
+	if hooks.displayPath == "" {
+		hooks.displayPath = path
+	}
 	r.mu.Lock()
 	config := r.restoreCleanup
 	hook := r.restoreTempLedgerHook

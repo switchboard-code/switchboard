@@ -1319,6 +1319,15 @@ func openBoundMutationHandleWindows(lease *windowsNamespaceLease, name string, f
 	}
 	runtime.KeepAlive(objectName)
 	if openErr != nil {
+		// The leased parent has already been resolved and held through an exact
+		// handle, so a not-found result here can only mean that the selected leaf
+		// disappeared before its mutation handle was bound. Report the checkpoint
+		// contract's stale sentinel rather than leaking a platform-specific
+		// ERROR_FILE_NOT_FOUND to callers.
+		if errors.Is(openErr, fs.ErrNotExist) {
+			return invalidWindowsMutationHandle(), errors.Join(openErr,
+				fmt.Errorf("%w: checkpoint mutation source link is missing", ErrStale))
+		}
 		return invalidWindowsMutationHandle(), openErr
 	}
 	original := windows.Handle(file.Fd())

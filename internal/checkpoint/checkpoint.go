@@ -2063,6 +2063,7 @@ func validateParentIdentity(path string, st *fileState) error {
 type restoreHooks struct {
 	prepareTemp      func(*os.File) error
 	fingerprintLimit int64
+	displayPath      string
 	beforeRemove     func() error
 	beforeReplace    func() error
 	publicationSeam  func() error
@@ -2097,6 +2098,10 @@ func restore(path string, st *fileState, hooks restoreHooks) restoreOutcome {
 }
 
 func restoreInScope(scope *restoreScope, path string, st *fileState, hooks restoreHooks) restoreOutcome {
+	displayPath := path
+	if hooks.displayPath != "" {
+		displayPath = hooks.displayPath
+	}
 	// The post-image comparison remains cooperative with an external writer,
 	// but the directory capability is held from that comparison through the
 	// irreversible operation. A parent rename or symlink swap can therefore
@@ -2131,32 +2136,32 @@ func restoreInScope(scope *restoreScope, path string, st *fileState, hooks resto
 		published, removeErr := removeBoundTarget(namespace, parent, hooks.retirementRoot, hooks.tempName, hooks.bindTemp, st.after, seam)
 		if removeErr != nil {
 			if published {
-				return publishedRestoreError(path, removeErr)
+				return publishedRestoreError(displayPath, removeErr)
 			}
 			return unpublishedRestore(removeErr)
 		}
 		if hooks.afterRemove != nil {
 			if err := hooks.afterRemove(); err != nil {
-				return publishedRestoreError(path, err)
+				return publishedRestoreError(displayPath, err)
 			}
 		}
 		if err := syncBoundDirectory(parent.root); err != nil {
-			return publishedRestoreError(path, fmt.Errorf("syncing parent directory: %w", err))
+			return publishedRestoreError(displayPath, fmt.Errorf("syncing parent directory: %w", err))
 		}
 		check, err := parent.fingerprint(restoreFingerprintLimit(hooks))
 		if err != nil {
-			return publishedRestoreError(path, fmt.Errorf("verifying removal: %w", err))
+			return publishedRestoreError(displayPath, fmt.Errorf("verifying removal: %w", err))
 		}
 		if check.existed {
-			return publishedRestoreError(path, errors.New("file still exists after removal"))
+			return publishedRestoreError(displayPath, errors.New("file still exists after removal"))
 		}
 		if len(st.parents) > 0 {
 			if err := validateParentIdentity(path, st); err != nil {
-				return publishedRestoreError(path, err)
+				return publishedRestoreError(displayPath, err)
 			}
 		} else if scope != nil {
 			if err := scope.validateLinked(); err != nil {
-				return publishedRestoreError(path, err)
+				return publishedRestoreError(displayPath, err)
 			}
 		}
 		return restoreOutcome{published: true}
@@ -2185,6 +2190,10 @@ func atomicRestore(path string, content []byte, mode fs.FileMode, expected finge
 }
 
 func atomicRestoreBound(scope *restoreScope, namespace *boundRestoreNamespace, parent *boundRestoreParent, path string, content []byte, mode fs.FileMode, expected fingerprint, st *fileState, hooks restoreHooks) (outcome restoreOutcome) {
+	displayPath := path
+	if hooks.displayPath != "" {
+		displayPath = hooks.displayPath
+	}
 	if namespace == nil || namespace.root == nil {
 		return unpublishedRestore(errors.New("restore namespace is closed"))
 	}
@@ -2204,7 +2213,7 @@ func atomicRestoreBound(scope *restoreScope, namespace *boundRestoreNamespace, p
 			outcome.cleanupPending = cleanupErr != nil
 			if cleanupErr != nil {
 				if outcome.published {
-					outcome = publishedRestoreError(path, errors.Join(outcome.err,
+					outcome = publishedRestoreError(displayPath, errors.Join(outcome.err,
 						fmt.Errorf("retiring unpublished checkpoint temporary: %w", cleanupErr)))
 				} else {
 					outcome.err = errors.Join(outcome.err,
@@ -2345,7 +2354,7 @@ func atomicRestoreBound(scope *restoreScope, namespace *boundRestoreNamespace, p
 	}
 	if err != nil {
 		if renameResult.published {
-			return publishedRestoreError(path, err)
+			return publishedRestoreError(displayPath, err)
 		}
 		return unpublishedRestore(err)
 	}
@@ -2362,7 +2371,7 @@ func atomicRestoreBound(scope *restoreScope, namespace *boundRestoreNamespace, p
 			}
 			cause = errors.Join(cause, fmt.Errorf("rolling back mismatched checkpoint exchange: %w", rollbackErr))
 		}
-		return publishedRestoreError(path, cause)
+		return publishedRestoreError(displayPath, cause)
 	}
 	if expected.existed {
 		rollbackPublication := func(cause error) restoreOutcome {
@@ -2385,7 +2394,7 @@ func atomicRestoreBound(scope *restoreScope, namespace *boundRestoreNamespace, p
 			// Preserve every ledger-bound name after an ambiguous rollback.
 			// Recovery, not best-effort deferred cleanup, owns the next step.
 			retainTemp = true
-			return publishedRestoreError(path, errors.Join(
+			return publishedRestoreError(displayPath, errors.Join(
 				fmt.Errorf("rolling back stale checkpoint publication: %w", rollbackErr),
 				cause,
 			))
@@ -2413,7 +2422,7 @@ func atomicRestoreBound(scope *restoreScope, namespace *boundRestoreNamespace, p
 			return rollbackPublication(linkErr)
 		}
 		if retireErr := retireBoundOpenFileTo(namespace.root, hooks.retirementRoot, tmpRel, currentTarget, false, nil, nil); retireErr != nil {
-			return publishedRestoreError(path, fmt.Errorf("retiring displaced restore target: %w", retireErr))
+			return publishedRestoreError(displayPath, fmt.Errorf("retiring displaced restore target: %w", retireErr))
 		}
 	} else {
 		rollbackCreation := func(cause error) restoreOutcome {
@@ -2433,7 +2442,7 @@ func atomicRestoreBound(scope *restoreScope, namespace *boundRestoreNamespace, p
 				rollbackErr = errors.New("created-file rollback was not confirmed")
 			}
 			retainTemp = true
-			return publishedRestoreError(path, errors.Join(
+			return publishedRestoreError(displayPath, errors.Join(
 				fmt.Errorf("rolling back stale created-file publication: %w", rollbackErr),
 				cause,
 			))
@@ -2450,27 +2459,27 @@ func atomicRestoreBound(scope *restoreScope, namespace *boundRestoreNamespace, p
 			// Retire only an alias the namespace primitive explicitly reports. A
 			// no-replace move (the normal absent-target path) retains no source.
 			if retireErr := retireBoundOpenFileTo(namespace.root, hooks.retirementRoot, tmpRel, tmp, false, nil, nil); retireErr != nil {
-				return publishedRestoreError(path, fmt.Errorf("retiring published restore alias: %w", retireErr))
+				return publishedRestoreError(displayPath, fmt.Errorf("retiring published restore alias: %w", retireErr))
 			}
 		}
 	}
 	if hooks.afterReplace != nil {
 		if err := hooks.afterReplace(); err != nil {
-			return publishedRestoreError(path, err)
+			return publishedRestoreError(displayPath, err)
 		}
 	}
 	if err := syncBoundReplacement(tmp); err != nil {
-		return publishedRestoreError(path, fmt.Errorf("syncing restored file: %w", err))
+		return publishedRestoreError(displayPath, fmt.Errorf("syncing restored file: %w", err))
 	}
 	if err := syncBoundDirectory(parent.root); err != nil {
-		return publishedRestoreError(path, fmt.Errorf("syncing parent directory: %w", err))
+		return publishedRestoreError(displayPath, fmt.Errorf("syncing parent directory: %w", err))
 	}
 	got, err := namespace.fingerprintTarget(restoreFingerprintLimit(hooks), tmpInfo)
 	if err != nil {
-		return publishedRestoreError(path, fmt.Errorf("verifying restored file: %w", err))
+		return publishedRestoreError(displayPath, fmt.Errorf("verifying restored file: %w", err))
 	}
 	if !sameFingerprint(got, desired) {
-		return publishedRestoreError(path, errors.New("restored file post-image mismatch"))
+		return publishedRestoreError(displayPath, errors.New("restored file post-image mismatch"))
 	}
 	return restoreOutcome{published: true}
 }

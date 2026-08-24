@@ -133,8 +133,7 @@ func TestPublishFileCASWindowsRollbackFailureStaysPublishedAndRecoverable(t *tes
 			return nil
 		}
 		windowsHandlePhaseTestHook = nil
-		record := currentPublicationLedgerRecord(t, journalDir)
-		blocker = filepath.Join(workspace, record.TempName)
+		blocker = filepath.Join(workspace, currentPublicationTempName(t, journalDir))
 		if err := os.WriteFile(blocker, []byte("foreign blocker"), 0o644); err != nil {
 			t.Fatalf("installing rollback blocker: %v", err)
 		}
@@ -221,27 +220,27 @@ func newWindowsFilePublicationFixture(t *testing.T) (workspace, journalDir, path
 	return workspace, journalDir, path, parent, recorder
 }
 
-func currentPublicationLedgerRecord(t *testing.T, journalDir string) restoreTempLedgerRecord {
+func currentPublicationTempName(t *testing.T, journalDir string) string {
 	t.Helper()
 	entries, err := os.ReadDir(journalDir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var tempName string
 	for _, entry := range entries {
 		if !isRestoreTempLedgerName(entry.Name()) {
 			continue
 		}
-		file, err := os.Open(filepath.Join(journalDir, entry.Name()))
-		if err != nil {
-			t.Fatal(err)
+		if tempName != "" {
+			t.Fatal("more than one publication cleanup ledger is active")
 		}
-		record, decodeErr := decodeRestoreTempLedger(file)
-		closeErr := file.Close()
-		if decodeErr != nil || closeErr != nil {
-			t.Fatal(errors.Join(decodeErr, closeErr))
-		}
-		return record
+		// Windows byte-range locks are mandatory, so the active recovery
+		// ledger cannot be read through a second handle at this test seam. Its
+		// validated random suffix is deliberately shared with the temporary.
+		tempName = ".switchboard-undo-" + strings.TrimPrefix(entry.Name(), restoreTempLedgerPrefix)
 	}
-	t.Fatal("publication cleanup ledger not found")
-	return restoreTempLedgerRecord{}
+	if tempName == "" {
+		t.Fatal("publication cleanup ledger not found")
+	}
+	return tempName
 }
