@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -555,6 +556,8 @@ func TestOpenMigratingCleanupCannotFollowDirectoryReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	replacementInjected := false
+	replacementBlocked := false
 	migrationCleanupTestHook = func(boundary migrationCleanupBoundary, _, _ string) error {
 		if boundary != migrationBeforeQuarantine {
 			return nil
@@ -565,6 +568,10 @@ func TestOpenMigratingCleanupCannotFollowDirectoryReplacement(t *testing.T) {
 		}
 		if err := parentRoot.Rename(filepath.Base(historicalDir), filepath.Base(movedDir)); err != nil {
 			_ = parentRoot.Close()
+			if runtime.GOOS == "windows" && errors.Is(err, os.ErrPermission) {
+				replacementBlocked = true
+				return nil
+			}
 			return err
 		}
 		if err := parentRoot.Close(); err != nil {
@@ -573,7 +580,11 @@ func TestOpenMigratingCleanupCannotFollowDirectoryReplacement(t *testing.T) {
 		if err := os.Mkdir(historicalDir, 0o700); err != nil {
 			return err
 		}
-		return os.WriteFile(filepath.Join(historicalDir, FileName), replacementBytes, 0o600)
+		if err := os.WriteFile(filepath.Join(historicalDir, FileName), replacementBytes, 0o600); err != nil {
+			return err
+		}
+		replacementInjected = true
+		return nil
 	}
 	t.Cleanup(func() { migrationCleanupTestHook = nil })
 
@@ -582,6 +593,18 @@ func TestOpenMigratingCleanupCannotFollowDirectoryReplacement(t *testing.T) {
 		t.Fatalf("migration across directory replacement: %v", err)
 	}
 	ledger.Close()
+	if replacementBlocked {
+		if _, err := os.Stat(movedDir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("kernel-blocked replacement appeared at moved path: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(historicalDir, FileName)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("bound historical ledger survived completed migration: %v", err)
+		}
+		return
+	}
+	if !replacementInjected {
+		t.Fatal("directory replacement was neither injected nor blocked")
+	}
 	if got := readMigrationBytes(t, filepath.Join(historicalDir, FileName)); !bytes.Equal(got, replacementBytes) {
 		t.Fatalf("replacement directory ledger was changed: %q", got)
 	}
