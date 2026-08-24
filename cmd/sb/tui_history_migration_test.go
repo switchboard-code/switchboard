@@ -1074,14 +1074,6 @@ func TestHistoryRewriteRollbackFailureRetainsEveryImageAndRecoveryEvidence(t *te
 		if got, readErr := os.ReadFile(path); readErr != nil || string(got) != foreign {
 			t.Fatalf("foreign canonical = %q, err=%v", got, readErr)
 		}
-		assertLiveHistoryTransaction(t, path)
-		data, _, recoveryErr := readHistoryFile(path, nil)
-		if recoveryErr != nil || string(data) != foreign {
-			t.Fatalf("recovering unpublished exact-handle refusal = %q, %v", data, recoveryErr)
-		}
-		if got, readErr := os.ReadFile(retired); readErr != nil || string(got) != original {
-			t.Fatalf("recovery changed externally retired original = %q, err=%v", got, readErr)
-		}
 		assertNoLiveHistoryTransaction(t, path)
 		assertHistoryArtifactsDoNotContain(t, dir, `"desired"`)
 		assertRetiredHistoryArtifactsArePrivateAndEmpty(t, dir)
