@@ -322,7 +322,7 @@ func TestAcquireWindowsNamespaceLeaseRejectsReparseDirectory(t *testing.T) {
 	}
 }
 
-func TestWindowsNamespaceLeaseReopensAndDeleteLeasesExactRoot(t *testing.T) {
+func TestWindowsNamespaceLeaseEmptyNameOpensAndDeleteLeasesExactRoot(t *testing.T) {
 	root, _ := openWindowsTestRoot(t)
 	rootFile, err := root.Open(".")
 	if err != nil {
@@ -367,6 +367,30 @@ func TestWindowsNamespaceLeaseReopensAndDeleteLeasesExactRoot(t *testing.T) {
 	}
 	if err := windows.CloseHandle(probe); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWindowsNamespaceLeaseEmptyNameRootOpensNestedAncestor(t *testing.T) {
+	root, dir := openWindowsTestRoot(t)
+	if err := os.Mkdir(filepath.Join(dir, "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := acquireWindowsNamespaceLease(root, filepath.Join("nested", "target"))
+	if err != nil {
+		t.Fatalf("leasing nested ancestor through minimal root handle: %v", err)
+	}
+	defer lease.close()
+	leasedNested, err := lease.directory(filepath.Join("nested", "target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	openedNested, err := root.Open("nested")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer openedNested.Close()
+	if err := requireSameWindowsHandle(windows.Handle(openedNested.Fd()), leasedNested); err != nil {
+		t.Fatalf("nested namespace lease changed identity: %v", err)
 	}
 }
 
@@ -1421,18 +1445,35 @@ func openWindowsDirectoryWriteHandle(path string) (windows.Handle, error) {
 }
 
 func reopenWindowsTestDirectoryDeleteHandle(handle windows.Handle) (windows.Handle, error) {
-	result, _, callErr := reOpenFileWindows.Call(
-		uintptr(handle),
-		uintptr(uint32(windows.DELETE)),
-		uintptr(uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)),
-		uintptr(uint32(windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT)),
-	)
-	reopened := windows.Handle(result)
-	if reopened == windows.InvalidHandle || reopened == 0 {
-		if callErr == nil || callErr == windows.ERROR_SUCCESS {
-			callErr = windows.ERROR_INVALID_HANDLE
-		}
-		return windows.InvalidHandle, callErr
+	objectName, err := windows.NewNTUnicodeString("")
+	if err != nil {
+		return windows.InvalidHandle, err
 	}
-	return reopened, nil
+	attributes := &windows.OBJECT_ATTRIBUTES{
+		RootDirectory: handle,
+		ObjectName:    objectName,
+		Attributes:    windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
+	}
+	attributes.Length = uint32(unsafe.Sizeof(*attributes))
+	var opened windows.Handle
+	err = windows.NtCreateFile(
+		&opened,
+		windows.DELETE|windows.SYNCHRONIZE,
+		attributes,
+		&windows.IO_STATUS_BLOCK{},
+		nil,
+		0,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		windows.FILE_OPEN,
+		windows.FILE_DIRECTORY_FILE|windows.FILE_SYNCHRONOUS_IO_NONALERT|windows.FILE_OPEN_REPARSE_POINT,
+		0,
+		0,
+	)
+	if status, ok := err.(windows.NTStatus); ok {
+		err = status.Errno()
+	}
+	if err != nil {
+		return windows.InvalidHandle, err
+	}
+	return opened, nil
 }

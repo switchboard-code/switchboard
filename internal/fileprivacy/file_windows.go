@@ -516,7 +516,7 @@ func Secure(f *os.File) error {
 }
 
 // reopenWindowsObjectForSecurity obtains the minimum ACL rights on the exact
-// object selected by f. ReOpenFile is identity-bound, so callers that received
+// object selected by f. The reopen is identity-bound, so callers that received
 // an os.Root handle without WRITE_DAC can repair it without a pathname reopen
 // or a final-component substitution race.
 //
@@ -550,52 +550,108 @@ func reopenWindowsObjectWithSecurityAccess(f *os.File, directory, writeOwner boo
 	if f == nil {
 		return nil, errors.New("owner-private security repair has no object handle")
 	}
-	access := uint32(windows.READ_CONTROL | windows.WRITE_DAC | windows.FILE_READ_ATTRIBUTES)
+	access := uint32(windows.WRITE_DAC)
 	if writeOwner {
 		access |= windows.WRITE_OWNER
 	}
-	flags := uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)
+	var handle windows.Handle
 	if directory {
-		flags |= windows.FILE_FLAG_BACKUP_SEMANTICS
-	}
-	result, _, callErr := filePrivacyReOpenFile.Call(
-		f.Fd(),
-		uintptr(access),
-		uintptr(uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)),
-		uintptr(flags),
-	)
-	runtime.KeepAlive(f)
-	handle := windows.Handle(result)
-	if handle == windows.InvalidHandle {
-		if callErr == nil || callErr == windows.ERROR_SUCCESS {
-			callErr = windows.ERROR_INVALID_HANDLE
+		if err := validateWindowsSecurityRepairDirectory(f); err != nil {
+			return nil, err
 		}
-		return nil, callErr
+		// The Win32 reopen used here previously combined WRITE_DAC with
+		// metadata rights, and that directory open was denied on a token whose
+		// owner authority could grant WRITE_DAC alone. NtCreateFile with an
+		// empty name and the selected directory as RootDirectory reopens that
+		// exact directory while requesting only the rights this mutation uses.
+		emptyName, err := windows.NewNTUnicodeString("")
+		if err != nil {
+			return nil, err
+		}
+		attributes := &windows.OBJECT_ATTRIBUTES{
+			RootDirectory: windows.Handle(f.Fd()),
+			ObjectName:    emptyName,
+			Attributes:    windows.OBJ_DONT_REPARSE,
+		}
+		attributes.Length = uint32(unsafe.Sizeof(*attributes))
+		err = windows.NtCreateFile(
+			&handle,
+			access,
+			attributes,
+			&windows.IO_STATUS_BLOCK{},
+			nil,
+			0,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+			windows.FILE_OPEN,
+			windows.FILE_DIRECTORY_FILE|windows.FILE_OPEN_REPARSE_POINT,
+			0,
+			0,
+		)
+		runtime.KeepAlive(f)
+		if err != nil {
+			if status, ok := err.(windows.NTStatus); ok {
+				err = status.Errno()
+			}
+			return nil, err
+		}
+	} else {
+		// ReOpenFile is proven for regular files and guarantees that the new
+		// handle selects the same file. Keep its metadata rights because the
+		// validation below consumes them.
+		result, _, callErr := filePrivacyReOpenFile.Call(
+			f.Fd(),
+			uintptr(access|windows.READ_CONTROL|windows.FILE_READ_ATTRIBUTES),
+			uintptr(uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE)),
+			uintptr(uint32(windows.FILE_FLAG_OPEN_REPARSE_POINT)),
+		)
+		runtime.KeepAlive(f)
+		handle = windows.Handle(result)
+		if handle == windows.InvalidHandle {
+			if callErr == nil || callErr == windows.ERROR_SUCCESS {
+				callErr = windows.ERROR_INVALID_HANDLE
+			}
+			return nil, callErr
+		}
 	}
 	mutation := os.NewFile(uintptr(handle), f.Name()+" (security repair)")
 	if mutation == nil {
 		_ = windows.CloseHandle(handle)
 		return nil, errors.New("converting owner-private security-repair handle")
 	}
+	if directory {
+		// The empty-name native open is bound by the kernel to f, so there is
+		// no path-derived identity to compare. Recheck the stable source handle
+		// at the seam; querying the minimal WRITE_DAC handle would require the
+		// extra metadata right that caused this repair path to be denied.
+		if err := validateWindowsSecurityRepairDirectory(f); err != nil {
+			return nil, errors.Join(err, mutation.Close())
+		}
+		return mutation, nil
+	}
 	originalInfo, originalErr := f.Stat()
 	mutationInfo, mutationErr := mutation.Stat()
 	if originalErr != nil || mutationErr != nil || originalInfo == nil || mutationInfo == nil ||
-		originalInfo.IsDir() != directory || mutationInfo.IsDir() != directory ||
+		originalInfo.IsDir() || mutationInfo.IsDir() ||
 		!os.SameFile(originalInfo, mutationInfo) {
 		return nil, errors.Join(errors.New("security-repair reopen returned a different object"),
 			originalErr, mutationErr, mutation.Close())
 	}
-	if directory {
-		var info windows.ByHandleFileInformation
-		if err := windows.GetFileInformationByHandle(handle, &info); err != nil ||
-			info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 ||
-			info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-			return nil, errors.Join(errors.New("security-repair directory has the wrong object type"), err, mutation.Close())
-		}
-	} else if err := verifyRegularSingleLink(mutation); err != nil {
+	if err := verifyRegularSingleLink(mutation); err != nil {
 		return nil, errors.Join(err, mutation.Close())
 	}
 	return mutation, nil
+}
+
+func validateWindowsSecurityRepairDirectory(f *os.File) error {
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info); err != nil {
+		return err
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 ||
+		info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return errors.New("security-repair directory has the wrong object type")
+	}
+	return nil
 }
 
 // SecureMode is Secure on Windows because NTFS does not expose portable Unix

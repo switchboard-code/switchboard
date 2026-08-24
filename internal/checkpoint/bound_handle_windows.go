@@ -213,11 +213,13 @@ func acquireWindowsNamespaceLeaseForDestination(root *os.Root, destinationParent
 		return nil, errors.Join(err, lease.close())
 	}
 	rootHandle := windows.Handle(rootFile.Fd())
-	// ReOpenFile narrows the exact root handle's sharing without resolving a
-	// pathname. NtCreateFile rejects "." as a relative object name on Windows.
-	// For a cross-root sink this runs after its anchor is created, so a reparse
-	// tag installed while the directory was empty is rejected and a later
-	// installation is blocked by the retained anchor entry.
+	// ReOpenFile only accepts an original handle created by CreateFile, while
+	// root.Open returns an NtCreateFile handle. NtCreateFile's empty relative
+	// object name denotes the RootDirectory handle itself (the same mapping Go
+	// uses for os.Root's "." operations), so it can narrow sharing without a
+	// pathname lookup. For a cross-root sink this runs after its anchor is
+	// created, so a reparse tag installed while the directory was empty is
+	// rejected and a later installation is blocked by the retained anchor entry.
 	leasedRoot, err := reopenWindowsNamespaceRoot(rootHandle, destinationParent == ".")
 	if err != nil {
 		return fail(fmt.Errorf("leasing checkpoint namespace root: %w", err))
@@ -282,22 +284,40 @@ func (lease *windowsNamespaceLease) directory(name string) (windows.Handle, erro
 }
 
 func reopenWindowsNamespaceRoot(root windows.Handle, shareWrites bool) (windows.Handle, error) {
+	objectName, err := windows.NewNTUnicodeString("")
+	if err != nil {
+		return windows.InvalidHandle, err
+	}
+	attributes := &windows.OBJECT_ATTRIBUTES{
+		RootDirectory: root,
+		ObjectName:    objectName,
+		Attributes:    windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
+	}
+	attributes.Length = uint32(unsafe.Sizeof(*attributes))
 	share := uint32(windows.FILE_SHARE_READ)
 	if shareWrites {
 		share |= windows.FILE_SHARE_WRITE
 	}
-	result, _, callErr := reOpenFileWindows.Call(
-		uintptr(root),
-		uintptr(uint32(windows.FILE_TRAVERSE|windows.FILE_READ_ATTRIBUTES|windows.SYNCHRONIZE)),
-		uintptr(share),
-		uintptr(uint32(windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT)),
+	var handle windows.Handle
+	err = windows.NtCreateFile(
+		&handle,
+		windows.FILE_TRAVERSE|windows.FILE_READ_ATTRIBUTES|windows.SYNCHRONIZE,
+		attributes,
+		&windows.IO_STATUS_BLOCK{},
+		nil,
+		0,
+		share,
+		windows.FILE_OPEN,
+		windows.FILE_DIRECTORY_FILE|windows.FILE_SYNCHRONOUS_IO_NONALERT|windows.FILE_OPEN_REPARSE_POINT,
+		0,
+		0,
 	)
-	handle := windows.Handle(result)
-	if handle == windows.InvalidHandle || handle == 0 {
-		if callErr == nil || callErr == windows.ERROR_SUCCESS {
-			callErr = windows.ERROR_INVALID_HANDLE
-		}
-		return windows.InvalidHandle, callErr
+	runtime.KeepAlive(objectName)
+	if status, ok := err.(windows.NTStatus); ok {
+		err = status.Errno()
+	}
+	if err != nil {
+		return windows.InvalidHandle, err
 	}
 	if err := validateWindowsNamespaceDirectory(handle); err != nil {
 		return windows.InvalidHandle, errors.Join(err, windows.CloseHandle(handle))
